@@ -1,0 +1,29 @@
+app_name = "taal_inventory"
+app_title = "Taal Inventory"
+app_publisher = "TAAL+ Healthcare"
+app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
+app_version = "1.0.0"
+app_license = "MIT"
+
+# ── Scheduler Jobs ──────────────────────────────────────────────
+scheduler_events = {
+    "daily": [
+        "taal_inventory.tasks.check_expiry_alerts",
+        "taal_inventory.tasks.check_low_stock_daily",
+    ],
+}
+
+# ── Document Event Hooks ─────────────────────────────────────────
+doc_events = {
+    "Sales Invoice": {
+        "on_submit": "taal_inventory.events.sales_invoice.on_submit",
+        "on_cancel": "taal_inventory.events.sales_invoice.on_cancel",
+    },
+    "Stock Receipt": {
+        "on_submit": "taal_inventory.events.stock_receipt.on_submit",
+        "on_cancel": "taal_inventory.events.stock_receipt.on_cancel",
+    },
+    "Stock Adjustment": {
+        "on_submit": "taal_inventory.events.stock_receipt.on_adjustment_submit",
+    },
+}
