@@ -1,0 +1,16 @@
+[project]
+name = "taal_inventory"
+authors = [
+    {name = "TAAL+ Healthcare", email = "admin@taalplus.in"}
+]
+description = "Pharmacy Inventory Management for TAAL+ Healthcare"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+
+[build-system]
+requires = ["flit_core >=3.2.0,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "taal_inventory"
