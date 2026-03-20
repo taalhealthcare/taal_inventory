@@ -7,10 +7,12 @@ def on_submit(doc, method):
     Triggered when Stock Receipt is submitted.
     Creates one Pharmacy Batch per line item.
     Updates current_stock on each Pharmacy Item.
+    Auto-creates or updates Item Price for Sales Invoice.
     """
     for row in doc.items:
         profit = (row.selling_price or 0) - (row.cost_price or 0)
 
+        # Create one Pharmacy Batch per receipt line
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  row.item,
@@ -37,13 +39,19 @@ def on_submit(doc, method):
 
         # Update current_stock on Pharmacy Item
         item_doc = frappe.get_doc("Pharmacy Item", row.item)
-        item_doc.current_stock = (item_doc.current_stock or 0) + row.qty_received
+        item_doc.current_stock = (
+            item_doc.current_stock or 0
+        ) + row.qty_received
         item_doc.save(ignore_permissions=True)
+
+        # Auto-create or update Item Price for Sales Invoice
+        if row.selling_price and row.selling_price > 0:
+            _sync_item_price(row.item, row.selling_price)
 
     frappe.db.commit()
     frappe.msgprint(
         "Stock Receipt submitted successfully. "
-        "Batches created and stock updated.",
+        "Batches created, stock updated and Item Price synced.",
         alert=True
     )
 
@@ -59,17 +67,21 @@ def on_cancel(doc, method):
             "Pharmacy Batch",
             filters={
                 "stock_receipt": doc.name,
-                "item": row.item
+                "item":          row.item
             },
             fields=["name", "remaining_qty"]
         )
         for b in batches:
             frappe.db.set_value(
-                "Pharmacy Batch", b.name, "status", "Quarantined"
+                "Pharmacy Batch",
+                b.name,
+                "status",
+                "Quarantined"
             )
             item_doc = frappe.get_doc("Pharmacy Item", row.item)
             item_doc.current_stock = max(
-                0, (item_doc.current_stock or 0) - b.remaining_qty
+                0,
+                (item_doc.current_stock or 0) - b.remaining_qty
             )
             item_doc.save(ignore_permissions=True)
 
@@ -100,7 +112,8 @@ def on_adjustment_submit(doc, method):
 
         # Write balance fields on the child row
         frappe.db.set_value(
-            "Stock Adjustment Item", row.name, {
+            "Stock Adjustment Item",
+            row.name, {
                 "balance_before": balance_before,
                 "balance_after":  new_qty
             }
@@ -122,3 +135,54 @@ def on_adjustment_submit(doc, method):
         )
 
     frappe.db.commit()
+
+
+def _sync_item_price(item_code, selling_price):
+    """
+    Auto-create or update Item Price in Standard Selling price list.
+    Called on every Stock Receipt submit.
+    If a newer batch has a different selling price,
+    it updates the existing Item Price to the latest price.
+    This ensures Sales Invoice always shows the correct
+    rate automatically — zero manual work needed.
+    """
+    try:
+        existing = frappe.get_all(
+            "Item Price",
+            filters={
+                "item_code":  item_code,
+                "price_list": "Standard Selling",
+                "selling":    1
+            },
+            fields=["name", "price_list_rate"],
+            limit_page_length=1
+        )
+
+        if existing:
+            # Update to latest selling price from this batch
+            frappe.db.set_value(
+                "Item Price",
+                existing[0].name,
+                "price_list_rate",
+                selling_price
+            )
+        else:
+            # Create brand new Item Price
+            item_price = frappe.get_doc({
+                "doctype":         "Item Price",
+                "item_code":       item_code,
+                "price_list":      "Standard Selling",
+                "selling":         1,
+                "price_list_rate": selling_price,
+                "currency":        "INR"
+            })
+            item_price.flags.ignore_permissions = True
+            item_price.insert()
+
+        frappe.db.commit()
+
+    except Exception as e:
+        frappe.log_error(
+            f"Item Price sync failed for {item_code}: {str(e)}",
+            "Item Price Sync Error"
+        )

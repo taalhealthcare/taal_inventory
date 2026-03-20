@@ -5,7 +5,11 @@ from taal_inventory.utils.fifo import deduct_stock_fifo, reverse_stock_fifo
 def on_submit(doc, method):
     """
     Triggered when Sales Invoice is submitted.
-    Calls FIFO engine for every pharmacy item in the invoice.
+    For every Pharmacy Item in the invoice:
+    - Runs FIFO deduction from oldest batch first
+    - Reduces Current Stock on Pharmacy Item
+    - Logs deduction in Deduction Log child table
+    - Fires Email + WhatsApp alert if stock crosses threshold
     """
     for row in doc.items:
         # Only process items that exist in Pharmacy Item master
@@ -26,7 +30,9 @@ def on_submit(doc, method):
 def on_cancel(doc, method):
     """
     Triggered when Sales Invoice is cancelled.
-    Reverses stock deduction for every pharmacy item in the invoice.
+    Reverses FIFO stock deduction for every
+    Pharmacy Item in the invoice.
+    Restores stock to pre-invoice levels.
     """
     for row in doc.items:
         if frappe.db.exists("Pharmacy Item", row.item_code):
@@ -34,9 +40,9 @@ def on_cancel(doc, method):
             logs = frappe.get_all(
                 "Deduction Log",
                 filters={
-                    "reference_no":       doc.name,
-                    "reference_doctype":  "Sales Invoice",
-                    "parent":             row.item_code
+                    "reference_no":      doc.name,
+                    "reference_doctype": "Sales Invoice",
+                    "parent":            row.item_code
                 },
                 fields=["batch_id", "qty_deducted"]
             )

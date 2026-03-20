@@ -26,4 +26,8 @@ doc_events = {
     "Stock Adjustment": {
         "on_submit": "taal_inventory.events.stock_receipt.on_adjustment_submit",
     },
+    "Pharmacy Item": {
+        "after_insert": "taal_inventory.events.pharmacy_item.after_insert",
+        "on_update":    "taal_inventory.events.pharmacy_item.on_update",
+    },
 }
