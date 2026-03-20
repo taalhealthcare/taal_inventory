@@ -46,7 +46,14 @@ def on_submit(doc, method):
 
         # Auto-create or update Item Price for Sales Invoice
         if row.selling_price and row.selling_price > 0:
-            _sync_item_price(row.item, row.selling_price)
+            # Get the actual item_code from Pharmacy Item
+            # row.item = Pharmacy Item name (TPCHC-PI-2026-00000001)
+            # We need item_code field (TEST-MED-001) for Item Price
+            actual_item_code = frappe.db.get_value(
+                "Pharmacy Item", row.item, "item_code"
+            )
+            if actual_item_code:
+                _sync_item_price(actual_item_code, row.selling_price)
 
     frappe.db.commit()
     frappe.msgprint(
