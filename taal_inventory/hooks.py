@@ -5,6 +5,12 @@ app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version = "1.0.0"
 app_license = "MIT"
 
+# ── DocType JS Files ─────────────────────────────────────────────
+doctype_js = {
+    "Stock Receipt":  "public/js/stock_receipt.js",
+    "Sales Invoice":  "public/js/sales_invoice.js",
+}
+
 # ── Scheduler Jobs ──────────────────────────────────────────────
 scheduler_events = {
     "daily": [
