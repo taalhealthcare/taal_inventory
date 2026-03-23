@@ -8,14 +8,31 @@ def on_submit(doc, method):
     Creates one Pharmacy Batch per line item.
     Updates current_stock on each Pharmacy Item.
     Auto-creates or updates Item Price for Sales Invoice.
+    Calculates and updates totals on Stock Receipt.
     """
+    total_amount = 0
+    total_tax    = 0
+
     for row in doc.items:
+        # Fetch full Pharmacy Item details
+        pi = frappe.get_doc("Pharmacy Item", row.item)
+
         profit = (row.selling_price or 0) - (row.cost_price or 0)
+
+        # Calculate line total
+        line_total = (row.qty_received or 0) * (row.cost_price or 0)
+
+        # Calculate tax amount for this line
+        tax_amount = line_total * ((row.purchase_tax_pct or 0) / 100)
+
+        total_amount += line_total
+        total_tax    += tax_amount
 
         # Create one Pharmacy Batch per receipt line
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  row.item,
+            "item_name":             pi.item_name,
             "batch_id":              row.batch_id,
             "manufacturing_date":    row.manufacturing_date,
             "expiry_date":           row.expiry_date,
@@ -26,6 +43,8 @@ def on_submit(doc, method):
             "gst_pct":               row.gst_pct or 0,
             "purchase_tax_pct":      row.purchase_tax_pct or 0,
             "supplier_discount_pct": row.discount_pct or 0,
+            "hsn_sac_code":          pi.hsn_sac_code or "",
+            "manufacturer_name":     pi.manufacturer_name or "",
             "supplier_name":         doc.supplier,
             "supplier_invoice_no":   doc.supplier_invoice_no,
             "qty_received":          row.qty_received,
@@ -37,6 +56,14 @@ def on_submit(doc, method):
         })
         batch.insert(ignore_permissions=True)
 
+        # Update line_total on the row
+        frappe.db.set_value(
+            "Stock Receipt Item",
+            row.name,
+            "line_total",
+            line_total
+        )
+
         # Update current_stock on Pharmacy Item
         item_doc = frappe.get_doc("Pharmacy Item", row.item)
         item_doc.current_stock = (
@@ -46,19 +73,24 @@ def on_submit(doc, method):
 
         # Auto-create or update Item Price for Sales Invoice
         if row.selling_price and row.selling_price > 0:
-            # Get the actual item_code from Pharmacy Item
-            # row.item = Pharmacy Item name (TPCHC-PI-2026-00000001)
-            # We need item_code field (TEST-MED-001) for Item Price
             actual_item_code = frappe.db.get_value(
                 "Pharmacy Item", row.item, "item_code"
             )
             if actual_item_code:
                 _sync_item_price(actual_item_code, row.selling_price)
 
+    # Update Stock Receipt totals
+    grand_total = total_amount + total_tax
+    frappe.db.set_value("Stock Receipt", doc.name, {
+        "total_amount": round(total_amount, 2),
+        "total_tax":    round(total_tax, 2),
+        "grand_total":  round(grand_total, 2)
+    })
+
     frappe.db.commit()
     frappe.msgprint(
         "Stock Receipt submitted successfully. "
-        "Batches created, stock updated and Item Price synced.",
+        "Batches created, stock updated and totals calculated.",
         alert=True
     )
 
@@ -91,6 +123,13 @@ def on_cancel(doc, method):
                 (item_doc.current_stock or 0) - b.remaining_qty
             )
             item_doc.save(ignore_permissions=True)
+
+    # Reset totals on cancel
+    frappe.db.set_value("Stock Receipt", doc.name, {
+        "total_amount": 0,
+        "total_tax":    0,
+        "grand_total":  0
+    })
 
     frappe.db.commit()
 
@@ -147,11 +186,7 @@ def on_adjustment_submit(doc, method):
 def _sync_item_price(item_code, selling_price):
     """
     Auto-create or update Item Price in Standard Selling price list.
-    Called on every Stock Receipt submit.
-    If a newer batch has a different selling price,
-    it updates the existing Item Price to the latest price.
-    This ensures Sales Invoice always shows the correct
-    rate automatically — zero manual work needed.
+    Called on Stock Receipt submit.
     """
     try:
         existing = frappe.get_all(
@@ -161,12 +196,11 @@ def _sync_item_price(item_code, selling_price):
                 "price_list": "Standard Selling",
                 "selling":    1
             },
-            fields=["name", "price_list_rate"],
+            fields=["name"],
             limit_page_length=1
         )
 
         if existing:
-            # Update to latest selling price from this batch
             frappe.db.set_value(
                 "Item Price",
                 existing[0].name,
@@ -174,7 +208,6 @@ def _sync_item_price(item_code, selling_price):
                 selling_price
             )
         else:
-            # Create brand new Item Price
             item_price = frappe.get_doc({
                 "doctype":         "Item Price",
                 "item_code":       item_code,
@@ -192,4 +225,9 @@ def _sync_item_price(item_code, selling_price):
         frappe.log_error(
             f"Item Price sync failed for {item_code}: {str(e)}",
             "Item Price Sync Error"
+        )
+        frappe.msgprint(
+            f"Item Price sync failed for {item_code}: {str(e)}",
+            title="Item Price Sync Error",
+            indicator="red"
         )
