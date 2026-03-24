@@ -2,18 +2,66 @@ import frappe
 from frappe.utils import today, now_datetime
 
 
+@frappe.whitelist()
+def get_fifo_rate(item_code):
+    """
+    Called from Sales Invoice JS when item is selected.
+    Finds the oldest active non-expired batch for this item
+    and returns its selling price — correct FIFO rate upfront.
+    """
+    # Look up Pharmacy Item by item_code field
+    pharmacy_items = frappe.get_all(
+        "Pharmacy Item",
+        filters={"item_code": item_code},
+        fields=["name"],
+        limit_page_length=1
+    )
+
+    if not pharmacy_items:
+        # Not a pharmacy item — return no rate
+        return {"blocked": False, "rate": 0, "batch_id": ""}
+
+    pi_name = pharmacy_items[0].name
+
+    # Fetch oldest active non-expired batch (FIFO order)
+    batches = frappe.get_all(
+        "Pharmacy Batch",
+        filters={
+            "item":          pi_name,
+            "status":        "Active",
+            "remaining_qty": [">", 0],
+            "expiry_date":   [">", today()]
+        },
+        fields=[
+            "name", "batch_id",
+            "selling_price", "remaining_qty"
+        ],
+        order_by="creation_date ASC",
+        limit_page_length=1
+    )
+
+    if not batches:
+        return {
+            "blocked": True,
+            "rate":     0,
+            "batch_id": ""
+        }
+
+    return {
+        "blocked":  False,
+        "rate":     batches[0].selling_price or 0,
+        "batch_id": batches[0].batch_id or ""
+    }
+
+
 def on_submit(doc, method):
     """
     Triggered when Sales Invoice is submitted.
-    For every item in the invoice:
-    - Looks up Pharmacy Item by item_code field
-    - Runs FIFO deduction from oldest batch first
-    - Reduces Current Stock on Pharmacy Item
-    - Logs deduction in Deduction Log child table
-    - Fires Email + WhatsApp alert if stock crosses threshold
+    Rate is already correct from get_fifo_rate() called on item select.
+    This runs FIFO deduction and logs it.
     """
     for row in doc.items:
-        # Look up Pharmacy Item by item_code field — NOT by name
+        # Look up Pharmacy Item by item_code field
         pharmacy_items = frappe.get_all(
             "Pharmacy Item",
             filters={"item_code": row.item_code},
@@ -27,27 +75,20 @@ def on_submit(doc, method):
         )
 
         if not pharmacy_items:
-            # Not a pharmacy item — skip silently
             continue
 
         pi_name = pharmacy_items[0].name
 
         # Run FIFO deduction
-        _deduct_fifo(
-            doc=doc,
-            row=row,
-            pi_name=pi_name
-        )
+        _deduct_fifo(doc=doc, row=row, pi_name=pi_name)
 
 
 def on_cancel(doc, method):
     """
     Triggered when Sales Invoice is cancelled.
-    Reverses FIFO stock deduction for every
-    Pharmacy Item in the invoice.
+    Reverses FIFO stock deduction.
     """
     for row in doc.items:
-        # Look up Pharmacy Item by item_code field
         pharmacy_items = frappe.get_all(
             "Pharmacy Item",
             filters={"item_code": row.item_code},
@@ -72,7 +113,6 @@ def on_cancel(doc, method):
         )
 
         for log in logs:
-            # Restore stock back to batch
             current = frappe.db.get_value(
                 "Pharmacy Batch",
                 log.batch_id,
@@ -82,7 +122,7 @@ def on_cancel(doc, method):
                 "Pharmacy Batch",
                 log.batch_id, {
                     "remaining_qty": current + log.qty_deducted,
-                    "status": "Active"
+                    "status":        "Active"
                 }
             )
 
@@ -93,22 +133,23 @@ def on_cancel(doc, method):
 
 def _deduct_fifo(doc, row, pi_name):
     """
-    Core FIFO deduction logic.
-    Deducts stock from oldest batch first.
-    Logs each deduction in Deduction Log child table.
+    Core FIFO deduction.
+    Deducts from oldest batch first.
+    Rate is already correct on the invoice from get_fifo_rate().
     """
     # Fetch active non-expired batches oldest first
     batches = frappe.get_all(
         "Pharmacy Batch",
         filters={
-            "item":         pi_name,
-            "status":       "Active",
+            "item":          pi_name,
+            "status":        "Active",
             "remaining_qty": [">", 0],
-            "expiry_date":  [">", today()]
+            "expiry_date":   [">", today()]
         },
         fields=[
             "name", "batch_id",
-            "remaining_qty", "creation_date"
+            "remaining_qty", "creation_date",
+            "selling_price"
         ],
         order_by="creation_date ASC",
         limit_page_length=0
@@ -129,13 +170,13 @@ def _deduct_fifo(doc, row, pi_name):
         )
 
     remaining = row.qty
-    consumed = []
+    consumed  = []
 
     # Deduct batch by batch — FIFO order
     for batch in batches:
         if remaining <= 0:
             break
-        deduct = min(batch.remaining_qty, remaining)
+        deduct  = min(batch.remaining_qty, remaining)
         new_qty = batch.remaining_qty - deduct
 
         frappe.db.set_value("Pharmacy Batch", batch.name, {
@@ -144,9 +185,10 @@ def _deduct_fifo(doc, row, pi_name):
         })
 
         consumed.append({
-            "batch": batch.name,
-            "batch_id": batch.batch_id,
-            "qty": deduct
+            "batch":         batch.name,
+            "batch_id":      batch.batch_id,
+            "qty":           deduct,
+            "selling_price": batch.selling_price or 0
         })
         remaining -= deduct
 
@@ -160,7 +202,7 @@ def _deduct_fifo(doc, row, pi_name):
     elif doc.customer_name:
         patient = doc.customer_name
 
-    # Log each batch consumed in Deduction Log
+    # Log each batch consumed
     for entry in consumed:
         pi_doc = frappe.get_doc("Pharmacy Item", pi_name)
         pi_doc.append("deduction_log", {
@@ -177,15 +219,12 @@ def _deduct_fifo(doc, row, pi_name):
 
     frappe.db.commit()
 
-    # Check thresholds and send notifications
+    # Check thresholds and notify
     _check_notify(pi_name, new_stock)
 
 
 def _recalculate_stock(pi_name):
-    """
-    Recalculate and update current_stock
-    on Pharmacy Item from all active batches.
-    """
+    """Recalculate current_stock from all active batches."""
     result = frappe.db.sql("""
         SELECT COALESCE(SUM(remaining_qty), 0) as total
         FROM `tabPharmacy Batch`
@@ -203,10 +242,7 @@ def _recalculate_stock(pi_name):
 
 
 def _check_notify(pi_name, new_stock):
-    """
-    Check stock thresholds and fire
-    email + WhatsApp notifications if crossed.
-    """
+    """Fire notifications if stock crosses thresholds."""
     from taal_inventory.utils.notifications import send_stock_alert
     pi = frappe.get_doc("Pharmacy Item", pi_name)
 

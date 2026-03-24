@@ -1,5 +1,15 @@
-// Stock Receipt — Auto Fetch Item Details + Calculate Totals
+// ── Auto refresh after submit ────────────────────────────────
+frappe.ui.form.on("Stock Receipt", {
+    after_save: function(frm) {
+        if (frm.doc.docstatus === 1) {
+            setTimeout(function() {
+                frm.reload_doc();
+            }, 1000);
+        }
+    }
+});
 
+// ── Receipt Items — Auto Fetch + Calculate ───────────────────
 frappe.ui.form.on("Stock Receipt Item", {
 
     item: function(frm, cdt, cdn) {
@@ -20,39 +30,34 @@ frappe.ui.form.on("Stock Receipt Item", {
         ).then(function(r) {
             if (!r.message) return;
             frappe.model.set_value(cdt, cdn,
-                "item_name",
-                r.message.item_name || "");
+                "item_name",        r.message.item_name || "");
             frappe.model.set_value(cdt, cdn,
-                "uom",
-                r.message.uom || "");
+                "uom",              r.message.uom || "");
             frappe.model.set_value(cdt, cdn,
-                "purchase_tax_pct",
-                r.message.purchase_tax_pct || 0);
+                "purchase_tax_pct", r.message.purchase_tax_pct || 0);
             frappe.model.set_value(cdt, cdn,
-                "gst_pct",
-                r.message.gst_pct || 0);
+                "gst_pct",          r.message.gst_pct || 0);
             frappe.model.set_value(cdt, cdn,
-                "hsn_sac_code",
-                r.message.hsn_sac_code || "");
+                "hsn_sac_code",     r.message.hsn_sac_code || "");
 
-            // Recalculate after fetching defaults
+            // Recalculate after defaults are filled
             calculate_line_total(frm, cdt, cdn);
         });
     },
 
-    qty_received: function(frm, cdt, cdn) {
+    qty_received:     function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
     },
-    cost_price: function(frm, cdt, cdn) {
+    cost_price:       function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
     },
-    discount_pct: function(frm, cdt, cdn) {
+    discount_pct:     function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
     },
     purchase_tax_pct: function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
     },
-    gst_pct: function(frm, cdt, cdn) {
+    gst_pct:          function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
     }
 });
@@ -63,14 +68,11 @@ function calculate_line_total(frm, cdt, cdn) {
     var rate     = flt(row.cost_price)   || 0;
     var discount = flt(row.discount_pct) || 0;
 
-    // Subtotal after discount
     var subtotal       = qty * rate;
     var after_discount = subtotal - (subtotal * discount / 100);
     var line_total     = parseFloat(after_discount.toFixed(2));
 
     frappe.model.set_value(cdt, cdn, "line_total", line_total);
-
-    // Recalculate header totals
     calculate_header_totals(frm);
 }
 
@@ -82,17 +84,13 @@ function calculate_header_totals(frm) {
         var qty      = flt(row.qty_received) || 0;
         var rate     = flt(row.cost_price)   || 0;
         var discount = flt(row.discount_pct) || 0;
-
-        // Use GST % for tax calculation
-        var gst_pct      = flt(row.gst_pct)       || 0;
-        var purchase_tax = flt(row.purchase_tax_pct) || 0;
-
-        // Combined tax rate = GST % + Purchase Tax %
-        var combined_tax_pct = gst_pct + purchase_tax;
+        var gst_pct  = flt(row.gst_pct)      || 0;
+        var pur_tax  = flt(row.purchase_tax_pct) || 0;
+        var tax_pct  = gst_pct + pur_tax;
 
         var subtotal       = qty * rate;
         var after_discount = subtotal - (subtotal * discount / 100);
-        var tax_amount     = after_discount * (combined_tax_pct / 100);
+        var tax_amount     = after_discount * (tax_pct / 100);
 
         total_amount += after_discount;
         total_tax    += tax_amount;
