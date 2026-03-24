@@ -176,50 +176,16 @@ def on_adjustment_submit(doc, method):
 def _sync_item_price(item_code, selling_price,
                      batch_name, expiry_date):
     """
-    Create one Item Price record per batch.
-    Stores batch_no and valid_upto (expiry date)
-    so expiry is visible directly in Item Price list.
-    Also updates default Item Price (no batch) as fallback.
+    Create or update Item Price in Standard Selling price list.
+    Does NOT use batch_no field (that links to native Batch doctype
+    which is different from our Pharmacy Batch — causes errors).
+    Uses valid_upto to store expiry date for visibility.
+    FEFO rate selection is handled by get_fifo_rate() in
+    sales_invoice.py — not by Item Price batch_no.
     """
     try:
-        # ── 1. Batch-specific Item Price ───────────────────────
-        batch_price = frappe.get_all(
-            "Item Price",
-            filters={
-                "item_code":  item_code,
-                "price_list": "Standard Selling",
-                "selling":    1,
-                "batch_no":   batch_name
-            },
-            fields=["name"],
-            limit_page_length=1
-        )
-
-        if batch_price:
-            frappe.db.set_value(
-                "Item Price",
-                batch_price[0].name, {
-                    "price_list_rate": selling_price,
-                    "valid_upto":      expiry_date
-                }
-            )
-        else:
-            ip = frappe.get_doc({
-                "doctype":         "Item Price",
-                "item_code":       item_code,
-                "price_list":      "Standard Selling",
-                "selling":         1,
-                "price_list_rate": selling_price,
-                "batch_no":        batch_name,
-                "valid_upto":      expiry_date,
-                "currency":        "INR"
-            })
-            ip.flags.ignore_permissions = True
-            ip.flags.ignore_mandatory   = True
-            ip.insert()
-
-        # ── 2. Default Item Price (no batch) — fallback ────────
-        default_price = frappe.get_all(
+        # Check if Item Price already exists for this item
+        existing = frappe.get_all(
             "Item Price",
             filters={
                 "item_code":  item_code,
@@ -231,41 +197,45 @@ def _sync_item_price(item_code, selling_price,
             limit_page_length=1
         )
 
-        if default_price:
+        if existing:
+            # Update existing Item Price with
+            # latest selling price and expiry date
             frappe.db.set_value(
                 "Item Price",
-                default_price[0].name,
-                "price_list_rate",
-                selling_price
+                existing[0].name, {
+                    "price_list_rate": selling_price,
+                    "valid_upto":      expiry_date
+                }
             )
         else:
-            ip_default = frappe.get_doc({
+            # Create new Item Price
+            ip = frappe.get_doc({
                 "doctype":         "Item Price",
                 "item_code":       item_code,
                 "price_list":      "Standard Selling",
                 "selling":         1,
                 "price_list_rate": selling_price,
+                "valid_upto":      expiry_date,
                 "currency":        "INR"
             })
-            ip_default.flags.ignore_permissions = True
-            ip_default.flags.ignore_mandatory   = True
-            ip_default.insert()
+            ip.flags.ignore_permissions = True
+            ip.flags.ignore_mandatory   = True
+            ip.insert()
 
         frappe.db.commit()
 
         frappe.logger().info(
-            f"Item Price synced for {item_code} "
-            f"batch {batch_name} rate {selling_price}"
+            f"Item Price synced: {item_code} "
+            f"rate {selling_price} expiry {expiry_date}"
         )
 
     except Exception as e:
         frappe.log_error(
-            f"Item Price sync failed for "
-            f"{item_code} batch {batch_name}: {str(e)}",
+            f"Item Price sync failed for {item_code}: {str(e)}",
             "Item Price Sync Error"
         )
         frappe.msgprint(
-            f"⚠ Item Price sync failed for {item_code}: {str(e)}",
+            f"Item Price sync failed for {item_code}: {str(e)}",
             title="Item Price Sync Error",
             indicator="red"
         )
