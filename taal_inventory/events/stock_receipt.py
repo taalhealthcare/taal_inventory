@@ -22,8 +22,11 @@ def on_submit(doc, method):
         # Calculate line total
         line_total = (row.qty_received or 0) * (row.cost_price or 0)
 
-        # Calculate tax amount for this line
-        tax_amount = line_total * ((row.purchase_tax_pct or 0) / 100)
+        # Combined tax = GST % + Purchase Tax %
+        gst_pct      = row.gst_pct or 0
+        purchase_tax = row.purchase_tax_pct or 0
+        combined_tax = gst_pct + purchase_tax
+        tax_amount   = line_total * (combined_tax / 100)
 
         total_amount += line_total
         total_tax    += tax_amount

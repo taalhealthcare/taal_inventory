@@ -6,7 +6,6 @@ frappe.ui.form.on("Stock Receipt Item", {
         var row = locals[cdt][cdn];
         if (!row.item) return;
 
-        // Fetch all details from Pharmacy Item
         frappe.db.get_value(
             "Pharmacy Item",
             row.item,
@@ -35,10 +34,12 @@ frappe.ui.form.on("Stock Receipt Item", {
             frappe.model.set_value(cdt, cdn,
                 "hsn_sac_code",
                 r.message.hsn_sac_code || "");
+
+            // Recalculate after fetching defaults
+            calculate_line_total(frm, cdt, cdn);
         });
     },
 
-    // Recalculate when any pricing field changes
     qty_received: function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
     },
@@ -50,25 +51,26 @@ frappe.ui.form.on("Stock Receipt Item", {
     },
     purchase_tax_pct: function(frm, cdt, cdn) {
         calculate_line_total(frm, cdt, cdn);
+    },
+    gst_pct: function(frm, cdt, cdn) {
+        calculate_line_total(frm, cdt, cdn);
     }
 });
 
 function calculate_line_total(frm, cdt, cdn) {
     var row      = locals[cdt][cdn];
-    var qty      = flt(row.qty_received)   || 0;
-    var rate     = flt(row.cost_price)     || 0;
-    var discount = flt(row.discount_pct)   || 0;
-    var tax_pct  = flt(row.purchase_tax_pct) || 0;
+    var qty      = flt(row.qty_received) || 0;
+    var rate     = flt(row.cost_price)   || 0;
+    var discount = flt(row.discount_pct) || 0;
 
     // Subtotal after discount
-    var subtotal = qty * rate;
+    var subtotal       = qty * rate;
     var after_discount = subtotal - (subtotal * discount / 100);
+    var line_total     = parseFloat(after_discount.toFixed(2));
 
-    // Line total before tax
-    var line_total = parseFloat(after_discount.toFixed(2));
     frappe.model.set_value(cdt, cdn, "line_total", line_total);
 
-    // Recalculate Stock Receipt header totals
+    // Recalculate header totals
     calculate_header_totals(frm);
 }
 
@@ -77,14 +79,20 @@ function calculate_header_totals(frm) {
     var total_tax    = 0;
 
     (frm.doc.items || []).forEach(function(row) {
-        var qty      = flt(row.qty_received)    || 0;
-        var rate     = flt(row.cost_price)      || 0;
-        var discount = flt(row.discount_pct)    || 0;
-        var tax_pct  = flt(row.purchase_tax_pct) || 0;
+        var qty      = flt(row.qty_received) || 0;
+        var rate     = flt(row.cost_price)   || 0;
+        var discount = flt(row.discount_pct) || 0;
+
+        // Use GST % for tax calculation
+        var gst_pct      = flt(row.gst_pct)       || 0;
+        var purchase_tax = flt(row.purchase_tax_pct) || 0;
+
+        // Combined tax rate = GST % + Purchase Tax %
+        var combined_tax_pct = gst_pct + purchase_tax;
 
         var subtotal       = qty * rate;
         var after_discount = subtotal - (subtotal * discount / 100);
-        var tax_amount     = after_discount * (tax_pct / 100);
+        var tax_amount     = after_discount * (combined_tax_pct / 100);
 
         total_amount += after_discount;
         total_tax    += tax_amount;
