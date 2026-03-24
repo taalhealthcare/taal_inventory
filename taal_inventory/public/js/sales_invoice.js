@@ -34,12 +34,17 @@ frappe.ui.form.on("Sales Invoice Item", {
 
                 // Set rate from nearest expiry batch
                 if (rate > 0) {
-                    frappe.model.set_value(
-                        cdt, cdn, "rate", rate);
-                    frappe.model.set_value(
-                        cdt, cdn, "price_list_rate", rate);
+                    // Delay needed — ERPNext native pricing engine
+                    // runs after item_code trigger and overrides rate.
+                    // setTimeout ensures our FEFO rate sets last.
+                    setTimeout(function() {
+                        frappe.model.set_value(
+                            cdt, cdn, "rate", rate);
+                        frappe.model.set_value(
+                            cdt, cdn, "price_list_rate", rate);
+                        frm.refresh_field("items");
+                    }, 800);
                 }
-
                 // Show batch info to user
                 frappe.show_alert({
                     message: "Batch: <b>" + batch_id
