@@ -1,19 +1,20 @@
-// ── Sales Invoice — FIFO Rate Fetch on Item Selection ────────
+// ── Sales Invoice — FEFO Rate + Qty Validation ───────────────
+
 frappe.ui.form.on("Sales Invoice Item", {
 
     item_code: function(frm, cdt, cdn) {
         var row = locals[cdt][cdn];
         if (!row.item_code) return;
 
-        // Fetch FIFO batch rate from server
+        // Fetch nearest expiry batch rate (FEFO)
         frappe.call({
             method: "taal_inventory.events.sales_invoice.get_fifo_rate",
             args: { item_code: row.item_code },
             callback: function(r) {
                 if (!r.message) return;
 
+                // Block if no valid stock
                 if (r.message.blocked) {
-                    // No valid stock — block this item
                     frappe.msgprint({
                         title: "No Stock Available",
                         message: "All batches for <b>"
@@ -26,27 +27,77 @@ frappe.ui.form.on("Sales Invoice Item", {
                     return;
                 }
 
-                if (r.message.rate && r.message.rate > 0) {
-                    // Set rate from oldest FIFO batch
-                    frappe.model.set_value(
-                        cdt, cdn, "rate", r.message.rate);
-                    frappe.model.set_value(
-                        cdt, cdn, "price_list_rate", r.message.rate);
+                var rate          = r.message.rate          || 0;
+                var remaining_qty = r.message.remaining_qty || 0;
+                var batch_id      = r.message.batch_id      || "";
+                var expiry_date   = r.message.expiry_date   || "";
 
-                    frappe.show_alert({
-                        message: "Rate ₹" + r.message.rate
-                            + " from batch: "
-                            + r.message.batch_id,
-                        indicator: "green"
-                    }, 4);
+                // Set rate from nearest expiry batch
+                if (rate > 0) {
+                    frappe.model.set_value(
+                        cdt, cdn, "rate", rate);
+                    frappe.model.set_value(
+                        cdt, cdn, "price_list_rate", rate);
                 }
+
+                // Show batch info to user
+                frappe.show_alert({
+                    message: "Batch: <b>" + batch_id
+                        + "</b>  |  Rate: ₹" + rate
+                        + "  |  Expiry: " + expiry_date
+                        + "  |  Available: " + remaining_qty,
+                    indicator: "blue"
+                }, 6);
+
+                // Store total available qty for validation
+                frappe.call({
+                    method: "taal_inventory.events.sales_invoice.get_total_available_qty",
+                    args: { item_code: row.item_code },
+                    callback: function(qr) {
+                        if (qr.message) {
+                            // Store in row for qty validation
+                            frappe.model.set_value(
+                                cdt, cdn,
+                                "__available_qty",
+                                qr.message.total_qty
+                            );
+                        }
+                    }
+                });
             }
         });
     },
 
     qty: function(frm, cdt, cdn) {
-        // Amount auto-calculated by ERPNext natively
-        // No action needed here
+        var row = locals[cdt][cdn];
+        if (!row.item_code || !row.qty) return;
+
+        // Validate qty against available stock
+        frappe.call({
+            method: "taal_inventory.events.sales_invoice.get_total_available_qty",
+            args: { item_code: row.item_code },
+            callback: function(r) {
+                if (!r.message) return;
+                var available = r.message.total_qty || 0;
+
+                if (row.qty > available) {
+                    frappe.msgprint({
+                        title: "Insufficient Stock",
+                        message: "You entered <b>" + row.qty
+                            + "</b> but only <b>"
+                            + available
+                            + "</b> units are available for <b>"
+                            + row.item_code + "</b>.<br><br>"
+                            + "Quantity has been capped at "
+                            + available + ".",
+                        indicator: "orange"
+                    });
+                    // Cap qty at available
+                    frappe.model.set_value(
+                        cdt, cdn, "qty", available);
+                }
+            }
+        });
     }
 });
 
@@ -118,6 +169,15 @@ function scan_and_add_item(frm, barcode) {
                     method: "taal_inventory.events.sales_invoice.get_fifo_rate",
                     args: { item_code: item_code },
                     callback: function(ir) {
+                        if (ir.message && ir.message.blocked) {
+                            frappe.msgprint({
+                                title: "No Stock",
+                                message: "No valid stock for "
+                                    + item_code,
+                                indicator: "red"
+                            });
+                            return;
+                        }
                         var rate = (ir.message && ir.message.rate)
                             ? ir.message.rate : 0;
                         var child = frm.add_child("items");
@@ -130,8 +190,8 @@ function scan_and_add_item(frm, barcode) {
                         );
                         frm.refresh_field("items");
                         frappe.show_alert({
-                            message: "Added via barcode: "
-                                + item_code,
+                            message: "Added: " + item_code
+                                + " @ ₹" + rate,
                             indicator: "green"
                         }, 3);
                     }

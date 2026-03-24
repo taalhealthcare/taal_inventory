@@ -7,14 +7,13 @@ def on_submit(doc, method):
     Triggered when Stock Receipt is submitted.
     Creates one Pharmacy Batch per line item.
     Updates current_stock on each Pharmacy Item.
-    Creates batch-specific Item Price for correct FIFO rate.
-    Calculates and updates totals on Stock Receipt.
+    Creates batch-specific Item Price with expiry date.
+    Calculates Stock Receipt totals.
     """
     total_amount = 0
     total_tax    = 0
 
     for row in doc.items:
-        # Fetch full Pharmacy Item details
         pi = frappe.get_doc("Pharmacy Item", row.item)
 
         profit     = (row.selling_price or 0) - (row.cost_price or 0)
@@ -53,6 +52,7 @@ def on_submit(doc, method):
             "creation_date":         now_datetime()
         })
         batch.insert(ignore_permissions=True)
+        frappe.db.commit()
 
         # Update line_total on receipt row
         frappe.db.set_value(
@@ -62,23 +62,24 @@ def on_submit(doc, method):
             round(line_total, 2)
         )
 
-        # Update current_stock
+        # Update current_stock on Pharmacy Item
         item_doc = frappe.get_doc("Pharmacy Item", row.item)
         item_doc.current_stock = (
             item_doc.current_stock or 0
         ) + row.qty_received
         item_doc.save(ignore_permissions=True)
 
-        # Create batch-specific Item Price
+        # Sync Item Price with batch name and expiry date
         if row.selling_price and row.selling_price > 0:
             actual_item_code = frappe.db.get_value(
                 "Pharmacy Item", row.item, "item_code"
             )
             if actual_item_code:
                 _sync_item_price(
-                    actual_item_code,
-                    row.selling_price,
-                    batch.name
+                    item_code=actual_item_code,
+                    selling_price=row.selling_price,
+                    batch_name=batch.name,
+                    expiry_date=row.expiry_date
                 )
 
     # Update Stock Receipt totals
@@ -112,7 +113,8 @@ def on_cancel(doc, method):
         )
         for b in batches:
             frappe.db.set_value(
-                "Pharmacy Batch", b.name, "status", "Quarantined"
+                "Pharmacy Batch", b.name,
+                "status", "Quarantined"
             )
             item_doc = frappe.get_doc("Pharmacy Item", row.item)
             item_doc.current_stock = max(
@@ -139,7 +141,7 @@ def on_adjustment_submit(doc, method):
     )
 
     for row in doc.items:
-        batch = frappe.get_doc("Pharmacy Batch", row.batch_id)
+        batch          = frappe.get_doc("Pharmacy Batch", row.batch_id)
         balance_before = batch.remaining_qty
         new_qty        = max(0, balance_before - row.qty)
 
@@ -171,15 +173,16 @@ def on_adjustment_submit(doc, method):
     frappe.db.commit()
 
 
-def _sync_item_price(item_code, selling_price, batch_name):
+def _sync_item_price(item_code, selling_price,
+                     batch_name, expiry_date):
     """
-    Create one Item Price per batch using batch_no field.
-    Also update default Item Price (no batch) for initial display.
-    When Sales Invoice opens — get_fifo_rate() overrides this
-    with the correct oldest batch rate.
+    Create one Item Price record per batch.
+    Stores batch_no and valid_upto (expiry date)
+    so expiry is visible directly in Item Price list.
+    Also updates default Item Price (no batch) as fallback.
     """
     try:
-        # 1. Batch-specific Item Price
+        # ── 1. Batch-specific Item Price ───────────────────────
         batch_price = frappe.get_all(
             "Item Price",
             filters={
@@ -195,9 +198,10 @@ def _sync_item_price(item_code, selling_price, batch_name):
         if batch_price:
             frappe.db.set_value(
                 "Item Price",
-                batch_price[0].name,
-                "price_list_rate",
-                selling_price
+                batch_price[0].name, {
+                    "price_list_rate": selling_price,
+                    "valid_upto":      expiry_date
+                }
             )
         else:
             ip = frappe.get_doc({
@@ -207,12 +211,14 @@ def _sync_item_price(item_code, selling_price, batch_name):
                 "selling":         1,
                 "price_list_rate": selling_price,
                 "batch_no":        batch_name,
+                "valid_upto":      expiry_date,
                 "currency":        "INR"
             })
             ip.flags.ignore_permissions = True
+            ip.flags.ignore_mandatory   = True
             ip.insert()
 
-        # 2. Default Item Price (no batch) — fallback display
+        # ── 2. Default Item Price (no batch) — fallback ────────
         default_price = frappe.get_all(
             "Item Price",
             filters={
@@ -242,12 +248,24 @@ def _sync_item_price(item_code, selling_price, batch_name):
                 "currency":        "INR"
             })
             ip_default.flags.ignore_permissions = True
+            ip_default.flags.ignore_mandatory   = True
             ip_default.insert()
 
         frappe.db.commit()
 
+        frappe.logger().info(
+            f"Item Price synced for {item_code} "
+            f"batch {batch_name} rate {selling_price}"
+        )
+
     except Exception as e:
         frappe.log_error(
-            f"Item Price sync failed for {item_code}: {str(e)}",
+            f"Item Price sync failed for "
+            f"{item_code} batch {batch_name}: {str(e)}",
             "Item Price Sync Error"
+        )
+        frappe.msgprint(
+            f"⚠ Item Price sync failed for {item_code}: {str(e)}",
+            title="Item Price Sync Error",
+            indicator="red"
         )
