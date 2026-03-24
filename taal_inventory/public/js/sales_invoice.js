@@ -1,17 +1,24 @@
 // ── Sales Invoice — FEFO Rate + Qty Validation ───────────────
+// Strategy: store FEFO rate in frm.__fefo_rates map
+// Hook into price_list_rate trigger to override ERPNext
+// every time it tries to reset rate from Item Price
 
 frappe.ui.form.on("Sales Invoice", {
 
     onload: function(frm) {
-        // Disable ERPNext native pricing engine completely
-        // so it never overrides our FEFO rate
         if (!frm.doc.docstatus) {
             frm.set_value("ignore_pricing_rule", 1);
+        }
+        // Initialize FEFO rate storage map on form
+        if (!frm.__fefo_rates) {
+            frm.__fefo_rates = {};
         }
     },
 
     refresh: function(frm) {
-        // Barcode scanner button
+        if (!frm.__fefo_rates) {
+            frm.__fefo_rates = {};
+        }
         if (!frm.doc.docstatus) {
             frm.add_custom_button("Scan Barcode", function() {
                 frappe.prompt(
@@ -39,23 +46,61 @@ frappe.ui.form.on("Sales Invoice Item", {
         var row = locals[cdt][cdn];
         if (!row.item_code) return;
 
+        // Clear stored rate for this row when item changes
+        if (frm.__fefo_rates) {
+            delete frm.__fefo_rates[cdn];
+        }
+
         fetch_fefo_rate(frm, cdt, cdn, row.item_code);
+    },
+
+    // ── THIS IS THE KEY FIX ──────────────────────────────────
+    // ERPNext calls set_value("price_list_rate") after
+    // get_item_details API returns. We intercept it here
+    // and immediately override with our stored FEFO rate.
+    price_list_rate: function(frm, cdt, cdn) {
+        var fefo_rate = frm.__fefo_rates
+            && frm.__fefo_rates[cdn];
+        if (!fefo_rate || fefo_rate <= 0) return;
+
+        var row = locals[cdt][cdn];
+        // Only override if ERPNext is trying to set wrong rate
+        if (row.price_list_rate !== fefo_rate) {
+            frappe.model.set_value(
+                cdt, cdn, "price_list_rate", fefo_rate);
+            frappe.model.set_value(
+                cdt, cdn, "rate", fefo_rate);
+        }
+    },
+
+    // Also intercept rate changes from ERPNext
+    rate: function(frm, cdt, cdn) {
+        var fefo_rate = frm.__fefo_rates
+            && frm.__fefo_rates[cdn];
+        if (!fefo_rate || fefo_rate <= 0) return;
+
+        var row = locals[cdt][cdn];
+        if (row.rate !== fefo_rate) {
+            frappe.model.set_value(
+                cdt, cdn, "rate", fefo_rate);
+        }
     },
 
     qty: function(frm, cdt, cdn) {
         var row = locals[cdt][cdn];
         if (!row.item_code || !row.qty) return;
 
-        // Re-apply FEFO rate since ERPNext qty trigger
-        // may try to recalculate pricing
-        if (row.__fefo_rate && row.__fefo_rate > 0) {
+        // Re-apply stored FEFO rate — qty trigger
+        // causes ERPNext to recalculate pricing
+        var fefo_rate = frm.__fefo_rates
+            && frm.__fefo_rates[cdn];
+        if (fefo_rate && fefo_rate > 0) {
             frappe.model.set_value(
-                cdt, cdn, "rate", row.__fefo_rate);
+                cdt, cdn, "rate", fefo_rate);
             frappe.model.set_value(
-                cdt, cdn, "price_list_rate", row.__fefo_rate);
+                cdt, cdn, "price_list_rate", fefo_rate);
         }
 
-        // Validate qty against available stock
         validate_qty(frm, cdt, cdn, row);
     }
 });
@@ -67,7 +112,6 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
         callback: function(r) {
             if (!r.message) return;
 
-            // Block if no valid stock
             if (r.message.blocked) {
                 frappe.msgprint({
                     title: "No Stock Available",
@@ -87,19 +131,22 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
             var expiry_date   = r.message.expiry_date   || "";
 
             if (rate > 0) {
-                // Store FEFO rate on row for qty trigger reference
-                locals[cdt][cdn].__fefo_rate = rate;
+                // Store FEFO rate in form-level map
+                // keyed by row cdn (unique per row)
+                if (!frm.__fefo_rates) {
+                    frm.__fefo_rates = {};
+                }
+                frm.__fefo_rates[cdn] = rate;
 
-                // Set rate directly — no setTimeout needed
-                // because ignore_pricing_rule = 1 prevents override
-                frappe.model.set_value(
-                    cdt, cdn, "rate", rate);
+                // Set rate — price_list_rate trigger above
+                // will defend this value if ERPNext overrides
                 frappe.model.set_value(
                     cdt, cdn, "price_list_rate", rate);
+                frappe.model.set_value(
+                    cdt, cdn, "rate", rate);
                 frm.refresh_field("items");
             }
 
-            // Show batch info
             frappe.show_alert({
                 message: "Batch: <b>" + batch_id
                     + "</b>  |  Rate: ₹" + rate
@@ -134,13 +181,13 @@ function validate_qty(frm, cdt, cdn, row) {
                 frappe.model.set_value(
                     cdt, cdn, "qty", available);
 
-                // Re-apply FEFO rate after qty correction
-                if (row.__fefo_rate && row.__fefo_rate > 0) {
+                var fefo_rate = frm.__fefo_rates
+                    && frm.__fefo_rates[cdn];
+                if (fefo_rate && fefo_rate > 0) {
                     frappe.model.set_value(
-                        cdt, cdn, "rate", row.__fefo_rate);
+                        cdt, cdn, "rate", fefo_rate);
                     frappe.model.set_value(
-                        cdt, cdn, "price_list_rate",
-                        row.__fefo_rate);
+                        cdt, cdn, "price_list_rate", fefo_rate);
                 }
             }
         }
@@ -203,8 +250,15 @@ function scan_and_add_item(frm, barcode) {
                         var rate = (ir.message && ir.message.rate)
                             ? ir.message.rate : 0;
                         var child = frm.add_child("items");
+                        var cdn   = child.name;
+
+                        if (!frm.__fefo_rates) {
+                            frm.__fefo_rates = {};
+                        }
+                        frm.__fefo_rates[cdn] = rate;
+
                         frappe.model.set_value(
-                            child.doctype, child.name, {
+                            child.doctype, cdn, {
                                 "item_code": item_code,
                                 "qty":       1,
                                 "rate":      rate
