@@ -159,28 +159,23 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
 }
 
 function validate_qty(frm, cdt, cdn, row) {
+    // Fetch nearest expiry batch details (FEFO)
     frappe.call({
-        method: "taal_inventory.events.sales_invoice.get_total_available_qty",
+        method: "taal_inventory.events.sales_invoice.get_fifo_rate",
         args: { item_code: row.item_code },
         callback: function(r) {
-            if (!r.message) return;
-            var available = r.message.total_qty || 0;
+            if (!r.message || r.message.blocked) return;
 
-            if (row.qty > available) {
-                frappe.msgprint({
-                    title: "Insufficient Stock",
-                    message: "You entered <b>" + row.qty
-                        + "</b> but only <b>"
-                        + available
-                        + "</b> units available for <b>"
-                        + row.item_code + "</b>.<br><br>"
-                        + "Quantity capped at "
-                        + available + ".",
-                    indicator: "orange"
-                });
+            var batch_remaining = r.message.remaining_qty || 0;
+            var batch_id        = r.message.batch_id      || "";
+            var expiry_date     = r.message.expiry_date   || "";
+
+            if (row.qty > batch_remaining) {
+                // Cap qty at batch remaining
                 frappe.model.set_value(
-                    cdt, cdn, "qty", available);
+                    cdt, cdn, "qty", batch_remaining);
 
+                // Re-apply FEFO rate after qty correction
                 var fefo_rate = frm.__fefo_rates
                     && frm.__fefo_rates[cdn];
                 if (fefo_rate && fefo_rate > 0) {
@@ -189,6 +184,18 @@ function validate_qty(frm, cdt, cdn, row) {
                     frappe.model.set_value(
                         cdt, cdn, "price_list_rate", fefo_rate);
                 }
+
+                // Blue alert — bottom right — no popup
+                frappe.show_alert({
+                    message: "Batch <b>" + batch_id
+                        + "</b> has only <b>"
+                        + batch_remaining
+                        + "</b> units remaining"
+                        + " (Expiry: " + expiry_date + ")."
+                        + " Quantity set to "
+                        + batch_remaining + ".",
+                    indicator: "blue"
+                }, 6);
             }
         }
     });
