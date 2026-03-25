@@ -185,126 +185,65 @@ function validate_qty(frm, cdt, cdn, row) {
                         cdt, cdn, "price_list_rate", fefo_rate);
                 }
 
-                // Rich styled popup
+                // Pop-Up Message of Stock Limit
                 frappe.msgprint({
-                    title: "⚠&nbsp; Stock Limited — Quantity Adjusted",
+                    title: "⚠&nbsp; Stock Alert — Quantity Adjusted",
                     indicator: "orange",
                     message: `
                         <div style="
                             font-family: Arial, sans-serif;
-                            padding: 4px 0;
+                            background: #fff8f0;
+                            border-left: 4px solid #e67e22;
+                            border-radius: 8px;
+                            padding: 18px 20px;
                         ">
-                            <!-- Batch Info Card -->
-                            <div style="
-                                background: #fff8f0;
-                                border-left: 4px solid #e67e22;
-                                border-radius: 6px;
-                                padding: 12px 16px;
-                                margin-bottom: 14px;
+                            <table style="
+                                width: 100%;
+                                border-collapse: collapse;
+                                font-size: 13px;
+                                color: #2c3e50;
                             ">
-                                <div style="
-                                    font-size: 12px;
-                                    color: #888;
-                                    text-transform: uppercase;
-                                    letter-spacing: 0.5px;
-                                    margin-bottom: 8px;
-                                ">Batch Details</div>
-
-                                <div style="
-                                    display: flex;
-                                    gap: 24px;
-                                    flex-wrap: wrap;
-                                ">
-                                    <div>
-                                        <div style="
-                                            font-size: 11px;
-                                            color: #999;
-                                        ">Batch ID</div>
-                                        <div style="
-                                            font-size: 15px;
-                                            font-weight: 700;
-                                            color: #2c3e50;
-                                        ">${batch_id}</div>
-                                    </div>
-                                    <div>
-                                        <div style="
-                                            font-size: 11px;
-                                            color: #999;
-                                        ">Expiry Date</div>
-                                        <div style="
-                                            font-size: 15px;
-                                            font-weight: 700;
-                                            color: #e74c3c;
-                                        ">${expiry_date}</div>
-                                    </div>
-                                    <div>
-                                        <div style="
-                                            font-size: 11px;
-                                            color: #999;
-                                        ">Available Qty</div>
-                                        <div style="
-                                            font-size: 15px;
-                                            font-weight: 700;
-                                            color: #27ae60;
-                                        ">${batch_remaining} units</div>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- Qty Adjustment Info -->
-                            <div style="
-                                background: #f0f4ff;
-                                border-left: 4px solid #3498db;
-                                border-radius: 6px;
-                                padding: 12px 16px;
-                                margin-bottom: 14px;
-                            ">
-                                <div style="
-                                    font-size: 13px;
-                                    color: #2c3e50;
-                                ">
-                                    You entered
-                                    <span style="
-                                        background: #e74c3c;
-                                        color: white;
-                                        padding: 1px 8px;
-                                        border-radius: 4px;
-                                        font-weight: 700;
-                                    ">${row.qty}</span>
-                                    but this batch only has
-                                    <span style="
-                                        background: #27ae60;
-                                        color: white;
-                                        padding: 1px 8px;
-                                        border-radius: 4px;
-                                        font-weight: 700;
-                                    ">${batch_remaining}</span>
-                                    units available.
-                                </div>
-                            </div>
-
-                            <!-- Auto-set confirmation -->
-                            <div style="
-                                background: #eafaf1;
-                                border-left: 4px solid #27ae60;
-                                border-radius: 6px;
-                                padding: 12px 16px;
-                                display: flex;
-                                align-items: center;
-                                gap: 10px;
-                            ">
-                                <span style="
-                                    font-size: 20px;
-                                ">✅</span>
-                                <span style="
-                                    font-size: 13px;
-                                    color: #1e8449;
-                                    font-weight: 600;
-                                ">
-                                    Quantity automatically set to
-                                    <strong>${batch_remaining}</strong>.
-                                </span>
-                            </div>
+                                <tr style="border-bottom: 1px solid #f0e0cc;">
+                                    <td style="padding: 7px 0; color: #888; width: 45%;">
+                                        Batch ID
+                                    </td>
+                                    <td style="padding: 7px 0; font-weight: 700;">
+                                        ${batch_id}
+                                    </td>
+                                </tr>
+                                <tr style="border-bottom: 1px solid #f0e0cc;">
+                                    <td style="padding: 7px 0; color: #888;">
+                                        Expiry Date
+                                    </td>
+                                    <td style="padding: 7px 0; font-weight: 700; color: #e74c3c;">
+                                        ${expiry_date}
+                                    </td>
+                                </tr>
+                                <tr style="border-bottom: 1px solid #f0e0cc;">
+                                    <td style="padding: 7px 0; color: #888;">
+                                        Available Qty
+                                    </td>
+                                    <td style="padding: 7px 0; font-weight: 700; color: #27ae60;">
+                                        ${batch_remaining} units
+                                    </td>
+                                </tr>
+                                <tr style="border-bottom: 1px solid #f0e0cc;">
+                                    <td style="padding: 7px 0; color: #888;">
+                                        You Entered
+                                    </td>
+                                    <td style="padding: 7px 0; font-weight: 700; color: #e74c3c;">
+                                        ${row.qty} units
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="padding: 10px 0 0 0; color: #888;">
+                                        Qty Set To
+                                    </td>
+                                    <td style="padding: 10px 0 0 0; font-weight: 700; color: #27ae60; font-size: 15px;">
+                                        ✅ ${batch_remaining} units
+                                    </td>
+                                </tr>
+                            </table>
                         </div>
                     `
                 });
