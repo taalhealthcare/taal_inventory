@@ -185,17 +185,21 @@ function validate_qty(frm, cdt, cdn, row) {
                         cdt, cdn, "price_list_rate", fefo_rate);
                 }
 
-                // Blue alert — bottom right — no popup
-                frappe.show_alert({
-                    message: "Batch <b>" + batch_id
-                        + "</b> has only <b>"
-                        + batch_remaining
-                        + "</b> units remaining"
-                        + " (Expiry: " + expiry_date + ")."
-                        + " Quantity set to "
-                        + batch_remaining + ".",
-                    indicator: "blue"
-                }, 6);
+                // Popup message
+                frappe.msgprint({
+                    title: "⚠ Stock Alert — Quantity Adjusted",
+                    message:
+                        "<b>Batch:</b> " + batch_id + "<br>"
+                        + "<b>Expiry Date:</b> " + expiry_date + "<br>"
+                        + "<b>Remaining Qty in this Batch:</b> "
+                        + batch_remaining + "<br><br>"
+                        + "You entered <b>" + row.qty + "</b> "
+                        + "but this batch only has <b>"
+                        + batch_remaining + "</b> units.<br><br>"
+                        + "Quantity has been automatically set to "
+                        + "<b>" + batch_remaining + "</b>.",
+                    indicator: "orange"
+                });
             }
         }
     });
