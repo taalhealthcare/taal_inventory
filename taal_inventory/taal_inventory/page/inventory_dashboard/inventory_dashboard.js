@@ -46,7 +46,7 @@ class TaalInventoryDashboard {
     refresh() {
         this._show_loading(true);
         frappe.call({
-            method:  'taal_inventory.page.inventory_dashboard.inventory_dashboard.get_dashboard_data',
+            method: 'taal_inventory.utils.dashboard.get_dashboard_data',
             freeze:  false,
             callback: (r) => {
                 this._show_loading(false);
