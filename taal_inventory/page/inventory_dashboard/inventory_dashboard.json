@@ -1,0 +1,9 @@
+{
+  "doctype": "Page",
+  "module": "Taal Inventory",
+  "name": "inventory-dashboard",
+  "page_name": "inventory-dashboard",
+  "system_page": 0,
+  "title": "Inventory Dashboard",
+  "roles": []
+}
