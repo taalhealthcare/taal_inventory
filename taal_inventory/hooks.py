@@ -4,6 +4,7 @@ app_publisher = "TAAL+ Healthcare"
 app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version = "1.0.0"
 app_license = "MIT"
+after_migrate = ["taal_inventory.setup.create_dashboard_page"]
 
 # ── Fixtures — force page sync into database ─────────────────────
 fixtures = [
