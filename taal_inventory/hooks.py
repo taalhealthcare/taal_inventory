@@ -5,6 +5,14 @@ app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version = "1.0.0"
 app_license = "MIT"
 
+# ── Fixtures — force page sync into database ─────────────────────
+fixtures = [
+    {
+        "dt":      "Page",
+        "filters": [["name", "=", "inventory-dashboard"]]
+    }
+]
+
 # ── Pages ────────────────────────────────────────────────────────
 page_js = {
     "inventory-dashboard": "public/js/inventory_dashboard_page.js"

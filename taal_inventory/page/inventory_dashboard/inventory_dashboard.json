@@ -1,17 +1,9 @@
 {
  "doctype": "Page",
- "idx": 0,
- "module": "Taal Inventory",
  "name": "inventory-dashboard",
  "page_name": "inventory-dashboard",
- "system_page": 0,
+ "module": "Taal Inventory",
  "title": "Inventory Dashboard",
- "roles": [
-  {
-   "role": "System Manager"
-  }
- ],
- "script": null,
- "style": null,
- "content": null
+ "system_page": 0,
+ "roles": []
 }
