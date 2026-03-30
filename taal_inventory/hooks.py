@@ -5,6 +5,11 @@ app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version = "1.0.0"
 app_license = "MIT"
 
+# ── Pages ────────────────────────────────────────────────────────
+page_js = {
+    "inventory-dashboard": "public/js/inventory_dashboard_page.js"
+}
+
 # ── DocType JS Files ─────────────────────────────────────────────
 doctype_js = {
     "Stock Receipt":  "public/js/stock_receipt.js",
