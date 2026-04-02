@@ -16,19 +16,12 @@ def receive_interakt_booking():
         if frappe.request.data:
             payload = json.loads(frappe.request.data)
 
-        # --- Validate required fields ---
-        required_fields = [
-            "whatsapp_number",
-            "patient_name",
-            "selected_service",
-            "consultation_type"
-        ]
-        for field in required_fields:
-            if not payload.get(field):
-                frappe.throw(
-                    f"Missing required field: {field}",
-                    frappe.MandatoryError
-                )
+        # --- TEMPORARY: Log full payload for debugging ---
+        frappe.log_error(
+            str(payload),
+            "Interakt Payload Debug"
+        )
+        return {"status": "debug", "payload_received": str(payload)}
 
         # --- Deduplicate: if same record_id arrives twice, skip ---
         record_id = payload.get("record_id")
