@@ -16,12 +16,19 @@ def receive_interakt_booking():
         if frappe.request.data:
             payload = json.loads(frappe.request.data)
 
-        # --- TEMPORARY: Log full payload for debugging ---
-        frappe.log_error(
-            str(payload),
-            "Interakt Payload Debug"
-        )
-        return {"status": "debug", "payload_received": str(payload)}
+        # --- Validate required fields ---
+        required_fields = [
+            "whatsapp_number",
+            "patient_name",
+            "selected_service",
+            "consultation_type"
+        ]
+        for field in required_fields:
+            if not payload.get(field):
+                frappe.throw(
+                    f"Missing required field: {field}",
+                    frappe.MandatoryError
+                )
 
         # --- Deduplicate: if same record_id arrives twice, skip ---
         record_id = payload.get("record_id")
@@ -115,6 +122,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     # Not found — create new Patient
     patient = frappe.new_doc("Patient")
     patient.first_name             = patient_name
+    patient.sex                    = "Other"
     patient.custom_whatsapp_number = whatsapp_number
     patient.custom_city_location   = city_location
     patient.status                 = "Active"
@@ -122,7 +130,6 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     frappe.db.commit()
 
     return patient.name
-
 
 def _generate_record_id():
     """
