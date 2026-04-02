@@ -199,10 +199,12 @@ def _resolve_time_slot(option_value):
 
 def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     """
-    Search for existing Patient by WhatsApp number.
-    If not found, create a new one.
-    Gender set to 'Other' as Frappe Healthcare requires it.
+    Search for existing Patient by WhatsApp number first.
+    If not found, search by name as fallback.
+    If still not found, create new Patient.
+    Updates WhatsApp number on existing patient if missing.
     """
+    # Search 1: by WhatsApp number — primary key
     existing = frappe.db.get_value(
         "Patient",
         {"custom_whatsapp_number": whatsapp_number},
@@ -211,16 +213,56 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     if existing:
         return existing
 
-    patient = frappe.new_doc("Patient")
-    patient.first_name             = patient_name
-    patient.sex                    = "Other"
-    patient.custom_whatsapp_number = whatsapp_number
-    patient.custom_city_location   = city_location
-    patient.status                 = "Active"
-    patient.insert(ignore_permissions=True)
-    frappe.db.commit()
+    # Search 2: by name — catches patients created before
+    # integration or from previous test runs
+    existing_by_name = frappe.db.get_value(
+        "Patient",
+        {"first_name": patient_name},
+        "name"
+    )
+    if existing_by_name:
+        # Update their WhatsApp number so next lookup works
+        frappe.db.set_value(
+            "Patient",
+            existing_by_name,
+            {
+                "custom_whatsapp_number": whatsapp_number,
+                "custom_city_location": city_location
+            }
+        )
+        frappe.db.commit()
+        return existing_by_name
 
-    return patient.name
+    # Not found anywhere — create new Patient
+    try:
+        patient = frappe.new_doc("Patient")
+        patient.first_name             = patient_name
+        patient.sex                    = "Other"
+        patient.custom_whatsapp_number = whatsapp_number
+        patient.custom_city_location   = city_location
+        patient.status                 = "Active"
+        patient.insert(ignore_permissions=True)
+        frappe.db.commit()
+        return patient.name
+
+    except frappe.UniqueValidationError:
+        # Race condition — patient was just created by another
+        # request. Fetch and return it.
+        fallback = frappe.db.get_value(
+            "Patient",
+            {"first_name": patient_name},
+            "name"
+        )
+        if fallback:
+            frappe.db.set_value(
+                "Patient",
+                fallback,
+                "custom_whatsapp_number",
+                whatsapp_number
+            )
+            frappe.db.commit()
+            return fallback
+        raise
 
 
 def _generate_record_id():
