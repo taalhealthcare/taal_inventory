@@ -10,7 +10,7 @@ from frappe.utils import now_datetime
 # You will get this from Razorpay Dashboard → Settings → Webhooks
 # We will do this in Step 10 — leave it as is for now
 # ──────────────────────────────────────────────────────────────────────────────
-RAZORPAY_WEBHOOK_SECRET = "REPLACE_THIS_LATER"
+RAZORPAY_WEBHOOK_SECRET = "taalplus_razorpay_secret_2026"
 
 
 @frappe.whitelist(allow_guest=True)
