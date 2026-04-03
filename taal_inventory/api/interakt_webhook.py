@@ -231,13 +231,11 @@ def _extract_form_data(steps):
 
 def _extract_time_from_message(message_text):
     """
-    Extracts the readable time slot from Thank You message text.
-
-    Message format:
-    "...Date:  2026-08-27\\nTime:  4 PM - 6 PM\\n..."
-
-    Returns readable string e.g. "4 PM - 6 PM"
-    Works permanently regardless of time slot label changes.
+    Extracts ONLY the readable time slot value from message text.
+    Handles all newline formats: \\n, \n, \r\n
+    
+    Input:  "Time:  4 PM - 6 PM \n\nConsultation Fee..."
+    Output: "4 PM - 6 PM"
     """
     try:
         parts = message_text.split("Time:")
@@ -246,13 +244,16 @@ def _extract_time_from_message(message_text):
 
         after_time = parts[1].strip()
 
-        # Time value ends at newline
-        first_line = after_time.split("\\n")[0].strip()
-        if not first_line:
-            first_line = after_time.split("\n")[0].strip()
+        # Split on every possible newline format
+        # Take whichever gives us the shortest first chunk
+        for separator in ["\n", "\\n", "\r\n", "\r"]:
+            if separator in after_time:
+                after_time = after_time.split(separator)[0].strip()
+                break
 
-        if "AM" in first_line or "PM" in first_line:
-            return first_line
+        # Validate it looks like a time value
+        if "AM" in after_time or "PM" in after_time:
+            return after_time
 
         return ""
     except Exception:
