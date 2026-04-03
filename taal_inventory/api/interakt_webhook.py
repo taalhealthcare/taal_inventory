@@ -51,31 +51,21 @@ def _handle_workflow_completion(payload):
     if not patient_name:
         return {"status": "ignored", "reason": "no customer name"}
 
-    # ── Step 3: Read ALL user traits ─────────────────────────────
-    # Interakt stores form responses as user traits
-    # after form submission — this is the most reliable source
-    traits = data.get("customer", {}).get("traits", {})
-
-    # ── Step 4: Extract form data from workflow steps ────────────
+    # ── Step 3: Extract form data from workflow steps ────────────
     steps = data.get("data", [])
     form_data = _extract_form_data(steps)
 
-    # ── Step 5: STRICT FILTER ────────────────────────────────────
-    # Only process if we have a form submission
-    # A valid booking MUST have at least a preferred_date
-    # from either form_data or traits
-    preferred_date = (
-        form_data.get("preferred_date")
-        or traits.get("consultation_date", "")
-    )
-
+    # ── Step 4: STRICT FILTER ────────────────────────────────────
+    # Only process events that have an actual form submission.
+    # A valid booking MUST have preferred_date.
+    preferred_date = form_data.get("preferred_date", "")
     if not preferred_date:
         return {
             "status": "ignored",
             "reason": "no form submission in this event"
         }
 
-    # ── Step 6: Deduplication ─────────────────────────────────────
+    # ── Step 5: Deduplication ────────────────────────────────────
     # Use workflow instance ID as unique key
     workflow_instance_id = data.get("id", "")
     record_id = f"IKT-{workflow_instance_id}" \
@@ -89,32 +79,19 @@ def _handle_workflow_completion(payload):
         )
         return {"status": "duplicate", "booking": existing}
 
-    # ── Step 7: Build all field values ───────────────────────────
-    # For each field: use form_data first, fall back to traits
+    # ── Step 6: Build all field values ───────────────────────────
+    city_location        = form_data.get("city_location", "")
+    preferred_time_slot  = form_data.get("preferred_time_slot", "")
+    consultation_reason  = form_data.get("consultation_reason", "")
 
-    city_location = (
-        form_data.get("city_location")
-        or traits.get("patient_city", "")
-    )
-
-    preferred_time_slot = _resolve_time_slot(
-        form_data.get("preferred_time_slot", ""),
-        traits.get("consultation_time", "")
-    )
-
-    consultation_reason = (
-        form_data.get("consultation_reason")
-        or traits.get("consultation_reason", "")
-    )
-
-    # ── Step 8: Get or create Patient ────────────────────────────
+    # ── Step 7: Get or create Patient ────────────────────────────
     patient_id = _get_or_create_patient(
         whatsapp_number=whatsapp_number,
         patient_name=patient_name,
         city_location=city_location
     )
 
-    # ── Step 9: Create Interakt Booking ──────────────────────────
+    # ── Step 8: Create Interakt Booking ──────────────────────────
     booking = frappe.new_doc("Interakt Booking")
 
     # Section A: Source Identity
@@ -161,92 +138,137 @@ def _handle_workflow_completion(payload):
 
 def _extract_form_data(steps):
     """
-    Loops through workflow steps looking for
-    InteractiveFlowReply — the WhatsApp Form response.
-    Parses the nested JSON and maps fields by key prefix.
+    Extracts all booking data from workflow steps.
+
+    Two sources used together:
+    1. InteractiveFlowReply — the WhatsApp Form submission
+       (has date, city, reason, raw time option ID)
+    2. Question message text — the Thank You message sent
+       to patient has the resolved readable time slot value
+       e.g. "Time:  4 PM - 6 PM"
     """
     result = {}
 
     for step in steps:
-        answer = step.get("answer", {})
+        question = step.get("question", {})
+        answer   = step.get("answer", {})
         msg_type = answer.get("message_content_type", "")
 
-        if msg_type != "InteractiveFlowReply":
-            continue
+        # ── Source 1: WhatsApp Form Submission ───────────────────
+        if msg_type == "InteractiveFlowReply":
+            try:
+                msg_str = answer.get("message", "{}")
+                msg = json.loads(msg_str)
+                response_json_str = (
+                    msg.get("nfm_reply", {})
+                       .get("response_json", "{}")
+                )
+                form_fields = json.loads(response_json_str)
 
-        try:
-            msg_str = answer.get("message", "{}")
-            msg = json.loads(msg_str)
-            response_json_str = (
-                msg.get("nfm_reply", {})
-                   .get("response_json", "{}")
-            )
-            form_fields = json.loads(response_json_str)
+                for key, value in form_fields.items():
+                    key_lower = key.lower()
 
-            for key, value in form_fields.items():
-                key_lower = key.lower()
+                    if key_lower.startswith("full_name") or \
+                       key_lower.startswith("patient_name"):
+                        result["patient_name"] = str(value).strip()
 
-                if key_lower.startswith("full_name") or \
-                   key_lower.startswith("patient_name"):
-                    result["patient_name"] = str(value).strip()
+                    elif key_lower.startswith("city"):
+                        result["city_location"] = str(value).strip()
 
-                elif key_lower.startswith("city"):
-                    result["city_location"] = str(value).strip()
+                    elif key_lower.startswith("preferred_date"):
+                        result["preferred_date"] = str(value).strip()
 
-                elif key_lower.startswith("preferred_date"):
-                    result["preferred_date"] = str(value).strip()
+                    elif key_lower.startswith("preferred_time"):
+                        # Store raw — will be overridden by readable
+                        # value extracted from message text below
+                        result["preferred_time_slot_raw"] = \
+                            str(value).strip()
 
-                elif key_lower.startswith("preferred_time"):
-                    result["preferred_time_slot"] = str(value).strip()
+                    elif key_lower.startswith("reason") or \
+                         key_lower.startswith("consultation_reason"):
+                        result["consultation_reason"] = \
+                            str(value).strip()
 
-                elif key_lower.startswith("reason") or \
-                     key_lower.startswith("consultation_reason"):
-                    result["consultation_reason"] = str(value).strip()
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "Interakt: Form Parse Error"
+                )
 
-        except Exception:
-            frappe.log_error(
-                frappe.get_traceback(),
-                "Interakt: Form Parse Error"
-            )
+        # ── Source 2: Thank You Message (readable time) ──────────
+        # The confirmation message Interakt sends to the patient
+        # contains the resolved human-readable time slot.
+        # e.g. "Date:  2026-08-27\nTime:  4 PM - 6 PM"
+        # We extract the time value from here — this is permanent
+        # and works for any time slot label changes in Interakt.
+        q_message = question.get("message", "")
+        if "Time:" in q_message and (
+            "AM" in q_message or "PM" in q_message
+        ):
+            time_val = _extract_time_from_message(q_message)
+            if time_val:
+                result["preferred_time_slot"] = time_val
+
+        a_message = str(answer.get("message", ""))
+        if "Time:" in a_message and (
+            "AM" in a_message or "PM" in a_message
+        ):
+            time_val = _extract_time_from_message(a_message)
+            if time_val:
+                result["preferred_time_slot"] = time_val
+
+    # ── Final: resolve time slot ─────────────────────────────────
+    # If we got a readable time from message text — use it
+    # Otherwise fall back to raw option ID from form
+    if not result.get("preferred_time_slot"):
+        raw = result.pop("preferred_time_slot_raw", "")
+        result["preferred_time_slot"] = raw
+    else:
+        result.pop("preferred_time_slot_raw", None)
 
     return result
 
 
-def _resolve_time_slot(form_value, trait_value):
+def _extract_time_from_message(message_text):
     """
-    Permanent solution — no hardcoded option ID mappings.
+    Extracts the readable time slot from Thank You message text.
 
-    Priority:
-    1. trait_value — always the human readable label
-       e.g. '4 PM - 6 PM' or '9:00 AM - 11:00 AM'
-    2. form_value — only if it contains AM/PM (readable)
-    3. Raw form_value — stored as-is if nothing better
+    Message format:
+    "...Date:  2026-08-27\\nTime:  4 PM - 6 PM\\n..."
+
+    Returns readable string e.g. "4 PM - 6 PM"
+    Works permanently regardless of time slot label changes.
     """
-    # Trait value is always readable — use it first
-    if trait_value and (
-        "AM" in trait_value or "PM" in trait_value
-    ):
-        return trait_value.strip()
+    try:
+        parts = message_text.split("Time:")
+        if len(parts) < 2:
+            return ""
 
-    # Form value is readable — use it
-    if form_value and (
-        "AM" in form_value or "PM" in form_value
-    ):
-        return form_value.strip()
+        after_time = parts[1].strip()
 
-    # Return whatever we have
-    return (trait_value or form_value or "").strip()
+        # Time value ends at newline
+        first_line = after_time.split("\\n")[0].strip()
+        if not first_line:
+            first_line = after_time.split("\n")[0].strip()
+
+        if "AM" in first_line or "PM" in first_line:
+            return first_line
+
+        return ""
+    except Exception:
+        return ""
 
 
 def _get_or_create_patient(
     whatsapp_number, patient_name, city_location=""
 ):
     """
-    Search for existing Patient by WhatsApp number.
+    Search for existing Patient by WhatsApp number first.
     Fall back to name search for pre-existing patients.
     Create new if not found anywhere.
+    Gender set to Other — required by ERPNext Healthcare.
     """
-    # Search 1: by WhatsApp number
+    # Search 1: by WhatsApp number — primary key
     existing = frappe.db.get_value(
         "Patient",
         {"custom_whatsapp_number": whatsapp_number},
@@ -272,7 +294,7 @@ def _get_or_create_patient(
         frappe.db.commit()
         return existing
 
-    # Search 3: LIKE search
+    # Search 3: LIKE search as last resort
     existing = frappe.db.get_value(
         "Patient",
         {"patient_name": ("like", f"%{patient_name}%")},
