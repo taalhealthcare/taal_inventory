@@ -175,26 +175,35 @@ def _extract_form_data(steps):
 
 def _resolve_time_slot(option_value):
     """
-    Interakt sends time slot as an option ID like:
-    option_1773381068873_bbg7g961e
-    Map known option IDs to readable labels.
-    If unknown, return as-is.
+    Interakt sends time slot as internal option ID like:
+    option_1773381057829_vihn2mczm
+    
+    We map known IDs to readable labels.
+    For unknown IDs, we return a cleaned readable version
+    so the booking is never blocked.
     """
+    # Direct readable match — return as-is
+    if "AM" in str(option_value) or "PM" in str(option_value):
+        return option_value
+
+    # Known option ID mappings
+    # These are discovered from your actual Interakt form
     slot_map = {
-        "option_1": "9:00 AM - 11:00 AM",
-        "option_2": "11:00 AM - 1:00 PM",
-        "option_3": "12:00 PM - 2:00 PM",
-        "option_4": "2:00 PM - 4:00 PM",
-        "option_5": "4:00 PM - 6:00 PM",
+        # Add real mappings as we discover them from logs
+        "option_1773381068873_bbg7g961e": "4:00 PM - 6:00 PM",
+        "option_1773381057829_vihn2mczm": "9:00 AM - 11:00 AM",
     }
-    # Try exact match first
+
     if option_value in slot_map:
         return slot_map[option_value]
-    # If it already looks like a readable time, return as-is
-    if "AM" in option_value or "PM" in option_value:
-        return option_value
-    # Return raw value — we will map it properly after first test
-    return option_value
+
+    # Unknown option ID — extract any readable part
+    # or return a safe default that won't crash
+    # Since field is now Data type, any string is accepted
+    if option_value and str(option_value).startswith("option_"):
+        return f"Slot: {option_value}"
+
+    return option_value or ""
 
 
 def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
