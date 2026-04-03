@@ -7,12 +7,9 @@ from frappe.utils import now_datetime
 def receive_interakt_booking():
     """
     Receives native Interakt Developer webhook events.
-    Only processes workflow_response_update events.
-    All other event types are silently ignored.
-
-    URL configured in Interakt Developer Settings:
-    https://demoerp.m.frappe.cloud/api/method/
-    taal_inventory.api.interakt_webhook.receive_interakt_booking
+    Only processes workflow_response_update events
+    that contain a completed WhatsApp Form submission.
+    All other events are silently ignored.
     """
     try:
         raw = frappe.request.data
@@ -22,11 +19,9 @@ def receive_interakt_booking():
         payload = json.loads(raw)
         event_type = payload.get("type", "")
 
-        # Only act on workflow completion events
         if event_type == "workflow_response_update":
             return _handle_workflow_completion(payload)
         else:
-            # Silently ignore all other Interakt event types
             return {"status": "ignored", "event_type": event_type}
 
     except Exception as e:
@@ -39,31 +34,52 @@ def receive_interakt_booking():
 
 def _handle_workflow_completion(payload):
     """
-    Parses workflow_response_update event from Interakt.
-    Extracts patient data and creates Interakt Booking + Patient.
+    Parses workflow_response_update event.
+    Only processes events that contain a completed form submission.
     """
     data = payload.get("data", {})
 
-    # --- Extract phone number ---
-    # Interakt sends as '+918604449446' — remove + sign
+    # ── Step 1: Extract phone number ─────────────────────────────
     raw_number = data.get("customer_number", "")
     whatsapp_number = raw_number.replace("+", "").strip()
-    patient_name = data.get("customer_name", "")
 
     if not whatsapp_number:
-        frappe.log_error(
-            "No customer_number found in workflow_response_update payload",
-            "Interakt: Missing Phone Number"
-        )
-        return {"status": "error", "reason": "no phone number"}
+        return {"status": "ignored", "reason": "no phone number"}
 
-    # --- Extract form fields from workflow steps ---
-    form_data = _extract_form_data(data.get("data", []))
+    # ── Step 2: Extract customer name ────────────────────────────
+    patient_name = str(data.get("customer_name", "")).strip()[:50]
+    if not patient_name:
+        return {"status": "ignored", "reason": "no customer name"}
 
-    # --- Deduplicate using workflow instance ID ---
+    # ── Step 3: Read ALL user traits ─────────────────────────────
+    # Interakt stores form responses as user traits
+    # after form submission — this is the most reliable source
+    traits = data.get("customer", {}).get("traits", {})
+
+    # ── Step 4: Extract form data from workflow steps ────────────
+    steps = data.get("data", [])
+    form_data = _extract_form_data(steps)
+
+    # ── Step 5: STRICT FILTER ────────────────────────────────────
+    # Only process if we have a form submission
+    # A valid booking MUST have at least a preferred_date
+    # from either form_data or traits
+    preferred_date = (
+        form_data.get("preferred_date")
+        or traits.get("consultation_date", "")
+    )
+
+    if not preferred_date:
+        return {
+            "status": "ignored",
+            "reason": "no form submission in this event"
+        }
+
+    # ── Step 6: Deduplication ─────────────────────────────────────
+    # Use workflow instance ID as unique key
     workflow_instance_id = data.get("id", "")
-    record_id = f"IKT-{workflow_instance_id}" if workflow_instance_id \
-        else _generate_record_id()
+    record_id = f"IKT-{workflow_instance_id}" \
+        if workflow_instance_id else _generate_record_id()
 
     if frappe.db.exists("Interakt Booking", {"record_id": record_id}):
         existing = frappe.db.get_value(
@@ -73,14 +89,32 @@ def _handle_workflow_completion(payload):
         )
         return {"status": "duplicate", "booking": existing}
 
-    # --- Get or create Patient ---
+    # ── Step 7: Build all field values ───────────────────────────
+    # For each field: use form_data first, fall back to traits
+
+    city_location = (
+        form_data.get("city_location")
+        or traits.get("patient_city", "")
+    )
+
+    preferred_time_slot = _resolve_time_slot(
+        form_data.get("preferred_time_slot", ""),
+        traits.get("consultation_time", "")
+    )
+
+    consultation_reason = (
+        form_data.get("consultation_reason")
+        or traits.get("consultation_reason", "")
+    )
+
+    # ── Step 8: Get or create Patient ────────────────────────────
     patient_id = _get_or_create_patient(
         whatsapp_number=whatsapp_number,
         patient_name=patient_name,
-        city_location=form_data.get("city_location", "")
+        city_location=city_location
     )
 
-    # --- Create Interakt Booking ---
+    # ── Step 9: Create Interakt Booking ──────────────────────────
     booking = frappe.new_doc("Interakt Booking")
 
     # Section A: Source Identity
@@ -93,23 +127,14 @@ def _handle_workflow_completion(payload):
     booking.patient             = patient_id
     booking.patient_name        = patient_name
     booking.whatsapp_number     = whatsapp_number
-    booking.city_location       = form_data.get("city_location", "")
+    booking.city_location       = city_location
 
     # Section C: Service Details
     booking.selected_service    = "Doctor Consultation"
     booking.consultation_type   = "Doctor"
-    booking.preferred_date      = form_data.get("preferred_date", "")
-    # Read time slot — prefer user trait (always readable)
-    # over form option ID (always a raw key)
-    traits = data.get("customer", {}).get("traits", {})
-    trait_time = traits.get("consultation_time", "")
-    form_time = form_data.get("preferred_time_slot", "")
-
-    if trait_time and ("AM" in trait_time or "PM" in trait_time):
-        booking.preferred_time_slot = trait_time
-    else:
-        booking.preferred_time_slot = form_time
-    booking.consultation_reason = form_data.get("consultation_reason", "")
+    booking.preferred_date      = preferred_date
+    booking.preferred_time_slot = preferred_time_slot
+    booking.consultation_reason = consultation_reason
 
     # Section D: Payment
     booking.payment_amount_inr  = 499
@@ -124,16 +149,21 @@ def _handle_workflow_completion(payload):
     return {
         "status": "success",
         "booking": booking.name,
-        "patient": patient_id
+        "patient": patient_id,
+        "data": {
+            "preferred_date": preferred_date,
+            "preferred_time_slot": preferred_time_slot,
+            "city_location": city_location,
+            "consultation_reason": consultation_reason
+        }
     }
 
 
 def _extract_form_data(steps):
     """
-    Loops through workflow steps and finds the WhatsApp Form response.
-    The form response is in the step with message_content_type
-    = InteractiveFlowReply.
-    Parses the response_json and maps fields by key prefix.
+    Loops through workflow steps looking for
+    InteractiveFlowReply — the WhatsApp Form response.
+    Parses the nested JSON and maps fields by key prefix.
     """
     result = {}
 
@@ -141,88 +171,82 @@ def _extract_form_data(steps):
         answer = step.get("answer", {})
         msg_type = answer.get("message_content_type", "")
 
-        if msg_type == "InteractiveFlowReply":
-            try:
-                # The message is a JSON string containing nfm_reply
-                msg = json.loads(answer.get("message", "{}"))
-                response_json_str = msg.get(
-                    "nfm_reply", {}
-                ).get("response_json", "{}")
-                form_fields = json.loads(response_json_str)
+        if msg_type != "InteractiveFlowReply":
+            continue
 
-                # Keys have format: field_label_RANDOMID
-                # Match by prefix to extract values reliably
-                for key, value in form_fields.items():
-                    key_lower = key.lower()
+        try:
+            msg_str = answer.get("message", "{}")
+            msg = json.loads(msg_str)
+            response_json_str = (
+                msg.get("nfm_reply", {})
+                   .get("response_json", "{}")
+            )
+            form_fields = json.loads(response_json_str)
 
-                    if key_lower.startswith("full_name") or \
-                       key_lower.startswith("patient_name"):
-                        result["patient_name"] = value
+            for key, value in form_fields.items():
+                key_lower = key.lower()
 
-                    elif key_lower.startswith("city"):
-                        result["city_location"] = value
+                if key_lower.startswith("full_name") or \
+                   key_lower.startswith("patient_name"):
+                    result["patient_name"] = str(value).strip()
 
-                    elif key_lower.startswith("preferred_date"):
-                        result["preferred_date"] = value
+                elif key_lower.startswith("city"):
+                    result["city_location"] = str(value).strip()
 
-                    elif key_lower.startswith("preferred_time_slot"):
-                        # Convert option ID to readable label if needed
-                        result["preferred_time_slot"] = \
-                            _resolve_time_slot(value)
+                elif key_lower.startswith("preferred_date"):
+                    result["preferred_date"] = str(value).strip()
 
-                    elif key_lower.startswith("reason"):
-                        result["consultation_reason"] = value
+                elif key_lower.startswith("preferred_time"):
+                    result["preferred_time_slot"] = str(value).strip()
 
-            except Exception:
-                frappe.log_error(
-                    frappe.get_traceback(),
-                    "Interakt: Form Data Parse Error"
-                )
+                elif key_lower.startswith("reason") or \
+                     key_lower.startswith("consultation_reason"):
+                    result["consultation_reason"] = str(value).strip()
+
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                "Interakt: Form Parse Error"
+            )
 
     return result
 
 
-def _resolve_time_slot(option_value):
+def _resolve_time_slot(form_value, trait_value):
     """
-    Interakt sends time slot as internal option ID like:
-    option_1773381057829_vihn2mczm
-    
-    We map known IDs to readable labels.
-    For unknown IDs, we return a cleaned readable version
-    so the booking is never blocked.
+    Permanent solution — no hardcoded option ID mappings.
+
+    Priority:
+    1. trait_value — always the human readable label
+       e.g. '4 PM - 6 PM' or '9:00 AM - 11:00 AM'
+    2. form_value — only if it contains AM/PM (readable)
+    3. Raw form_value — stored as-is if nothing better
     """
-    # Direct readable match — return as-is
-    if "AM" in str(option_value) or "PM" in str(option_value):
-        return option_value
+    # Trait value is always readable — use it first
+    if trait_value and (
+        "AM" in trait_value or "PM" in trait_value
+    ):
+        return trait_value.strip()
 
-    # Known option ID mappings
-    # These are discovered from your actual Interakt form
-    slot_map = {
-        # Add real mappings as we discover them from logs
-        "option_1773381068873_bbg7g961e": "4:00 PM - 6:00 PM",
-        "option_1773381057829_vihn2mczm": "9:00 AM - 11:00 AM",
-    }
+    # Form value is readable — use it
+    if form_value and (
+        "AM" in form_value or "PM" in form_value
+    ):
+        return form_value.strip()
 
-    if option_value in slot_map:
-        return slot_map[option_value]
-
-    # Unknown option ID — extract any readable part
-    # or return a safe default that won't crash
-    # Since field is now Data type, any string is accepted
-    if option_value and str(option_value).startswith("option_"):
-        return f"Slot: {option_value}"
-
-    return option_value or ""
+    # Return whatever we have
+    return (trait_value or form_value or "").strip()
 
 
-def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
+def _get_or_create_patient(
+    whatsapp_number, patient_name, city_location=""
+):
     """
-    Search for existing Patient by WhatsApp number first.
-    Then by patient_name field.
-    Then by first_name field.
-    If all fail, create new patient safely.
+    Search for existing Patient by WhatsApp number.
+    Fall back to name search for pre-existing patients.
+    Create new if not found anywhere.
     """
-    # Search 1: by WhatsApp number — primary key
+    # Search 1: by WhatsApp number
     existing = frappe.db.get_value(
         "Patient",
         {"custom_whatsapp_number": whatsapp_number},
@@ -231,7 +255,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     if existing:
         return existing
 
-    # Search 2: by patient_name (full name field in Healthcare)
+    # Search 2: by patient_name field
     existing = frappe.db.get_value(
         "Patient",
         {"patient_name": patient_name},
@@ -239,8 +263,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     )
     if existing:
         frappe.db.set_value(
-            "Patient",
-            existing,
+            "Patient", existing,
             {
                 "custom_whatsapp_number": whatsapp_number,
                 "custom_city_location": city_location
@@ -249,25 +272,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
         frappe.db.commit()
         return existing
 
-    # Search 3: by first_name
-    existing = frappe.db.get_value(
-        "Patient",
-        {"first_name": patient_name},
-        "name"
-    )
-    if existing:
-        frappe.db.set_value(
-            "Patient",
-            existing,
-            {
-                "custom_whatsapp_number": whatsapp_number,
-                "custom_city_location": city_location
-            }
-        )
-        frappe.db.commit()
-        return existing
-
-    # Search 4: case-insensitive LIKE search as last resort
+    # Search 3: LIKE search
     existing = frappe.db.get_value(
         "Patient",
         {"patient_name": ("like", f"%{patient_name}%")},
@@ -275,8 +280,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     )
     if existing:
         frappe.db.set_value(
-            "Patient",
-            existing,
+            "Patient", existing,
             {
                 "custom_whatsapp_number": whatsapp_number,
                 "custom_city_location": city_location
@@ -285,7 +289,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
         frappe.db.commit()
         return existing
 
-    # Nothing found — create new Patient
+    # Not found — create new Patient
     try:
         patient = frappe.new_doc("Patient")
         patient.first_name             = patient_name
@@ -297,8 +301,7 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
         frappe.db.commit()
         return patient.name
 
-    except (frappe.UniqueValidationError, Exception) as e:
-        # Last resort: fetch whatever patient exists with this name
+    except Exception as e:
         frappe.db.rollback()
         fallback = frappe.db.get_value(
             "Patient",
@@ -307,16 +310,14 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
         )
         if fallback:
             frappe.db.set_value(
-                "Patient",
-                fallback,
-                "custom_whatsapp_number",
-                whatsapp_number
+                "Patient", fallback,
+                "custom_whatsapp_number", whatsapp_number
             )
             frappe.db.commit()
             return fallback
         frappe.log_error(
-            f"Could not find or create patient: {patient_name}\n{str(e)}",
-            "Patient Lookup Failed"
+            f"Patient create failed: {patient_name}\n{str(e)}",
+            "Patient Creation Failed"
         )
         raise
 
