@@ -200,9 +200,9 @@ def _resolve_time_slot(option_value):
 def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     """
     Search for existing Patient by WhatsApp number first.
-    If not found, search by name as fallback.
-    If still not found, create new Patient.
-    Updates WhatsApp number on existing patient if missing.
+    Then by patient_name field.
+    Then by first_name field.
+    If all fail, create new patient safely.
     """
     # Search 1: by WhatsApp number — primary key
     existing = frappe.db.get_value(
@@ -213,27 +213,61 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
     if existing:
         return existing
 
-    # Search 2: by name — catches patients created before
-    # integration or from previous test runs
-    existing_by_name = frappe.db.get_value(
+    # Search 2: by patient_name (full name field in Healthcare)
+    existing = frappe.db.get_value(
         "Patient",
-        {"first_name": patient_name},
+        {"patient_name": patient_name},
         "name"
     )
-    if existing_by_name:
-        # Update their WhatsApp number so next lookup works
+    if existing:
         frappe.db.set_value(
             "Patient",
-            existing_by_name,
+            existing,
             {
                 "custom_whatsapp_number": whatsapp_number,
                 "custom_city_location": city_location
             }
         )
         frappe.db.commit()
-        return existing_by_name
+        return existing
 
-    # Not found anywhere — create new Patient
+    # Search 3: by first_name
+    existing = frappe.db.get_value(
+        "Patient",
+        {"first_name": patient_name},
+        "name"
+    )
+    if existing:
+        frappe.db.set_value(
+            "Patient",
+            existing,
+            {
+                "custom_whatsapp_number": whatsapp_number,
+                "custom_city_location": city_location
+            }
+        )
+        frappe.db.commit()
+        return existing
+
+    # Search 4: case-insensitive LIKE search as last resort
+    existing = frappe.db.get_value(
+        "Patient",
+        {"patient_name": ("like", f"%{patient_name}%")},
+        "name"
+    )
+    if existing:
+        frappe.db.set_value(
+            "Patient",
+            existing,
+            {
+                "custom_whatsapp_number": whatsapp_number,
+                "custom_city_location": city_location
+            }
+        )
+        frappe.db.commit()
+        return existing
+
+    # Nothing found — create new Patient
     try:
         patient = frappe.new_doc("Patient")
         patient.first_name             = patient_name
@@ -245,12 +279,12 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
         frappe.db.commit()
         return patient.name
 
-    except frappe.UniqueValidationError:
-        # Race condition — patient was just created by another
-        # request. Fetch and return it.
+    except (frappe.UniqueValidationError, Exception) as e:
+        # Last resort: fetch whatever patient exists with this name
+        frappe.db.rollback()
         fallback = frappe.db.get_value(
             "Patient",
-            {"first_name": patient_name},
+            {"patient_name": ("like", f"%{patient_name}%")},
             "name"
         )
         if fallback:
@@ -262,6 +296,10 @@ def _get_or_create_patient(whatsapp_number, patient_name, city_location=""):
             )
             frappe.db.commit()
             return fallback
+        frappe.log_error(
+            f"Could not find or create patient: {patient_name}\n{str(e)}",
+            "Patient Lookup Failed"
+        )
         raise
 
 
