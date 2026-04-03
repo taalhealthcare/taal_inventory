@@ -99,7 +99,16 @@ def _handle_workflow_completion(payload):
     booking.selected_service    = "Doctor Consultation"
     booking.consultation_type   = "Doctor"
     booking.preferred_date      = form_data.get("preferred_date", "")
-    booking.preferred_time_slot = form_data.get("preferred_time_slot", "")
+    # Read time slot — prefer user trait (always readable)
+    # over form option ID (always a raw key)
+    traits = data.get("customer", {}).get("traits", {})
+    trait_time = traits.get("consultation_time", "")
+    form_time = form_data.get("preferred_time_slot", "")
+
+    if trait_time and ("AM" in trait_time or "PM" in trait_time):
+        booking.preferred_time_slot = trait_time
+    else:
+        booking.preferred_time_slot = form_time
     booking.consultation_reason = form_data.get("consultation_reason", "")
 
     # Section D: Payment
