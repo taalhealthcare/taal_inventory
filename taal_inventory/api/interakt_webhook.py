@@ -66,7 +66,6 @@ def _handle_workflow_completion(payload):
         }
 
     # ── Step 5: Deduplication ────────────────────────────────────
-    # Use workflow instance ID as unique key
     workflow_instance_id = data.get("id", "")
     record_id = f"IKT-{workflow_instance_id}" \
         if workflow_instance_id else _generate_record_id()
@@ -80,9 +79,9 @@ def _handle_workflow_completion(payload):
         return {"status": "duplicate", "booking": existing}
 
     # ── Step 6: Build all field values ───────────────────────────
-    city_location        = form_data.get("city_location", "")
-    preferred_time_slot  = form_data.get("preferred_time_slot", "")
-    consultation_reason  = form_data.get("consultation_reason", "")
+    city_location       = form_data.get("city_location", "")
+    preferred_time_slot = form_data.get("preferred_time_slot", "")
+    consultation_reason = form_data.get("consultation_reason", "")
 
     # ── Step 7: Get or create Patient ────────────────────────────
     patient_id = _get_or_create_patient(
@@ -95,30 +94,30 @@ def _handle_workflow_completion(payload):
     booking = frappe.new_doc("Interakt Booking")
 
     # Section A: Source Identity
-    booking.record_id           = record_id
-    booking.booking_source      = "Interakt WhatsApp"
-    booking.interakt_flow_name  = "Doctor Consultation"
-    booking.lead_created_at     = now_datetime()
+    booking.record_id          = record_id
+    booking.booking_source     = "Interakt WhatsApp"
+    booking.interakt_flow_name = "Doctor Consultation"
+    booking.lead_created_at    = now_datetime()
 
     # Section B: Patient Details
-    booking.patient             = patient_id
-    booking.patient_name        = patient_name
-    booking.whatsapp_number     = whatsapp_number
-    booking.city_location       = city_location
+    booking.patient            = patient_id
+    booking.patient_name       = patient_name
+    booking.whatsapp_number    = whatsapp_number
+    booking.city_location      = city_location
 
     # Section C: Service Details
-    booking.selected_service    = "Doctor Consultation"
-    booking.consultation_type   = "Doctor"
-    booking.preferred_date      = preferred_date
+    booking.selected_service   = "Doctor Consultation"
+    booking.consultation_type  = "Doctor"
+    booking.preferred_date     = preferred_date
     booking.preferred_time_slot = preferred_time_slot
     booking.consultation_reason = consultation_reason
 
     # Section D: Payment
-    booking.payment_amount_inr  = 499
-    booking.payment_status      = "Pending"
+    booking.payment_amount_inr = 499
+    booking.payment_status     = "Pending"
 
     # Section E: Operations
-    booking.booking_status      = "Pending Payment"
+    booking.booking_status     = "Pending Payment"
 
     booking.insert(ignore_permissions=True)
     frappe.db.commit()
@@ -141,11 +140,10 @@ def _extract_form_data(steps):
     Extracts all booking data from workflow steps.
 
     Two sources used together:
-    1. InteractiveFlowReply — the WhatsApp Form submission
-       (has date, city, reason, raw time option ID)
-    2. Question message text — the Thank You message sent
-       to patient has the resolved readable time slot value
-       e.g. "Time:  4 PM - 6 PM"
+    1. InteractiveFlowReply — WhatsApp Form submission
+       contains date, city, reason, raw time option ID
+    2. Question message text — Thank You message sent to
+       patient has the resolved readable time slot label
     """
     result = {}
 
@@ -179,8 +177,8 @@ def _extract_form_data(steps):
                         result["preferred_date"] = str(value).strip()
 
                     elif key_lower.startswith("preferred_time"):
-                        # Store raw — will be overridden by readable
-                        # value extracted from message text below
+                        # Store raw — will be overridden if readable
+                        # value found in message text below
                         result["preferred_time_slot_raw"] = \
                             str(value).strip()
 
@@ -196,11 +194,9 @@ def _extract_form_data(steps):
                 )
 
         # ── Source 2: Thank You Message (readable time) ──────────
-        # The confirmation message Interakt sends to the patient
-        # contains the resolved human-readable time slot.
+        # The confirmation message sent to patient contains
+        # the resolved human-readable time slot label.
         # e.g. "Date:  2026-08-27\nTime:  4 PM - 6 PM"
-        # We extract the time value from here — this is permanent
-        # and works for any time slot label changes in Interakt.
         q_message = question.get("message", "")
         if "Time:" in q_message and (
             "AM" in q_message or "PM" in q_message
@@ -218,13 +214,24 @@ def _extract_form_data(steps):
                 result["preferred_time_slot"] = time_val
 
     # ── Final: resolve time slot ─────────────────────────────────
-    # If we got a readable time from message text — use it
-    # Otherwise fall back to raw option ID from form
-    if not result.get("preferred_time_slot"):
-        raw = result.pop("preferred_time_slot_raw", "")
-        result["preferred_time_slot"] = raw
+    # Priority:
+    # 1. Readable time extracted from message text — best source
+    # 2. Known option ID mapping — reliable fallback
+    # 3. Raw option ID — last resort, always stored
+    readable_from_message = result.get("preferred_time_slot", "")
+    raw_option_id = result.pop("preferred_time_slot_raw", "")
+
+    if readable_from_message and (
+        "AM" in readable_from_message or
+        "PM" in readable_from_message
+    ):
+        # Already got readable value from message text
+        result["preferred_time_slot"] = readable_from_message
     else:
-        result.pop("preferred_time_slot_raw", None)
+        # Use known option ID mapping as fallback
+        result["preferred_time_slot"] = _resolve_time_slot(
+            raw_option_id
+        )
 
     return result
 
@@ -232,32 +239,76 @@ def _extract_form_data(steps):
 def _extract_time_from_message(message_text):
     """
     Extracts ONLY the readable time slot value from message text.
-    Handles all newline formats: \\n, \n, \r\n
-    
+    Handles non-breaking spaces and all newline formats.
+
     Input:  "Time:  4 PM - 6 PM \n\nConsultation Fee..."
     Output: "4 PM - 6 PM"
     """
     try:
+        if "Time:" not in message_text:
+            return ""
+
         parts = message_text.split("Time:")
         if len(parts) < 2:
             return ""
 
-        after_time = parts[1].strip()
+        after_time = parts[1]
 
-        # Split on every possible newline format
-        # Take whichever gives us the shortest first chunk
+        # Remove non-breaking spaces
+        after_time = after_time.replace("\xa0", " ").strip()
+
+        # Split on every possible newline — take first chunk only
         for separator in ["\n", "\\n", "\r\n", "\r"]:
             if separator in after_time:
-                after_time = after_time.split(separator)[0].strip()
+                after_time = after_time.split(separator)[0]
                 break
 
-        # Validate it looks like a time value
+        # Final clean
+        after_time = after_time.replace("\xa0", " ").strip()
+        after_time = after_time.rstrip(".,;:")
+
         if "AM" in after_time or "PM" in after_time:
-            return after_time
+            return after_time.strip()
 
         return ""
     except Exception:
         return ""
+
+
+def _resolve_time_slot(raw_option_id):
+    """
+    Resolves Interakt option IDs to readable time labels.
+
+    These option IDs are stable for YOUR specific form —
+    they only change if you delete and recreate the
+    dropdown field in Interakt WhatsApp Forms.
+
+    To add new mappings:
+    1. Run a test booking with an unknown slot
+    2. Check Interakt Booking record for the raw option ID
+    3. Add it here with its label
+
+    Current known mappings for TAAL+ Doctor Consultation form:
+    """
+    slot_map = {
+        "option_1773381068873_bbg7g961e": "4:00 PM - 6:00 PM",
+        "option_1773381057829_vihn2mczm": "9:00 AM - 11:00 AM",
+        "option_1773381018418_s16i4ur2a": "11:00 AM - 1:00 PM",
+    }
+
+    if not raw_option_id:
+        return ""
+
+    # Already readable — return directly
+    if "AM" in raw_option_id or "PM" in raw_option_id:
+        return raw_option_id.strip()
+
+    # Known mapping — return readable label
+    if raw_option_id in slot_map:
+        return slot_map[raw_option_id]
+
+    # Unknown option ID — store raw so we can add mapping later
+    return raw_option_id
 
 
 def _get_or_create_patient(
