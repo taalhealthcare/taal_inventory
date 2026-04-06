@@ -35,7 +35,8 @@ def receive_interakt_booking():
 def _handle_workflow_completion(payload):
     """
     Parses workflow_response_update event.
-    Only processes events that contain a completed form submission.
+    Only processes events that contain a completed
+    WhatsApp Form submission.
     """
     data = payload.get("data", {})
 
@@ -90,6 +91,8 @@ def _handle_workflow_completion(payload):
     # ── Step 7: Get or create Patient ────────────────────────────
     # WhatsApp number is the ONLY reliable unique key.
     # Name matching is exact only — no LIKE search ever.
+    # UID is auto-assigned by Server Script on before_insert
+    # using ORDER BY uid DESC — so no collision possible.
     patient_id = _get_or_create_patient(
         whatsapp_number=whatsapp_number,
         patient_name=patient_name,
@@ -291,7 +294,7 @@ def _resolve_time_slot(raw_option_id):
 
     To add a new mapping:
     1. Run a test booking selecting the unknown time slot
-    2. Check the Interakt Booking record for the raw option ID
+    2. Check Interakt Booking record for the raw option ID
     3. Add it to slot_map below with its readable label
     """
     slot_map = {
@@ -325,11 +328,14 @@ def _get_or_create_patient(
     LIKE search permanently removed — caused wrong patient
     linking (Ram matched Ramesh Patil).
 
+    UID is auto-assigned by Server Script on before_insert.
+    Server Script uses ORDER BY uid DESC so always picks
+    the highest existing UID and adds 1 — no collision possible.
+
     Search order:
     1. WhatsApp number — exact match, primary key
     2. patient_name — exact match only
-    3. Create new — UID counter synced to actual DB max
-       before insert so collision is impossible by design.
+    3. Create new Patient
     """
     # Search 1: by WhatsApp number — primary unique key
     existing = frappe.db.get_value(
@@ -359,10 +365,7 @@ def _get_or_create_patient(
         return existing
 
     # Search 3: Create new Patient
-    # Sync UID counter to actual DB max BEFORE inserting
-    # This makes UID collision impossible by design
-    _sync_uid_counter_to_db_max()
-
+    # UID auto-assigned by Server Script on before_insert
     try:
         patient = frappe.new_doc("Patient")
         patient.first_name             = patient_name
@@ -375,8 +378,6 @@ def _get_or_create_patient(
         return patient.name
 
     except frappe.UniqueValidationError as e:
-        # Should never happen after counter sync
-        # but handle gracefully just in case
         frappe.db.rollback()
 
         # Check if concurrent request just created this patient
@@ -395,7 +396,7 @@ def _get_or_create_patient(
             return concurrent
 
         frappe.log_error(
-            f"Patient creation failed even after counter sync.\n"
+            f"Patient creation failed.\n"
             f"Patient: {patient_name}\n"
             f"Error: {str(e)}",
             "Patient Creation Failed"
@@ -410,68 +411,6 @@ def _get_or_create_patient(
             "Patient Creation Failed"
         )
         raise
-
-
-def _sync_uid_counter_to_db_max():
-    """
-    Syncs the TPCHC naming series counter to the actual
-    maximum UID currently in the Patient table.
-
-    Called BEFORE every new patient creation.
-
-    Logic:
-    ──────
-    1. Query actual highest UID in tabPatient
-       e.g. TPCHC00000605
-    2. Extract numeric part → 605
-    3. Set tabSeries counter to 605
-    4. Frappe does +1 on next insert → TPCHC00000606
-    5. Collision impossible — always above all existing UIDs
-
-    Why better than retry logic:
-    ─────────────────────────────
-    The tabSeries counter drifts when inserts fail midway.
-    Counter increments but record never saves — leaving ghost
-    values that collide with real patients on reuse.
-    Reading actual DB max bypasses the counter entirely
-    and always generates the next truly available UID.
-    """
-    try:
-        result = frappe.db.sql("""
-            SELECT uid
-            FROM `tabPatient`
-            WHERE uid LIKE 'TPCHC%'
-            ORDER BY uid DESC
-            LIMIT 1
-        """, as_dict=True)
-
-        if not result or not result[0].get("uid"):
-            # No patients yet — leave counter as-is
-            return
-
-        max_uid = result[0]["uid"]
-
-        # Extract numeric part: TPCHC00000605 → 605
-        numeric_part = max_uid.replace("TPCHC", "").strip()
-        if not numeric_part.isdigit():
-            return
-
-        max_number = int(numeric_part)
-
-        # Set counter to actual max
-        # Frappe adds +1 when generating next UID
-        frappe.db.sql("""
-            UPDATE `tabSeries`
-            SET current = %s
-            WHERE name = 'TPCHC'
-        """, (max_number,))
-        frappe.db.commit()
-
-    except Exception as e:
-        frappe.log_error(
-            f"Failed to sync TPCHC counter: {str(e)}",
-            "UID Counter Sync Error"
-        )
 
 
 def _generate_record_id():
