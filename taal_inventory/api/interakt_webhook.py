@@ -47,15 +47,17 @@ def _handle_workflow_completion(payload):
         return {"status": "ignored", "reason": "no phone number"}
 
     # ── Step 2: Extract customer name ────────────────────────────
-    patient_name = str(data.get("customer_name", "")).strip()[:50]
+    patient_name = str(
+        data.get("customer_name", "")
+    ).strip()[:50]
     if not patient_name:
         return {"status": "ignored", "reason": "no customer name"}
 
-    # ── Step 3: Extract form data from workflow steps ────────────
+    # ── Step 3: Extract form data from workflow steps ─────────────
     steps = data.get("data", [])
     form_data = _extract_form_data(steps)
 
-    # ── Step 4: STRICT FILTER ────────────────────────────────────
+    # ── Step 4: STRICT FILTER ─────────────────────────────────────
     # Only process events that have an actual form submission.
     # A valid booking MUST have preferred_date.
     preferred_date = form_data.get("preferred_date", "")
@@ -65,12 +67,14 @@ def _handle_workflow_completion(payload):
             "reason": "no form submission in this event"
         }
 
-    # ── Step 5: Deduplication ────────────────────────────────────
+    # ── Step 5: Deduplication ─────────────────────────────────────
     workflow_instance_id = data.get("id", "")
     record_id = f"IKT-{workflow_instance_id}" \
         if workflow_instance_id else _generate_record_id()
 
-    if frappe.db.exists("Interakt Booking", {"record_id": record_id}):
+    if frappe.db.exists(
+        "Interakt Booking", {"record_id": record_id}
+    ):
         existing = frappe.db.get_value(
             "Interakt Booking",
             {"record_id": record_id},
@@ -78,12 +82,14 @@ def _handle_workflow_completion(payload):
         )
         return {"status": "duplicate", "booking": existing}
 
-    # ── Step 6: Build all field values ───────────────────────────
+    # ── Step 6: Build all field values ────────────────────────────
     city_location       = form_data.get("city_location", "")
     preferred_time_slot = form_data.get("preferred_time_slot", "")
     consultation_reason = form_data.get("consultation_reason", "")
 
     # ── Step 7: Get or create Patient ────────────────────────────
+    # WhatsApp number is the ONLY reliable unique key.
+    # Name matching is exact only — no LIKE search ever.
     patient_id = _get_or_create_patient(
         whatsapp_number=whatsapp_number,
         patient_name=patient_name,
@@ -94,30 +100,30 @@ def _handle_workflow_completion(payload):
     booking = frappe.new_doc("Interakt Booking")
 
     # Section A: Source Identity
-    booking.record_id          = record_id
-    booking.booking_source     = "Interakt WhatsApp"
-    booking.interakt_flow_name = "Doctor Consultation"
-    booking.lead_created_at    = now_datetime()
+    booking.record_id           = record_id
+    booking.booking_source      = "Interakt WhatsApp"
+    booking.interakt_flow_name  = "Doctor Consultation"
+    booking.lead_created_at     = now_datetime()
 
     # Section B: Patient Details
-    booking.patient            = patient_id
-    booking.patient_name       = patient_name
-    booking.whatsapp_number    = whatsapp_number
-    booking.city_location      = city_location
+    booking.patient             = patient_id
+    booking.patient_name        = patient_name
+    booking.whatsapp_number     = whatsapp_number
+    booking.city_location       = city_location
 
     # Section C: Service Details
-    booking.selected_service   = "Doctor Consultation"
-    booking.consultation_type  = "Doctor"
-    booking.preferred_date     = preferred_date
+    booking.selected_service    = "Doctor Consultation"
+    booking.consultation_type   = "Doctor"
+    booking.preferred_date      = preferred_date
     booking.preferred_time_slot = preferred_time_slot
     booking.consultation_reason = consultation_reason
 
     # Section D: Payment
-    booking.payment_amount_inr = 499
-    booking.payment_status     = "Pending"
+    booking.payment_amount_inr  = 499
+    booking.payment_status      = "Pending"
 
     # Section E: Operations
-    booking.booking_status     = "Pending Payment"
+    booking.booking_status      = "Pending Payment"
 
     booking.insert(ignore_permissions=True)
     frappe.db.commit()
@@ -168,22 +174,27 @@ def _extract_form_data(steps):
 
                     if key_lower.startswith("full_name") or \
                        key_lower.startswith("patient_name"):
-                        result["patient_name"] = str(value).strip()
+                        result["patient_name"] = \
+                            str(value).strip()
 
                     elif key_lower.startswith("city"):
-                        result["city_location"] = str(value).strip()
+                        result["city_location"] = \
+                            str(value).strip()
 
                     elif key_lower.startswith("preferred_date"):
-                        result["preferred_date"] = str(value).strip()
+                        result["preferred_date"] = \
+                            str(value).strip()
 
                     elif key_lower.startswith("preferred_time"):
-                        # Store raw — will be overridden if readable
-                        # value found in message text below
+                        # Store raw — overridden below if
+                        # readable value found in message text
                         result["preferred_time_slot_raw"] = \
                             str(value).strip()
 
                     elif key_lower.startswith("reason") or \
-                         key_lower.startswith("consultation_reason"):
+                         key_lower.startswith(
+                             "consultation_reason"
+                         ):
                         result["consultation_reason"] = \
                             str(value).strip()
 
@@ -213,7 +224,7 @@ def _extract_form_data(steps):
             if time_val:
                 result["preferred_time_slot"] = time_val
 
-    # ── Final: resolve time slot ─────────────────────────────────
+    # ── Final: resolve time slot ──────────────────────────────────
     # Priority:
     # 1. Readable time extracted from message text — best source
     # 2. Known option ID mapping — reliable fallback
@@ -225,10 +236,8 @@ def _extract_form_data(steps):
         "AM" in readable_from_message or
         "PM" in readable_from_message
     ):
-        # Already got readable value from message text
         result["preferred_time_slot"] = readable_from_message
     else:
-        # Use known option ID mapping as fallback
         result["preferred_time_slot"] = _resolve_time_slot(
             raw_option_id
         )
@@ -253,8 +262,6 @@ def _extract_time_from_message(message_text):
             return ""
 
         after_time = parts[1]
-
-        # Remove non-breaking spaces
         after_time = after_time.replace("\xa0", " ").strip()
 
         # Split on every possible newline — take first chunk only
@@ -263,7 +270,6 @@ def _extract_time_from_message(message_text):
                 after_time = after_time.split(separator)[0]
                 break
 
-        # Final clean
         after_time = after_time.replace("\xa0", " ").strip()
         after_time = after_time.rstrip(".,;:")
 
@@ -279,18 +285,17 @@ def _resolve_time_slot(raw_option_id):
     """
     Resolves Interakt option IDs to readable time labels.
 
-    These option IDs are stable for YOUR specific form —
-    they only change if you delete and recreate the
-    dropdown field in Interakt WhatsApp Forms.
+    These option IDs are stable for your specific Interakt form.
+    They only change if you delete and recreate the dropdown
+    field inside Interakt WhatsApp Forms builder.
 
-    To add new mappings:
-    1. Run a test booking with an unknown slot
-    2. Check Interakt Booking record for the raw option ID
-    3. Add it here with its label
-
-    Current known mappings for TAAL+ Doctor Consultation form:
+    To add a new mapping:
+    1. Run a test booking selecting the unknown time slot
+    2. Check the Interakt Booking record for the raw option ID
+    3. Add it to slot_map below with its readable label
     """
     slot_map = {
+        # TAAL+ Doctor Consultation form — known mappings
         "option_1773381068873_bbg7g961e": "4:00 PM - 6:00 PM",
         "option_1773381057829_vihn2mczm": "9:00 AM - 11:00 AM",
         "option_1773381018418_s16i4ur2a": "11:00 AM - 1:00 PM",
@@ -299,15 +304,15 @@ def _resolve_time_slot(raw_option_id):
     if not raw_option_id:
         return ""
 
-    # Already readable — return directly
+    # Already readable
     if "AM" in raw_option_id or "PM" in raw_option_id:
         return raw_option_id.strip()
 
-    # Known mapping — return readable label
+    # Known mapping
     if raw_option_id in slot_map:
         return slot_map[raw_option_id]
 
-    # Unknown option ID — store raw so we can add mapping later
+    # Unknown — store raw so we can add mapping later
     return raw_option_id
 
 
@@ -315,12 +320,18 @@ def _get_or_create_patient(
     whatsapp_number, patient_name, city_location=""
 ):
     """
-    Search for existing Patient by WhatsApp number first.
-    Fall back to name search for pre-existing patients.
-    Create new if not found anywhere.
-    Gender set to Other — required by ERPNext Healthcare.
+    Patient lookup — strict matching only.
+
+    LIKE search permanently removed — caused wrong patient
+    linking (Ram matched Ramesh Patil).
+
+    Search order:
+    1. WhatsApp number — exact match, primary key
+    2. patient_name — exact match only
+    3. Create new — UID counter synced to actual DB max
+       before insert so collision is impossible by design.
     """
-    # Search 1: by WhatsApp number — primary key
+    # Search 1: by WhatsApp number — primary unique key
     existing = frappe.db.get_value(
         "Patient",
         {"custom_whatsapp_number": whatsapp_number},
@@ -329,7 +340,8 @@ def _get_or_create_patient(
     if existing:
         return existing
 
-    # Search 2: by patient_name field
+    # Search 2: exact patient_name match only
+    # NEVER use LIKE — matches similar names incorrectly
     existing = frappe.db.get_value(
         "Patient",
         {"patient_name": patient_name},
@@ -346,24 +358,11 @@ def _get_or_create_patient(
         frappe.db.commit()
         return existing
 
-    # Search 3: LIKE search as last resort
-    existing = frappe.db.get_value(
-        "Patient",
-        {"patient_name": ("like", f"%{patient_name}%")},
-        "name"
-    )
-    if existing:
-        frappe.db.set_value(
-            "Patient", existing,
-            {
-                "custom_whatsapp_number": whatsapp_number,
-                "custom_city_location": city_location
-            }
-        )
-        frappe.db.commit()
-        return existing
+    # Search 3: Create new Patient
+    # Sync UID counter to actual DB max BEFORE inserting
+    # This makes UID collision impossible by design
+    _sync_uid_counter_to_db_max()
 
-    # Not found — create new Patient
     try:
         patient = frappe.new_doc("Patient")
         patient.first_name             = patient_name
@@ -375,25 +374,104 @@ def _get_or_create_patient(
         frappe.db.commit()
         return patient.name
 
-    except Exception as e:
+    except frappe.UniqueValidationError as e:
+        # Should never happen after counter sync
+        # but handle gracefully just in case
         frappe.db.rollback()
-        fallback = frappe.db.get_value(
+
+        # Check if concurrent request just created this patient
+        concurrent = frappe.db.get_value(
             "Patient",
-            {"patient_name": ("like", f"%{patient_name}%")},
+            {"patient_name": patient_name},
             "name"
         )
-        if fallback:
+        if concurrent:
             frappe.db.set_value(
-                "Patient", fallback,
-                "custom_whatsapp_number", whatsapp_number
+                "Patient", concurrent,
+                "custom_whatsapp_number",
+                whatsapp_number
             )
             frappe.db.commit()
-            return fallback
+            return concurrent
+
         frappe.log_error(
-            f"Patient create failed: {patient_name}\n{str(e)}",
+            f"Patient creation failed even after counter sync.\n"
+            f"Patient: {patient_name}\n"
+            f"Error: {str(e)}",
             "Patient Creation Failed"
         )
         raise
+
+    except Exception as e:
+        frappe.db.rollback()
+        frappe.log_error(
+            f"Patient creation unexpected error: "
+            f"{patient_name}\n{str(e)}",
+            "Patient Creation Failed"
+        )
+        raise
+
+
+def _sync_uid_counter_to_db_max():
+    """
+    Syncs the TPCHC naming series counter to the actual
+    maximum UID currently in the Patient table.
+
+    Called BEFORE every new patient creation.
+
+    Logic:
+    ──────
+    1. Query actual highest UID in tabPatient
+       e.g. TPCHC00000605
+    2. Extract numeric part → 605
+    3. Set tabSeries counter to 605
+    4. Frappe does +1 on next insert → TPCHC00000606
+    5. Collision impossible — always above all existing UIDs
+
+    Why better than retry logic:
+    ─────────────────────────────
+    The tabSeries counter drifts when inserts fail midway.
+    Counter increments but record never saves — leaving ghost
+    values that collide with real patients on reuse.
+    Reading actual DB max bypasses the counter entirely
+    and always generates the next truly available UID.
+    """
+    try:
+        result = frappe.db.sql("""
+            SELECT uid
+            FROM `tabPatient`
+            WHERE uid LIKE 'TPCHC%'
+            ORDER BY uid DESC
+            LIMIT 1
+        """, as_dict=True)
+
+        if not result or not result[0].get("uid"):
+            # No patients yet — leave counter as-is
+            return
+
+        max_uid = result[0]["uid"]
+
+        # Extract numeric part: TPCHC00000605 → 605
+        numeric_part = max_uid.replace("TPCHC", "").strip()
+        if not numeric_part.isdigit():
+            return
+
+        max_number = int(numeric_part)
+
+        # Set counter to actual max
+        # Frappe adds +1 when generating next UID
+        frappe.db.sql("""
+            UPDATE `tabSeries`
+            SET current = %s
+            WHERE name = 'TPCHC'
+        """, (max_number,))
+        frappe.db.commit()
+
+    except Exception as e:
+        frappe.log_error(
+            f"Failed to sync TPCHC counter: {str(e)}",
+            "UID Counter Sync Error"
+        )
 
 
 def _generate_record_id():
