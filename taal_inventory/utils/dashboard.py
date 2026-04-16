@@ -13,7 +13,108 @@ def get_dashboard_data():
     }
 
 
+# ── KPI Drill-down for Hover Popup ───────────────────────────────
+# Called from inventory_dashboard.js when user hovers a KPI card.
+# Returns up to 10 rows of detail data for the given KPI key.
+
+@frappe.whitelist()
+def get_kpi_detail(key):
+    key = (key or "").strip()
+
+    # Low Stock — items at or below their reorder point
+    if key == "low_stock":
+        return frappe.db.sql("""
+            SELECT item_name,
+                   ROUND(current_stock, 0)  AS current_stock,
+                   ROUND(reorder_value, 0)  AS target
+            FROM `tabPharmacy Item`
+            WHERE is_active=1 AND reorder_value>0 AND current_stock<=reorder_value
+            ORDER BY (reorder_value - current_stock) DESC LIMIT 10
+        """, as_dict=True)
+
+    # Critical — items at or below minimum stock
+    if key == "critical":
+        return frappe.db.sql("""
+            SELECT item_name,
+                   ROUND(current_stock, 0) AS current_stock,
+                   ROUND(min_stock_qty, 0) AS target
+            FROM `tabPharmacy Item`
+            WHERE is_active=1 AND min_stock_qty>0 AND current_stock<=min_stock_qty
+            ORDER BY (min_stock_qty - current_stock) DESC LIMIT 10
+        """, as_dict=True)
+
+    # Expiring in 30 days
+    if key == "exp_30":
+        return frappe.db.sql("""
+            SELECT pi.item_name,
+                   pb.expiry_date,
+                   ROUND(pb.remaining_qty, 0) AS remaining_qty
+            FROM `tabPharmacy Batch` pb
+            JOIN `tabPharmacy Item` pi ON pi.name=pb.item
+            WHERE pb.status='Active' AND pb.remaining_qty>0
+              AND pb.expiry_date BETWEEN CURDATE()
+                  AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)
+            ORDER BY pb.expiry_date ASC LIMIT 10
+        """, as_dict=True)
+
+    # Expiring in 7 days — urgent
+    if key == "exp_7":
+        return frappe.db.sql("""
+            SELECT pi.item_name,
+                   pb.expiry_date,
+                   ROUND(pb.remaining_qty, 0) AS remaining_qty
+            FROM `tabPharmacy Batch` pb
+            JOIN `tabPharmacy Item` pi ON pi.name=pb.item
+            WHERE pb.status='Active' AND pb.remaining_qty>0
+              AND pb.expiry_date BETWEEN CURDATE()
+                  AND DATE_ADD(CURDATE(), INTERVAL 7 DAY)
+            ORDER BY pb.expiry_date ASC LIMIT 10
+        """, as_dict=True)
+
+    # Overstock — items above maximum stock
+    if key == "overstock":
+        return frappe.db.sql("""
+            SELECT item_name,
+                   ROUND(current_stock, 0) AS current_stock,
+                   ROUND(max_stock_qty, 0) AS target
+            FROM `tabPharmacy Item`
+            WHERE is_active=1 AND max_stock_qty>0 AND current_stock>max_stock_qty
+            ORDER BY (current_stock - max_stock_qty) DESC LIMIT 10
+        """, as_dict=True)
+
+    # Never sold — active items with no deduction history
+    if key == "never_sold":
+        return frappe.db.sql("""
+            SELECT item_name,
+                   ROUND(current_stock, 0) AS current_stock
+            FROM `tabPharmacy Item` pi
+            WHERE is_active=1
+              AND NOT EXISTS (
+                SELECT 1 FROM `tabDeduction Log` dl WHERE dl.parent=pi.name
+              )
+            LIMIT 10
+        """, as_dict=True)
+
+    # Slow moving — no deductions in last 90 days
+    if key == "slow_moving":
+        d90 = str(add_days(today(), -90))
+        return frappe.db.sql("""
+            SELECT item_name,
+                   ROUND(current_stock, 0) AS current_stock
+            FROM `tabPharmacy Item` pi
+            WHERE is_active=1
+              AND NOT EXISTS (
+                SELECT 1 FROM `tabDeduction Log` dl
+                WHERE dl.parent=pi.name AND dl.deduction_datetime>=%s
+              )
+            LIMIT 10
+        """, d90, as_dict=True)
+
+    return []
+
+
 # ── KPIs ─────────────────────────────────────────────────────────
+# Unchanged from original — all field names preserved exactly
 
 def _kpis(t, ms, me):
     d7  = str(add_days(t, 7))
@@ -136,19 +237,23 @@ def _charts(t, ms, me):
         "weekly_movement":    _weekly_movement(t),
         "daily_dispensing":   _daily_dispensing(t),
         "batch_status":       _batch_status(),
-        "category_value":     _category_value(),
+        "category_value":     _category_value(),       # FIX: category_name via JOIN
         "writeoff_breakdown": _writeoff_breakdown(),
-        "top_fast_moving":    _top_fast_moving(ms, me),
+        "top_fast_moving":    _top_fast_moving(t),     # FIX: rolling 30 days
         "top_stock_value":    _top_stock_value(),
-        "top_patients":       _top_patients(ms, me),
+        "top_patients":       _top_patients(t),        # FIX: rolling 30 days
         "monthly_profit":     _monthly_profit(t),
         "supplier_purchase":  _supplier_purchase(t),
-        "margin_category":    _margin_category(),
+        "margin_category":    _margin_category(),      # FIX: category_name via JOIN
         "expiry_timeline":    _expiry_timeline(t),
         "batch_age":          _batch_age(t),
         "reorder_gap":        _reorder_gap(),
     }
 
+
+# ── Individual chart queries ──────────────────────────────────────
+# Only _category_value, _margin_category, _top_fast_moving,
+# _top_patients changed. All others unchanged from original.
 
 def _weekly_movement(t):
     rows_out = frappe.db.sql("""
@@ -178,7 +283,7 @@ def _weekly_movement(t):
             wk_map[k] = {"in": 0.0, "out": 0.0}
         wk_map[k]["out"] = float(r.qty or 0)
 
-    weeks = sorted(wk_map.keys())
+    weeks  = sorted(wk_map.keys())
     labels = ["Wk {}".format(i + 1) for i in range(len(weeks))]
     return {
         "labels": labels,
@@ -216,17 +321,23 @@ def _batch_status():
     }
 
 
+# FIX: JOIN tabItem Category to get human-readable category_name
+# instead of the auto-generated hash stored in pi.category
 def _category_value():
     rows = frappe.db.sql("""
-        SELECT pi.category,
-               COALESCE(SUM(pb.remaining_qty*pb.selling_price),0) AS val
+        SELECT COALESCE(ic.category_name, pi.category, 'Uncategorized') AS cat,
+               COALESCE(SUM(pb.remaining_qty * pb.selling_price), 0)    AS val
         FROM `tabPharmacy Batch` pb
-        JOIN `tabPharmacy Item` pi ON pi.name=pb.item
-        WHERE pb.status='Active' AND pi.category!=''
-        GROUP BY pi.category ORDER BY val DESC LIMIT 8
+        JOIN `tabPharmacy Item` pi ON pi.name = pb.item
+        LEFT JOIN `tabItem Category` ic ON ic.name = pi.category
+        WHERE pb.status = 'Active'
+          AND pi.category IS NOT NULL
+          AND pi.category != ''
+        GROUP BY pi.category
+        ORDER BY val DESC LIMIT 8
     """, as_dict=True)
     return {
-        "labels":   [r.category or "Uncategorized" for r in rows],
+        "labels":   [r.cat or "Uncategorized" for r in rows],
         "datasets": [{"name": "Stock Value",
                       "values": [float(r.val or 0) for r in rows]}]
     }
@@ -246,15 +357,18 @@ def _writeoff_breakdown():
     }
 
 
-def _top_fast_moving(ms, me):
+# FIX: was _top_fast_moving(ms, me) filtering by current calendar month
+# Changed to rolling 30-day window so data shows even mid-month
+def _top_fast_moving(t):
     rows = frappe.db.sql("""
         SELECT pi.item_name,
-               COALESCE(SUM(dl.qty_deducted),0) AS qty
+               COALESCE(SUM(dl.qty_deducted), 0) AS qty
         FROM `tabDeduction Log` dl
-        JOIN `tabPharmacy Item` pi ON pi.name=dl.parent
-        WHERE DATE(dl.deduction_datetime) BETWEEN %s AND %s
-        GROUP BY dl.parent ORDER BY qty DESC LIMIT 10
-    """, (ms, me), as_dict=True)
+        JOIN `tabPharmacy Item` pi ON pi.name = dl.parent
+        WHERE dl.deduction_datetime >= DATE_SUB(%s, INTERVAL 30 DAY)
+        GROUP BY dl.parent
+        ORDER BY qty DESC LIMIT 10
+    """, t, as_dict=True)
     return {
         "labels":   [r.item_name for r in rows],
         "datasets": [{"name": "Qty Sold",
@@ -265,10 +379,10 @@ def _top_fast_moving(ms, me):
 def _top_stock_value():
     rows = frappe.db.sql("""
         SELECT pi.item_name,
-               COALESCE(SUM(pb.remaining_qty*pb.selling_price),0) AS val
+               COALESCE(SUM(pb.remaining_qty * pb.selling_price), 0) AS val
         FROM `tabPharmacy Batch` pb
-        JOIN `tabPharmacy Item` pi ON pi.name=pb.item
-        WHERE pb.status='Active'
+        JOIN `tabPharmacy Item` pi ON pi.name = pb.item
+        WHERE pb.status = 'Active'
         GROUP BY pb.item ORDER BY val DESC LIMIT 10
     """, as_dict=True)
     return {
@@ -278,15 +392,18 @@ def _top_stock_value():
     }
 
 
-def _top_patients(ms, me):
+# FIX: was _top_patients(ms, me) filtering by current calendar month
+# Changed to rolling 30-day window so data shows even mid-month
+def _top_patients(t):
     rows = frappe.db.sql("""
         SELECT patient_name,
-               COALESCE(SUM(qty_deducted),0) AS qty
+               COALESCE(SUM(qty_deducted), 0) AS qty
         FROM `tabDeduction Log`
-        WHERE patient_name!=''
-          AND DATE(deduction_datetime) BETWEEN %s AND %s
-        GROUP BY patient_name ORDER BY qty DESC LIMIT 10
-    """, (ms, me), as_dict=True)
+        WHERE patient_name != ''
+          AND deduction_datetime >= DATE_SUB(%s, INTERVAL 30 DAY)
+        GROUP BY patient_name
+        ORDER BY qty DESC LIMIT 10
+    """, t, as_dict=True)
     return {
         "labels":   [r.patient_name for r in rows],
         "datasets": [{"name": "Qty Received",
@@ -314,7 +431,7 @@ def _monthly_profit(t):
 def _supplier_purchase(t):
     rows = frappe.db.sql("""
         SELECT supplier,
-               COALESCE(SUM(grand_total),0) AS total
+               COALESCE(SUM(grand_total), 0) AS total
         FROM `tabStock Receipt`
         WHERE docstatus=1
           AND receipt_date >= DATE_SUB(%s, INTERVAL 12 MONTH)
@@ -327,19 +444,24 @@ def _supplier_purchase(t):
     }
 
 
+# FIX: JOIN tabItem Category to get human-readable category_name
 def _margin_category():
     rows = frappe.db.sql("""
-        SELECT pi.category,
-               COALESCE(AVG(CASE WHEN pb.selling_price>0
-                   THEN (pb.selling_price-pb.cost_price)/pb.selling_price*100
-                   ELSE 0 END),0) AS margin
+        SELECT COALESCE(ic.category_name, pi.category, 'Uncategorized') AS cat,
+               COALESCE(AVG(CASE WHEN pb.selling_price > 0
+                   THEN (pb.selling_price - pb.cost_price) / pb.selling_price * 100
+                   ELSE 0 END), 0) AS margin
         FROM `tabPharmacy Batch` pb
-        JOIN `tabPharmacy Item` pi ON pi.name=pb.item
-        WHERE pb.status='Active' AND pi.category!=''
-        GROUP BY pi.category ORDER BY margin DESC LIMIT 8
+        JOIN `tabPharmacy Item` pi ON pi.name = pb.item
+        LEFT JOIN `tabItem Category` ic ON ic.name = pi.category
+        WHERE pb.status = 'Active'
+          AND pi.category IS NOT NULL
+          AND pi.category != ''
+        GROUP BY pi.category
+        ORDER BY margin DESC LIMIT 8
     """, as_dict=True)
     return {
-        "labels":   [r.category for r in rows],
+        "labels":   [r.cat for r in rows],
         "datasets": [{"name": "Avg Margin %",
                       "values": [round(float(r.margin or 0), 1) for r in rows]}]
     }
