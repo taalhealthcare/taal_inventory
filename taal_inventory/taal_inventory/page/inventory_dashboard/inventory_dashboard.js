@@ -425,19 +425,22 @@ class TaalInventoryDashboard {
         const $pop = $("#ti-popup");
         if (!$pop.length) return;
 
-        // ── Position popup below the card ────────────────────────
-        // scroll offset needed since popup is position:absolute on body
-        let top  = rect.bottom + window.scrollY + 10;
-        let left = rect.left   + window.scrollX;
+        // ── position:fixed — rect values are already viewport-relative ──
+        // No scrollY/scrollX offset needed. Works correctly for every
+        // row of cards regardless of Frappe's scroll container structure.
+        let top  = rect.bottom + 10;
+        let left = rect.left;
 
         // Clamp to right viewport edge
         if (left + 290 > window.innerWidth) {
             left = window.innerWidth - 298;
         }
-        // If popup would overflow bottom of viewport, flip above card
+        // If popup would overflow bottom of viewport, flip above card instead
         if (rect.bottom + 320 > window.innerHeight) {
-            top = rect.top + window.scrollY - 320;
+            top = rect.top - 320;
         }
+        // Never go above viewport top
+        if (top < 8) top = 8;
 
         $pop.css({ top: top + "px", left: left + "px" }).show();
 
@@ -612,7 +615,7 @@ class TaalInventoryDashboard {
             + ".ti-nodata{display:flex;align-items:center;justify-content:center;"
             +   "height:180px;color:#94a3b8;font-size:12px;font-style:italic}"
             // ── Hover popup ───────────────────────────────────
-            + "#ti-popup{position:absolute;width:280px;background:#fff;"
+            + "#ti-popup{position:fixed;width:280px;background:#fff;"
             +   "border:0.5px solid #e2e8f0;border-radius:12px;"
             +   "box-shadow:0 8px 28px rgba(0,0,0,.13);"
             +   "z-index:99999;overflow:hidden;pointer-events:auto}"
