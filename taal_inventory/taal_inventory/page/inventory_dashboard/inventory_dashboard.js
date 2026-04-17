@@ -425,22 +425,22 @@ class TaalInventoryDashboard {
         const $pop = $("#ti-popup");
         if (!$pop.length) return;
 
-        // ── position:fixed — rect values are already viewport-relative ──
-        // No scrollY/scrollX offset needed. Works correctly for every
-        // row of cards regardless of Frappe's scroll container structure.
+        // Always show BELOW the hovered card. Never flip above.
+        // position:fixed so rect coords are viewport-relative — no scroll offset needed.
+        // Popup body max-height is calculated from available space below the card
+        // so the popup always fits and always appears directly below every row.
         let top  = rect.bottom + 10;
         let left = rect.left;
 
         // Clamp to right viewport edge
-        if (left + 290 > window.innerWidth) {
-            left = window.innerWidth - 298;
-        }
-        // If popup would overflow bottom of viewport, flip above card instead
-        if (rect.bottom + 320 > window.innerHeight) {
-            top = rect.top - 320;
-        }
-        // Never go above viewport top
-        if (top < 8) top = 8;
+        if (left + 290 > window.innerWidth) left = window.innerWidth - 298;
+        // Clamp to left viewport edge
+        if (left < 8) left = 8;
+
+        // popup chrome = header(~44px) + footer(~30px) = 74px
+        // body gets the remaining available space, minimum 80px
+        const availBelow = window.innerHeight - rect.bottom - 26;
+        this._popup_body_h = Math.max(80, availBelow - 74);
 
         $pop.css({ top: top + "px", left: left + "px" }).show();
 
@@ -534,8 +534,9 @@ class TaalInventoryDashboard {
                 + `</div>`;
         }).join("");
 
+        const bodyH = this._popup_body_h || 256;
         return head
-            + `<div class="ti-pop-body">${items}</div>`
+            + `<div class="ti-pop-body" style="max-height:${bodyH}px">${items}</div>`
             + `<div class="ti-pop-foot">${subtitle || "Top " + rows.length + " shown"}</div>`;
     }
 
@@ -626,7 +627,7 @@ class TaalInventoryDashboard {
             +   "letter-spacing:.06em;color:#64748b}"
             + ".ti-pop-count{font-size:11px;font-weight:500;padding:1px 8px;"
             +   "border-radius:999px;flex-shrink:0}"
-            + ".ti-pop-body{max-height:256px;overflow-y:auto}"
+            + ".ti-pop-body{overflow-y:auto}"
             + ".ti-pop-item{padding:8px 14px;border-bottom:0.5px solid #f1f5f9;"
             +   "transition:background .12s ease}"
             + ".ti-pop-item:last-child{border-bottom:none}"
