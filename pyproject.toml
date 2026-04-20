@@ -7,9 +7,6 @@ description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
-dependencies = [
-    "frappe>=15.0.0 <16.0.0"
-]
 
 [build-system]
 requires = ["flit_core >=3.2.0,<4"]
@@ -17,3 +14,7 @@ build-backend = "flit_core.buildapi"
 
 [tool.flit.module]
 name = "taal_inventory"
+
+[tool.bench]
+app_name = "taal_inventory"
+required_apps = ["frappe/frappe@version-15"]
