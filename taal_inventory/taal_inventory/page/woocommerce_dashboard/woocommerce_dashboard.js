@@ -218,7 +218,7 @@ function _dash_load(page, mode) {
     $(page.main).find(".dw,.dw-loading").remove();
     $(page.main).append('<div class="dw-loading">Loading dashboard…</div>');
     frappe.call({
-        method: "taal_inventory.page.woocommerce_dashboard.woocommerce_dashboard.get_woocommerce_dashboard_data",
+        method: "taal_inventory.utils.woocommerce_dashboard.get_woocommerce_dashboard_data",
         args:   { mode: mode },
         freeze: false,
         callback: function (r) {
