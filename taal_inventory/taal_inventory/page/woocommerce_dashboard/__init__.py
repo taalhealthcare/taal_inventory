@@ -1,1 +1,1 @@
-# WooCommerce Orders Dashboard — taal_inventory
+# WooCommerce Orders Dashboard — Online / Offline toggle
