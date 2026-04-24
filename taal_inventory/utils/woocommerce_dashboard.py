@@ -3,12 +3,13 @@ from frappe.utils import today, add_days, get_first_day, get_last_day, nowdate
 
 
 @frappe.whitelist()
-def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None):
+def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None, period_label=None):
     """
-    mode      : "online"  — custom_offline__online = 'Online'
-                "offline" — custom_offline__online = 'Offline'
-    from_date : filter start date (YYYY-MM-DD), optional
-    to_date   : filter end date   (YYYY-MM-DD), optional
+    mode         : "online"  — custom_offline__online = 'Online'
+                   "offline" — custom_offline__online = 'Offline'
+    from_date    : filter start date (YYYY-MM-DD), optional
+    to_date      : filter end date   (YYYY-MM-DD), optional
+    period_label : human-readable period label echoed back to JS
     """
     t   = today()
     fd  = from_date or None
@@ -22,7 +23,10 @@ def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None):
 
     if mode == "offline":
         return {
-            "mode":     "offline",
+            "mode":         "offline",
+            "period_label": period_label or "All Time",
+            "from_date":    from_date or "",
+            "to_date":      to_date   or "",
             "kpis":     _offline_kpis(t, ms, me, lms, lme, fd, td),
             "snapshot": _offline_snapshot(ms, me, fd, td),
             "charts":   _offline_charts(t, ms, me, fd, td),
@@ -32,7 +36,10 @@ def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None):
         }
     else:
         return {
-            "mode":     "online",
+            "mode":         "online",
+            "period_label": period_label or "All Time",
+            "from_date":    from_date or "",
+            "to_date":      to_date   or "",
             "kpis":     _online_kpis(t, ms, me, lms, lme, fd, td),
             "snapshot": _online_snapshot(fd, td),
             "charts":   _online_charts(t, fd, td),
