@@ -312,7 +312,7 @@ def _online_charts(t, fd, td):
         WHERE docstatus=1 AND custom_offline__online='Online'
           AND {} {}
           AND transaction_date IS NOT NULL
-        GROUP BY mo, sk ORDER BY sk
+        GROUP BY yr, mo_num, sk ORDER BY sk
     """.format(_RSTAT, _mo_date), as_dict=True)
 
     # Monthly order volume — Shipped or Processing only (FIX)
@@ -325,7 +325,7 @@ def _online_charts(t, fd, td):
         WHERE docstatus=1 AND custom_offline__online='Online'
           AND {} {}
           AND transaction_date IS NOT NULL
-        GROUP BY mo, sk ORDER BY sk
+        GROUP BY yr, mo_num, sk ORDER BY sk
     """.format(_RSTAT, _mo_date), as_dict=True)
 
     return {
@@ -573,7 +573,7 @@ def _offline_charts(t, ms, me, fd, td):
         JOIN `tabSales Order` so ON so.name = stc.parent
         WHERE so.docstatus=1 AND so.custom_offline__online='Offline'
           {} AND stc.tax_amount IS NOT NULL
-        GROUP BY mo, sk, stc.account_head ORDER BY sk
+        GROUP BY yr, mo_num, sk, stc.account_head ORDER BY sk
     """.format(_mo_date), as_dict=True)
 
     month_map = {}
@@ -595,7 +595,7 @@ def _offline_charts(t, ms, me, fd, td):
                    YEAR(transaction_date)*100+MONTH(transaction_date) AS sk
             FROM `tabSales Order`
             WHERE docstatus=1 AND custom_offline__online='Offline' {}
-            GROUP BY mo, sk ORDER BY sk
+            GROUP BY yr, mo_num, sk ORDER BY sk
         """.format(_ord_date), as_dict=True)
         for r in ord_rows:
             month_map[r.sk] = {"mo": _mo_label(r.sk // 100, r.sk % 100), "sk": r.sk, "sgst": 0.0, "cgst": 0.0, "igst": 0.0, "tds": 0.0}
@@ -623,7 +623,7 @@ def _offline_charts(t, ms, me, fd, td):
                COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
         WHERE docstatus=1 AND custom_offline__online='Offline' {}
-        GROUP BY mo, sk ORDER BY sk
+        GROUP BY yr, mo_num, sk ORDER BY sk
     """.format(_rev_date), as_dict=True)
 
     mo_rows = frappe.db.sql("""
@@ -633,7 +633,7 @@ def _offline_charts(t, ms, me, fd, td):
                COUNT(*) AS cnt
         FROM `tabSales Order`
         WHERE docstatus=1 AND custom_offline__online='Offline' {}
-        GROUP BY mo, sk ORDER BY sk
+        GROUP BY yr, mo_num, sk ORDER BY sk
     """.format(_rev_date), as_dict=True)
 
     return {
