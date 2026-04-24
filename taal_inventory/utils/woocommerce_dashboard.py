@@ -100,7 +100,7 @@ _RSTAT = "woocommerce_status IN ('Shipped','Processing','shipped','processing')"
 # Pending — only Pending status
 _PEND  = "woocommerce_status IN ('Pending','pending')"
 # Cancelled
-_CANC  = "woocommerce_status IN ('Cancelled','cancelled','failed')"
+_CANC  = "woocommerce_status IN ('Cancelled','cancelled')"
 # Shipped only
 _SHIP  = "woocommerce_status IN ('Shipped','shipped')"
 
