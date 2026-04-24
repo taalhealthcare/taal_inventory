@@ -123,7 +123,8 @@ def _online_kpis(t, ms, me, lms, lme, fd, td):
     cancelled = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _CANC, date_c)))
     shipped   = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _SHIP, date_c)))
     ship_proc = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _RSTAT, date_c)))
-    aov       = round(total_rev / total_ord, 2) if total_ord else 0.0
+    # AOV = revenue ÷ Shipped+Processing order count (matches report logic)
+    aov = round(total_rev / ship_proc, 2) if ship_proc else 0.0
 
     return {
         "total_revenue":    total_rev,
