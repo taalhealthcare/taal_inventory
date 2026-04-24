@@ -136,8 +136,9 @@ def _online_kpis(t, ms, me, lms, lme, fd, td):
 
     ty       = str(add_days(t, -1))
     total_ord = cnt()
-    today_ord = cnt("transaction_date='{}'".format(str(t)))
-    yest_ord  = cnt("transaction_date='{}'".format(ty))
+    # Orders today — Shipped + Processing only (same filter as all revenue metrics)
+    today_ord = cnt("{} AND transaction_date='{}'".format(_RSTAT, str(t)))
+    yest_ord  = cnt("{} AND transaction_date='{}'".format(_RSTAT, ty))
 
     pending   = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _PEND, date_c)))
     cancelled = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _CANC, date_c)))
@@ -445,8 +446,8 @@ def _offline_kpis(t, ms, me, lms, lme, fd, td):
         lmonth_rev = rev("transaction_date BETWEEN '{}' AND '{}'".format(lms, lme))
 
     total_ord = cnt()
-    today_ord = cnt("transaction_date='{}'".format(str(t)))
-    yest_ord  = cnt("transaction_date='{}'".format(str(add_days(t, -1))))
+    today_ord = cnt("transaction_date='{}' AND {}".format(str(t), _RSTAT))
+    yest_ord  = cnt("transaction_date='{}' AND {}".format(str(add_days(t, -1)), _RSTAT))
     pending   = cnt("status='To Deliver and Bill'")
     cancelled = cnt("status='Cancelled'")
     completed = cnt("status='Completed'")
