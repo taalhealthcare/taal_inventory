@@ -24,21 +24,67 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
     });
 
     // ── Date preset buttons ───────────────────────────────────
+    // NOTE: frappe.datetime.month_start/end/week_start/end do NOT exist in Frappe v15.
+    // We compute all dates manually using the today string (YYYY-MM-DD).
+
+    function _woo_date_add(dateStr, days) {
+        var d = new Date(dateStr);
+        d.setDate(d.getDate() + days);
+        return d.toISOString().slice(0, 10);
+    }
+
+    function _woo_month_start(dateStr) {
+        // Returns YYYY-MM-01
+        return dateStr.slice(0, 7) + "-01";
+    }
+
+    function _woo_month_end(dateStr) {
+        // Returns last day of the month
+        var parts = dateStr.split("-");
+        var y = parseInt(parts[0]), m = parseInt(parts[1]);
+        var last = new Date(y, m, 0).getDate(); // day 0 of next month = last day of this month
+        return parts[0] + "-" + parts[1] + "-" + String(last).padStart(2, "0");
+    }
+
+    function _woo_week_start(dateStr) {
+        // Returns Monday of the current week
+        var d = new Date(dateStr);
+        var day = d.getDay(); // 0=Sun, 1=Mon...
+        var diff = (day === 0) ? -6 : 1 - day; // adjust to Monday
+        d.setDate(d.getDate() + diff);
+        return d.toISOString().slice(0, 10);
+    }
+
+    function _woo_months_ago(dateStr, n) {
+        var parts = dateStr.split("-");
+        var y = parseInt(parts[0]), m = parseInt(parts[1]) - n;
+        while (m <= 0) { m += 12; y -= 1; }
+        var mm = String(m).padStart(2, "0");
+        var lastDay = new Date(y, m, 0).getDate();
+        var dd = Math.min(parseInt(parts[2]), lastDay);
+        return y + "-" + mm + "-" + String(dd).padStart(2, "0");
+    }
+
     var presets = ["Today", "This Week", "This Month", "Last 3 Months", "Last 6 Months"];
     presets.forEach(function (lbl) {
         page.add_inner_button(__(lbl), function () {
-            var today = frappe.datetime.get_today();
+            var today = frappe.datetime.get_today(); // always returns YYYY-MM-DD ✓
             var fd, td;
             if (lbl === "Today") {
                 fd = today; td = today;
             } else if (lbl === "This Week") {
-                fd = frappe.datetime.week_start(); td = frappe.datetime.week_end();
+                fd = _woo_week_start(today); td = today;
             } else if (lbl === "This Month") {
-                fd = frappe.datetime.month_start(); td = frappe.datetime.month_end();
+                fd = _woo_month_start(today); td = _woo_month_end(today);
             } else if (lbl === "Last 3 Months") {
-                fd = frappe.datetime.add_months(today, -3); td = today;
+                fd = _woo_months_ago(today, 3); td = today;
             } else if (lbl === "Last 6 Months") {
-                fd = frappe.datetime.add_months(today, -6); td = today;
+                fd = _woo_months_ago(today, 6); td = today;
+            }
+            // Safety check — never call with undefined dates
+            if (!fd || !td) {
+                frappe.msgprint("Could not compute date range. Please try again.");
+                return;
             }
             window._woo_from_date = fd;
             window._woo_to_date   = td;
@@ -432,7 +478,7 @@ function _dash_topbar(mode, kp, fd, td) {
     var isOnline = mode === "online";
     var chips = isOnline
         ? [["#EAF3DE","#27500A","#639922", _INR(kp.total_revenue||0)+" revenue"],
-           ["#E6F1FB","#0C447C","#378ADD", (kp.total_orders||0)+" online orders"],
+           ["#E6F1FB","#0C447C","#378ADD", (kp.ship_proc_count||0)+" shipped/processing"],
            ["#FAEEDA","#633806","#BA7517", (kp.pending||0)+" pending"]]
         : [["#EAF3DE","#27500A","#639922", _INR(kp.total_revenue||0)+" revenue"],
            ["#FAEEDA","#633806","#BA7517", (kp.total_orders||0)+" orders"],
