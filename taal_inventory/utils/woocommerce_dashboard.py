@@ -69,6 +69,19 @@ def _trend(cur, prev):
     pct  = round(abs(diff) / prev * 100, 1)
     return {"pct": pct, "dir": "up" if diff > 0 else ("down" if diff < 0 else "flat")}
 
+# Month label helper — avoids DATE_FORMAT %b %Y in SQL (% escaping issues)
+_MONTH_NAMES = ["","Jan","Feb","Mar","Apr","May","Jun",
+                "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+def _mo_label(yr, mo):
+    """Return e.g. 'Apr 2026' from year=2026, month=4"""
+    try:
+        return _MONTH_NAMES[int(mo)] + " " + str(yr)
+    except Exception:
+        return str(yr) + "-" + str(mo)
+
+
+
 def _date_clause(fd, td, alias="so"):
     """Return AND clause for date range if provided."""
     if fd and td:
@@ -291,7 +304,8 @@ def _online_charts(t, fd, td):
     # Monthly revenue — Shipped or Processing only (already correct)
     _mo_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     mr = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
+        SELECT YEAR(transaction_date) AS yr,
+               MONTH(transaction_date) AS mo_num,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
@@ -303,7 +317,8 @@ def _online_charts(t, fd, td):
 
     # Monthly order volume — Shipped or Processing only (FIX)
     mo = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
+        SELECT YEAR(transaction_date) AS yr,
+               MONTH(transaction_date) AS mo_num,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COUNT(*) AS cnt
         FROM `tabSales Order`
@@ -318,8 +333,8 @@ def _online_charts(t, fd, td):
         "payment":       {"labels": [r.woocommerce_payment_method for r in pm],   "datasets": [{"values": [_int(r.cnt) for r in pm]}]},
         "order_buckets": {"labels": bkt_labels,                                   "datasets": [{"values": bkt_values}]},
         "top_states":    {"labels": [s[0] for s in sorted_states],                "datasets": [{"values": [s[1] for s in sorted_states]}]},
-        "monthly_rev":   {"labels": [r.mo for r in mr],                           "datasets": [{"values": [_flt(r.rev) for r in mr]}]},
-        "monthly_ord":   {"labels": [r.mo for r in mo],                           "datasets": [{"values": [_int(r.cnt) for r in mo]}]},
+        "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mr],                           "datasets": [{"values": [_flt(r.rev) for r in mr]}]},
+        "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo],                           "datasets": [{"values": [_int(r.cnt) for r in mo]}]},
     }
 
 
@@ -549,7 +564,8 @@ def _offline_charts(t, ms, me, fd, td):
 
     _mo_date = "AND so.transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND so.transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     tax_monthly = frappe.db.sql("""
-        SELECT DATE_FORMAT(so.transaction_date,'%%%%b %%%%Y') AS mo,
+        SELECT YEAR(so.transaction_date) AS yr,
+               MONTH(so.transaction_date) AS mo_num,
                YEAR(so.transaction_date)*100+MONTH(so.transaction_date) AS sk,
                stc.account_head,
                COALESCE(SUM(stc.tax_amount), 0) AS total
@@ -563,7 +579,7 @@ def _offline_charts(t, ms, me, fd, td):
     month_map = {}
     for r in tax_monthly:
         if r.sk not in month_map:
-            month_map[r.sk] = {"mo": r.mo, "sk": r.sk, "sgst": 0.0, "cgst": 0.0, "igst": 0.0, "tds": 0.0}
+            month_map[r.sk] = {"mo": _mo_label(r.sk // 100, r.sk % 100), "sk": r.sk, "sgst": 0.0, "cgst": 0.0, "igst": 0.0, "tds": 0.0}
         ah  = (r.account_head or "").upper()
         val = _flt(r.total)
         if "TDS" in ah or "TAX DEDUCT" in ah: month_map[r.sk]["tds"]  += val
@@ -574,14 +590,15 @@ def _offline_charts(t, ms, me, fd, td):
     if not month_map:
         _ord_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
         ord_rows = frappe.db.sql("""
-            SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
+            SELECT YEAR(transaction_date) AS yr,
+                   MONTH(transaction_date) AS mo_num,
                    YEAR(transaction_date)*100+MONTH(transaction_date) AS sk
             FROM `tabSales Order`
             WHERE docstatus=1 AND custom_offline__online='Offline' {}
             GROUP BY mo, sk ORDER BY sk
         """.format(_ord_date), as_dict=True)
         for r in ord_rows:
-            month_map[r.sk] = {"mo": r.mo, "sk": r.sk, "sgst": 0.0, "cgst": 0.0, "igst": 0.0, "tds": 0.0}
+            month_map[r.sk] = {"mo": _mo_label(r.sk // 100, r.sk % 100), "sk": r.sk, "sgst": 0.0, "cgst": 0.0, "igst": 0.0, "tds": 0.0}
 
     sorted_months = sorted(month_map.values(), key=lambda x: x["sk"])
 
@@ -600,7 +617,8 @@ def _offline_charts(t, ms, me, fd, td):
 
     _rev_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     rev_rows = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
+        SELECT YEAR(transaction_date) AS yr,
+               MONTH(transaction_date) AS mo_num,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
@@ -609,7 +627,8 @@ def _offline_charts(t, ms, me, fd, td):
     """.format(_rev_date), as_dict=True)
 
     mo_rows = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
+        SELECT YEAR(transaction_date) AS yr,
+               MONTH(transaction_date) AS mo_num,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COUNT(*) AS cnt
         FROM `tabSales Order`
@@ -621,8 +640,8 @@ def _offline_charts(t, ms, me, fd, td):
         "status":        {"labels": [r.status for r in st_rows], "datasets": [{"values": [_int(r.cnt) for r in st_rows]}]},
         "tax_monthly":   [{"mo": m["mo"],"sgst": round(m["sgst"],2),"cgst": round(m["cgst"],2),"igst": round(m["igst"],2),"tds": round(m["tds"],2)} for m in sorted_months],
         "order_buckets": {"labels": bkt_labels, "datasets": [{"values": bkt_values}]},
-        "monthly_rev":   {"labels": [r.mo for r in rev_rows], "datasets": [{"values": [_flt(r.rev) for r in rev_rows]}]},
-        "monthly_ord":   {"labels": [r.mo for r in mo_rows],  "datasets": [{"values": [_int(r.cnt) for r in mo_rows]}]},
+        "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in rev_rows], "datasets": [{"values": [_flt(r.rev) for r in rev_rows]}]},
+        "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo_rows],  "datasets": [{"values": [_int(r.cnt) for r in mo_rows]}]},
     }
 
 
