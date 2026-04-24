@@ -291,7 +291,7 @@ def _online_charts(t, fd, td):
     # Monthly revenue — Shipped or Processing only (already correct)
     _mo_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     mr = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%b %%Y') AS mo,
+        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
@@ -303,7 +303,7 @@ def _online_charts(t, fd, td):
 
     # Monthly order volume — Shipped or Processing only (FIX)
     mo = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%b %%Y') AS mo,
+        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COUNT(*) AS cnt
         FROM `tabSales Order`
@@ -549,7 +549,7 @@ def _offline_charts(t, ms, me, fd, td):
 
     _mo_date = "AND so.transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND so.transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     tax_monthly = frappe.db.sql("""
-        SELECT DATE_FORMAT(so.transaction_date,'%%b %%Y') AS mo,
+        SELECT DATE_FORMAT(so.transaction_date,'%%%%b %%%%Y') AS mo,
                YEAR(so.transaction_date)*100+MONTH(so.transaction_date) AS sk,
                stc.account_head,
                COALESCE(SUM(stc.tax_amount), 0) AS total
@@ -574,7 +574,7 @@ def _offline_charts(t, ms, me, fd, td):
     if not month_map:
         _ord_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
         ord_rows = frappe.db.sql("""
-            SELECT DATE_FORMAT(transaction_date,'%%b %%Y') AS mo,
+            SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
                    YEAR(transaction_date)*100+MONTH(transaction_date) AS sk
             FROM `tabSales Order`
             WHERE docstatus=1 AND custom_offline__online='Offline' {}
@@ -600,7 +600,7 @@ def _offline_charts(t, ms, me, fd, td):
 
     _rev_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     rev_rows = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%b %%Y') AS mo,
+        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
@@ -609,7 +609,7 @@ def _offline_charts(t, ms, me, fd, td):
     """.format(_rev_date), as_dict=True)
 
     mo_rows = frappe.db.sql("""
-        SELECT DATE_FORMAT(transaction_date,'%%b %%Y') AS mo,
+        SELECT DATE_FORMAT(transaction_date,'%%%%b %%%%Y') AS mo,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COUNT(*) AS cnt
         FROM `tabSales Order`
