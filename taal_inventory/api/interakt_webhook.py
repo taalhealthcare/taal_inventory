@@ -88,6 +88,12 @@ def _handle_workflow_completion(payload):
     preferred_time_slot = form_data.get("preferred_time_slot", "")
     consultation_reason = form_data.get("consultation_reason", "")
 
+    # Speciality: defaults to "Other" until the Interakt form
+    # has the speciality dropdown wired up. "Other" means no
+    # doctor assigned at payment time → no doctor WhatsApp →
+    # patient still gets Meet link → admin still notified.
+    speciality          = form_data.get("speciality", "") or "Other"
+
     # ── Step 7: Get or create Patient ────────────────────────────
     # WhatsApp number is the ONLY reliable unique key.
     # Name matching is exact only — no LIKE search ever.
@@ -120,6 +126,7 @@ def _handle_workflow_completion(payload):
     booking.preferred_date      = preferred_date
     booking.preferred_time_slot = preferred_time_slot
     booking.consultation_reason = consultation_reason
+    booking.speciality          = speciality
 
     # Section D: Payment
     booking.payment_amount_inr  = 499
@@ -139,7 +146,8 @@ def _handle_workflow_completion(payload):
             "preferred_date": preferred_date,
             "preferred_time_slot": preferred_time_slot,
             "city_location": city_location,
-            "consultation_reason": consultation_reason
+            "consultation_reason": consultation_reason,
+            "speciality": speciality
         }
     }
 
@@ -150,7 +158,7 @@ def _extract_form_data(steps):
 
     Two sources used together:
     1. InteractiveFlowReply — WhatsApp Form submission
-       contains date, city, reason, raw time option ID
+       contains date, city, reason, raw time option ID, speciality
     2. Question message text — Thank You message sent to
        patient has the resolved readable time slot label
     """
@@ -199,6 +207,14 @@ def _extract_form_data(steps):
                              "consultation_reason"
                          ):
                         result["consultation_reason"] = \
+                            str(value).strip()
+
+                    elif key_lower.startswith("speciality"):
+                        # New: captures the speciality dropdown
+                        # value when the Interakt form has it.
+                        # When absent, _handle_workflow_completion
+                        # defaults to "Other".
+                        result["speciality"] = \
                             str(value).strip()
 
             except Exception:
