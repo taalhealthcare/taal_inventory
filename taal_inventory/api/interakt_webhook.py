@@ -13,6 +13,17 @@ def receive_interakt_booking():
     """
     try:
         raw = frappe.request.data
+
+        # ════════════════════════════════════════════════════════════════
+        # DIAGNOSTIC LOGGING (temporary — remove after issue is solved)
+        # Logs every incoming webhook to Error Log so we can see
+        # exactly what Interakt is sending.
+        # ════════════════════════════════════════════════════════════════
+        try:
+            _log_incoming_for_debug(raw)
+        except Exception:
+            pass  # Never let logging break the actual flow
+
         if not raw:
             return {"status": "ignored", "reason": "empty body"}
 
@@ -32,6 +43,72 @@ def receive_interakt_booking():
         return {"status": "error", "message": str(e)}
 
 
+def _log_incoming_for_debug(raw):
+    """
+    DIAGNOSTIC ONLY — Logs every incoming Interakt webhook request to
+    Error Log with the title "INTERAKT DEBUG: Incoming Webhook".
+
+    Remove this function and its caller in receive_interakt_booking
+    once the booking-creation issue is resolved.
+    """
+    if not raw:
+        frappe.log_error(
+            "Body: (empty)",
+            "INTERAKT DEBUG: Incoming Webhook"
+        )
+        return
+
+    try:
+        payload = json.loads(raw)
+    except Exception as parse_err:
+        try:
+            raw_preview = raw.decode("utf-8", errors="replace")[:1000]
+        except Exception:
+            raw_preview = str(raw)[:1000]
+        frappe.log_error(
+            f"JSON parse failed: {parse_err}\n\nRaw body preview:\n{raw_preview}",
+            "INTERAKT DEBUG: Parse Failed"
+        )
+        return
+
+    event_type      = payload.get("type", "?")
+    data            = payload.get("data", {}) or {}
+    customer_number = data.get("customer_number", "?")
+    customer_name   = data.get("customer_name", "?")
+    workflow_id     = data.get("id", "?")
+    steps           = data.get("data", [])
+    num_steps       = len(steps) if isinstance(steps, list) else 0
+
+    # Detect form submission step
+    has_form_submission = False
+    if isinstance(steps, list):
+        for step in steps:
+            if isinstance(step, dict):
+                answer = step.get("answer", {}) or {}
+                if answer.get("message_content_type") == "InteractiveFlowReply":
+                    has_form_submission = True
+                    break
+
+    try:
+        raw_preview = raw.decode('utf-8', errors='replace')[:3000]
+    except Exception:
+        raw_preview = str(raw)[:3000]
+
+    summary = (
+        f"Event Type:           {event_type}\n"
+        f"Customer Name:        {customer_name}\n"
+        f"Customer Number:      {customer_number}\n"
+        f"Workflow Instance ID: {workflow_id}\n"
+        f"Number of Steps:      {num_steps}\n"
+        f"Has Form Submission:  {has_form_submission}\n"
+        f"\n"
+        f"-- Raw payload (first 3000 chars) --\n"
+        f"{raw_preview}"
+    )
+
+    frappe.log_error(summary, "INTERAKT DEBUG: Incoming Webhook")
+
+
 def _handle_workflow_completion(payload):
     """
     Parses workflow_response_update event.
@@ -40,27 +117,21 @@ def _handle_workflow_completion(payload):
     """
     data = payload.get("data", {})
 
-    # ── Step 1: Extract phone number ─────────────────────────────
     raw_number = data.get("customer_number", "")
     whatsapp_number = raw_number.replace("+", "").strip()
 
     if not whatsapp_number:
         return {"status": "ignored", "reason": "no phone number"}
 
-    # ── Step 2: Extract customer name ────────────────────────────
     patient_name = str(
         data.get("customer_name", "")
     ).strip()[:50]
     if not patient_name:
         return {"status": "ignored", "reason": "no customer name"}
 
-    # ── Step 3: Extract form data from workflow steps ─────────────
     steps = data.get("data", [])
     form_data = _extract_form_data(steps)
 
-    # ── Step 4: STRICT FILTER ─────────────────────────────────────
-    # Only process events that have an actual form submission.
-    # A valid booking MUST have preferred_date.
     preferred_date = form_data.get("preferred_date", "")
     if not preferred_date:
         return {
@@ -68,7 +139,6 @@ def _handle_workflow_completion(payload):
             "reason": "no form submission in this event"
         }
 
-    # ── Step 5: Deduplication ─────────────────────────────────────
     workflow_instance_id = data.get("id", "")
     record_id = f"IKT-{workflow_instance_id}" \
         if workflow_instance_id else _generate_record_id()
@@ -83,56 +153,34 @@ def _handle_workflow_completion(payload):
         )
         return {"status": "duplicate", "booking": existing}
 
-    # ── Step 6: Build all field values ────────────────────────────
     city_location       = form_data.get("city_location", "")
     preferred_time_slot = form_data.get("preferred_time_slot", "")
     consultation_reason = form_data.get("consultation_reason", "")
-
-    # Speciality: defaults to "Other" until the Interakt form
-    # has the speciality dropdown wired up. "Other" means no
-    # doctor assigned at payment time → no doctor WhatsApp →
-    # patient still gets Meet link → admin still notified.
     speciality          = form_data.get("speciality", "") or "Other"
 
-    # ── Step 7: Get or create Patient ────────────────────────────
-    # WhatsApp number is the ONLY reliable unique key.
-    # Name matching is exact only — no LIKE search ever.
-    # UID is auto-assigned by Server Script on before_insert
-    # using ORDER BY uid DESC — so no collision possible.
     patient_id = _get_or_create_patient(
         whatsapp_number=whatsapp_number,
         patient_name=patient_name,
         city_location=city_location
     )
 
-    # ── Step 8: Create Interakt Booking ──────────────────────────
     booking = frappe.new_doc("Interakt Booking")
-
-    # Section A: Source Identity
     booking.record_id           = record_id
     booking.booking_source      = "Interakt WhatsApp"
     booking.interakt_flow_name  = "Doctor Consultation"
     booking.lead_created_at     = now_datetime()
-
-    # Section B: Patient Details
     booking.patient             = patient_id
     booking.patient_name        = patient_name
     booking.whatsapp_number     = whatsapp_number
     booking.city_location       = city_location
-
-    # Section C: Service Details
     booking.selected_service    = "Doctor Consultation"
     booking.consultation_type   = "Doctor"
     booking.preferred_date      = preferred_date
     booking.preferred_time_slot = preferred_time_slot
     booking.consultation_reason = consultation_reason
     booking.speciality          = speciality
-
-    # Section D: Payment
     booking.payment_amount_inr  = 499
     booking.payment_status      = "Pending"
-
-    # Section E: Operations
     booking.booking_status      = "Pending Payment"
 
     booking.insert(ignore_permissions=True)
@@ -153,15 +201,7 @@ def _handle_workflow_completion(payload):
 
 
 def _extract_form_data(steps):
-    """
-    Extracts all booking data from workflow steps.
-
-    Two sources used together:
-    1. InteractiveFlowReply — WhatsApp Form submission
-       contains date, city, reason, raw time option ID, speciality
-    2. Question message text — Thank You message sent to
-       patient has the resolved readable time slot label
-    """
+    """Extracts all booking data from workflow steps."""
     result = {}
 
     for step in steps:
@@ -169,7 +209,6 @@ def _extract_form_data(steps):
         answer   = step.get("answer", {})
         msg_type = answer.get("message_content_type", "")
 
-        # ── Source 1: WhatsApp Form Submission ───────────────────
         if msg_type == "InteractiveFlowReply":
             try:
                 msg_str = answer.get("message", "{}")
@@ -197,8 +236,6 @@ def _extract_form_data(steps):
                             str(value).strip()
 
                     elif key_lower.startswith("preferred_time"):
-                        # Store raw — overridden below if
-                        # readable value found in message text
                         result["preferred_time_slot_raw"] = \
                             str(value).strip()
 
@@ -210,10 +247,6 @@ def _extract_form_data(steps):
                             str(value).strip()
 
                     elif key_lower.startswith("speciality"):
-                        # New: captures the speciality dropdown
-                        # value when the Interakt form has it.
-                        # When absent, _handle_workflow_completion
-                        # defaults to "Other".
                         result["speciality"] = \
                             str(value).strip()
 
@@ -223,10 +256,6 @@ def _extract_form_data(steps):
                     "Interakt: Form Parse Error"
                 )
 
-        # ── Source 2: Thank You Message (readable time) ──────────
-        # The confirmation message sent to patient contains
-        # the resolved human-readable time slot label.
-        # e.g. "Date:  2026-08-27\nTime:  4 PM - 6 PM"
         q_message = question.get("message", "")
         if "Time:" in q_message and (
             "AM" in q_message or "PM" in q_message
@@ -243,11 +272,6 @@ def _extract_form_data(steps):
             if time_val:
                 result["preferred_time_slot"] = time_val
 
-    # ── Final: resolve time slot ──────────────────────────────────
-    # Priority:
-    # 1. Readable time extracted from message text — best source
-    # 2. Known option ID mapping — reliable fallback
-    # 3. Raw option ID — last resort, always stored
     readable_from_message = result.get("preferred_time_slot", "")
     raw_option_id = result.pop("preferred_time_slot_raw", "")
 
@@ -265,13 +289,7 @@ def _extract_form_data(steps):
 
 
 def _extract_time_from_message(message_text):
-    """
-    Extracts ONLY the readable time slot value from message text.
-    Handles non-breaking spaces and all newline formats.
-
-    Input:  "Time:  4 PM - 6 PM \n\nConsultation Fee..."
-    Output: "4 PM - 6 PM"
-    """
+    """Extracts ONLY the readable time slot value from message text."""
     try:
         if "Time:" not in message_text:
             return ""
@@ -283,7 +301,6 @@ def _extract_time_from_message(message_text):
         after_time = parts[1]
         after_time = after_time.replace("\xa0", " ").strip()
 
-        # Split on every possible newline — take first chunk only
         for separator in ["\n", "\\n", "\r\n", "\r"]:
             if separator in after_time:
                 after_time = after_time.split(separator)[0]
@@ -301,20 +318,8 @@ def _extract_time_from_message(message_text):
 
 
 def _resolve_time_slot(raw_option_id):
-    """
-    Resolves Interakt option IDs to readable time labels.
-
-    These option IDs are stable for your specific Interakt form.
-    They only change if you delete and recreate the dropdown
-    field inside Interakt WhatsApp Forms builder.
-
-    To add a new mapping:
-    1. Run a test booking selecting the unknown time slot
-    2. Check Interakt Booking record for the raw option ID
-    3. Add it to slot_map below with its readable label
-    """
+    """Resolves Interakt option IDs to readable time labels."""
     slot_map = {
-        # TAAL+ Doctor Consultation form — known mappings
         "option_1773381068873_bbg7g961e": "4:00 PM - 6:00 PM",
         "option_1773381057829_vihn2mczm": "9:00 AM - 11:00 AM",
         "option_1773381018418_s16i4ur2a": "11:00 AM - 1:00 PM",
@@ -323,37 +328,19 @@ def _resolve_time_slot(raw_option_id):
     if not raw_option_id:
         return ""
 
-    # Already readable
     if "AM" in raw_option_id or "PM" in raw_option_id:
         return raw_option_id.strip()
 
-    # Known mapping
     if raw_option_id in slot_map:
         return slot_map[raw_option_id]
 
-    # Unknown — store raw so we can add mapping later
     return raw_option_id
 
 
 def _get_or_create_patient(
     whatsapp_number, patient_name, city_location=""
 ):
-    """
-    Patient lookup — strict matching only.
-
-    LIKE search permanently removed — caused wrong patient
-    linking (Ram matched Ramesh Patil).
-
-    UID is auto-assigned by Server Script on before_insert.
-    Server Script uses ORDER BY uid DESC so always picks
-    the highest existing UID and adds 1 — no collision possible.
-
-    Search order:
-    1. WhatsApp number — exact match, primary key
-    2. patient_name — exact match only
-    3. Create new Patient
-    """
-    # Search 1: by WhatsApp number — primary unique key
+    """Patient lookup — strict matching only."""
     existing = frappe.db.get_value(
         "Patient",
         {"custom_whatsapp_number": whatsapp_number},
@@ -362,8 +349,6 @@ def _get_or_create_patient(
     if existing:
         return existing
 
-    # Search 2: exact patient_name match only
-    # NEVER use LIKE — matches similar names incorrectly
     existing = frappe.db.get_value(
         "Patient",
         {"patient_name": patient_name},
@@ -380,8 +365,6 @@ def _get_or_create_patient(
         frappe.db.commit()
         return existing
 
-    # Search 3: Create new Patient
-    # UID auto-assigned by Server Script on before_insert
     try:
         patient = frappe.new_doc("Patient")
         patient.first_name             = patient_name
@@ -396,7 +379,6 @@ def _get_or_create_patient(
     except frappe.UniqueValidationError as e:
         frappe.db.rollback()
 
-        # Check if concurrent request just created this patient
         concurrent = frappe.db.get_value(
             "Patient",
             {"patient_name": patient_name},
