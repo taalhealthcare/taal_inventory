@@ -9,15 +9,16 @@ from frappe.utils import now_datetime
 # and checking the "Interakt: Unknown Speciality Option" error log.
 # ──────────────────────────────────────────────────────────────────────────────
 SPECIALITY_OPTION_MAP = {
-    # Example (replace with real IDs after testing):
-    # "option_xxxxxxx_aaaaaa": "Mental Health",
-    # "option_xxxxxxx_bbbbbb": "HIV Care (ART)",
-    # "option_xxxxxxx_cccccc": "PrEP & PEP Support",
-    # "option_xxxxxxx_dddddd": "STI/STD Care",
-    # "option_xxxxxxx_eeeeee": "Mens Health",
-    # "option_xxxxxxx_ffffff": "Womens Health",
-    # "option_xxxxxxx_gggggg": "LGBTQ+ Health",
-    # "option_xxxxxxx_hhhhhh": "Other",
+    # All 7 speciality option IDs mapped (form revision: 2026-06-01)
+    "option_1746003238318_a35cczxk9": "Mental Health",
+    "option_1746003263847_vikrtx2f5": "HIV Care (ART)",
+    "option_1746003269445_7edlabgtb": "PrEP & PEP Support",
+    "option_1779967711791_x7emnvtxp": "STI/STD Care",
+    "option_1779967725446_9liljnhsf": "Mens Health",
+    "option_1779967727051_mfasrm9pb": "Womens Health",
+    "option_1779967728316_y1cwf2g05": "LGBTQ+ Health",
+    # NOTE: "Other" option ID not yet captured — unknown option IDs default to "Other" anyway,
+    # so this is functionally complete. Add the Other option ID here when discovered.
 }
 
 VALID_SPECIALITIES = {
@@ -416,8 +417,9 @@ def _resolve_time_slot(raw_option_id):
         "option_1773381068873_bbg7g961e": "4:00 PM - 6:00 PM",
         "option_1773381057829_vihn2mczm": "9:00 AM - 11:00 AM",
         "option_1773381018418_s16i4ur2a": "11:00 AM - 1:00 PM",
-        # New form option ID (seen in debug log — verify label)
-        # "option_1779967870405_05y9nt205": "<verify and fill in>",
+        # New form options (build out as we discover them)
+        "option_1779967868409_virlndpus": "03:00 PM - 03:30 PM",
+        # "option_1779967870405_05y9nt205": "<verify and add>",
     }
     if not raw_option_id:
         return ""
