@@ -53,6 +53,8 @@ def receive_interakt_booking():
 
         if event_type == "workflow_response_update":
             return _handle_workflow_completion(payload)
+        elif event_type == "message_received":
+            return _handle_message_received(payload)
         else:
             return {"status": "ignored", "event_type": event_type}
 
@@ -62,6 +64,77 @@ def receive_interakt_booking():
             "Interakt Webhook Error"
         )
         return {"status": "error", "message": str(e)}
+
+
+def _handle_message_received(payload):
+    """
+    Handles `message_received` events. Specifically: when a patient submits the
+    WhatsApp Form (InteractiveFlowReply), Interakt updates customer.traits with
+    RESOLVED values (e.g. consultation_time = "12:00 PM - 12:30 PM" instead of
+    the raw option_id). We use this to backfill the booking's preferred_time_slot
+    with the human-readable label, replacing the raw option_id stored by the
+    workflow_response_update handler.
+
+    Idempotent — only updates if the current value still looks like a raw option ID.
+    """
+    data = payload.get("data", {}) or {}
+    message = data.get("message", {}) or {}
+
+    # Only process WhatsApp Form submissions (not text, buttons, etc.)
+    if message.get("message_content_type") != "InteractiveFlowReply":
+        return {"status": "ignored", "reason": "not a flow reply"}
+
+    customer = data.get("customer", {}) or {}
+    phone = (customer.get("channel_phone_number") or "").lstrip("+").strip()
+    traits = customer.get("traits", {}) or {}
+
+    if not phone:
+        return {"status": "ignored", "reason": "no phone in event"}
+
+    # Find the most-recent booking for this patient where time slot is still raw option_id.
+    # We scope to last 10 minutes to avoid touching old bookings.
+    from frappe.utils import add_to_date
+
+    window_start = add_to_date(now_datetime(), minutes=-10)
+
+    bookings = frappe.get_all(
+        "Interakt Booking",
+        filters={
+            "whatsapp_number": phone,
+            "creation": [">", window_start],
+            "preferred_time_slot": ["like", "option_%"],
+        },
+        fields=["name", "preferred_time_slot"],
+        order_by="creation desc",
+        limit=1,
+    )
+
+    if not bookings:
+        return {"status": "no_booking_to_update"}
+
+    booking = bookings[0]
+
+    # Extract resolved values from traits (Interakt strips leading spaces sometimes)
+    resolved_time = (traits.get("consultation_time") or "").strip()
+
+    if not resolved_time or resolved_time.startswith("option_"):
+        return {"status": "no_resolved_time_in_traits", "booking": booking["name"]}
+
+    # Update only the time slot field, leave everything else alone
+    frappe.db.set_value(
+        "Interakt Booking",
+        booking["name"],
+        "preferred_time_slot",
+        resolved_time,
+    )
+    frappe.db.commit()
+
+    return {
+        "status": "time_slot_resolved",
+        "booking": booking["name"],
+        "old_value": booking["preferred_time_slot"],
+        "new_value": resolved_time,
+    }
 
 
 def _log_incoming_for_debug(raw):
