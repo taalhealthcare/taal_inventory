@@ -36,7 +36,7 @@ from taal_inventory.services import admin_notifier
 # Get from: Razorpay Dashboard → Settings → Webhooks → (your webhook) → Secret
 # This must MATCH the secret configured for your webhook in Razorpay.
 # ──────────────────────────────────────────────────────────────────────────────
-RAZORPAY_WEBHOOK_SECRET = "3a_JN39BAkMXYub"
+RAZORPAY_WEBHOOK_SECRET = "taalplus_razorpay_secret_2026"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,6 +81,89 @@ def handle_razorpay_payment():
             "Razorpay Webhook Error"
         )
         return {"status": "error", "message": str(e)}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Test-only wrapper — DELETE BEFORE PRODUCTION GO-LIVE
+# Allows triggering the full post-payment orchestration manually from
+# System Console without making an actual Razorpay payment. Builds a synthetic
+# Razorpay event from the booking and calls the real _handle_payment_success.
+#
+# Usage from System Console:
+#     result = frappe.call(
+#         "taal_inventory.api.razorpay_webhook.simulate_post_payment",
+#         booking_name="IB-20260602-00003",
+#     )
+#     print(result)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@frappe.whitelist()
+def simulate_post_payment(booking_name=None):
+    """
+    Manually trigger the post-payment flow for an Interakt Booking, bypassing
+    Razorpay entirely. Useful for demo/QA. Builds a synthetic event and runs
+    the same _handle_payment_success that the live webhook uses.
+    """
+    if not booking_name:
+        return {"error": "booking_name parameter required"}
+
+    if not frappe.db.exists("Interakt Booking", booking_name):
+        return {"error": f"Booking {booking_name} not found"}
+
+    booking = frappe.get_doc("Interakt Booking", booking_name)
+
+    if booking.payment_status == "Paid":
+        return {
+            "error": "Booking already Paid",
+            "booking": booking_name,
+            "hint": "Run the reset script first, or test a different booking.",
+        }
+
+    # Build a synthetic Razorpay payment_link.paid event
+    fake_event = {
+        "event": "payment_link.paid",
+        "payload": {
+            "payment_link": {
+                "entity": {
+                    "id": "plink_MANUAL_TEST_" + booking_name,
+                    "customer": {
+                        "contact": "+" + (booking.whatsapp_number or ""),
+                    },
+                },
+            },
+            "payment": {
+                "entity": {
+                    "id": "pay_MANUAL_TEST_" + booking_name,
+                    "amount": int((booking.payment_amount_inr or 499) * 100),
+                    "contact": "+" + (booking.whatsapp_number or ""),
+                },
+            },
+        },
+    }
+
+    # Run the same handler the live webhook calls
+    _handle_payment_success(fake_event)
+
+    # Reload and return the post-execution state
+    booking.reload()
+    return {
+        "booking_name": booking_name,
+        "payment_status": booking.payment_status,
+        "razorpay_order_id": booking.razorpay_order_id,
+        "payment_id": booking.payment_id,
+        "payment_received_at": str(booking.payment_received_at or ""),
+        "booking_status": booking.booking_status,
+        "assigned_team_member": booking.assigned_team_member or "(none)",
+        "patient_appointment": booking.patient_appointment or "(none)",
+        "payment_entry": booking.payment_entry or "(none)",
+        "google_meet_link": booking.google_meet_link or "(none)",
+        "google_calendar_event_id": booking.google_calendar_event_id or "(none)",
+        "meet_creation_status": booking.meet_creation_status or "(none)",
+        "meet_creation_error": booking.meet_creation_error or "(none)",
+        "patient_message_sent": booking.patient_message_sent,
+        "doctor_message_sent": booking.doctor_message_sent,
+        "admin_message_sent": booking.admin_message_sent,
+    }
 
 
 def _verify_razorpay_signature(raw_body, signature):
@@ -339,10 +422,31 @@ def _send_doctor_whatsapp(booking, doctor_details, speciality):
 def _create_patient_appointment(booking):
     """Auto-creates a Patient Appointment record and links it back to the booking."""
     try:
+        # Parse 24h time from preferred_time_slot like "04:00 PM - 04:30 PM" → "16:00:00"
+        appt_time_24h = "09:00:00"
+        try:
+            slot = (booking.preferred_time_slot or "").strip()
+            start_str = slot.split(" - ")[0].strip()
+            parts = start_str.split()
+            hr_min = parts[0].split(":")
+            hour = int(hr_min[0])
+            minute = int(hr_min[1])
+            period = parts[1].upper() if len(parts) > 1 else "AM"
+            if period == "PM" and hour != 12:
+                hour += 12
+            elif period == "AM" and hour == 12:
+                hour = 0
+            appt_time_24h = f"{hour:02d}:{minute:02d}:00"
+        except Exception:
+            pass
+
         appt = frappe.new_doc("Patient Appointment")
         appt.patient                       = booking.patient
+        appt.appointment_for               = "Practitioner"
         appt.appointment_type              = booking.selected_service
         appt.appointment_date              = booking.preferred_date
+        appt.appointment_time              = appt_time_24h
+        appt.duration                      = 30
         appt.notes                         = booking.consultation_reason
         appt.status                        = "Open"
         appt.custom_booking_source         = "Interakt WhatsApp"
@@ -373,18 +477,121 @@ def _create_patient_appointment(booking):
         )
 
 
-def _create_payment_entry(booking, amount):
-    """Auto-creates a Payment Entry for accounting reconciliation."""
+def _get_default_company():
+    """
+    Resolve the company to use for accounting entries. Order of preference:
+      1. Booking API Settings → default_company (if configured)
+      2. Global default company (frappe.defaults)
+      3. First Company record in the system
+    """
     try:
+        company = frappe.db.get_single_value("Booking API Settings", "default_company")
+        if company and frappe.db.exists("Company", company):
+            return company
+    except Exception:
+        pass
+
+    global_default = frappe.defaults.get_global_default("company")
+    if global_default and frappe.db.exists("Company", global_default):
+        return global_default
+
+    companies = frappe.get_all("Company", limit=1, order_by="creation asc")
+    return companies[0]["name"] if companies else None
+
+
+def _resolve_customer_from_patient(patient_name):
+    """
+    Find the Customer record linked to a Patient.
+    Falls back to using patient_name as a Customer if no link exists.
+    """
+    if not patient_name:
+        return None
+
+    customer = frappe.db.get_value("Patient", patient_name, "customer")
+    if customer and frappe.db.exists("Customer", customer):
+        return customer
+
+    if frappe.db.exists("Customer", patient_name):
+        return patient_name
+
+    return None
+
+
+def _create_payment_entry(booking, amount):
+    """
+    Auto-creates a Payment Entry for accounting reconciliation.
+    Uses the configured company's default accounts and cost center — works
+    on any environment (TCPL, TPC, or whatever the live abbreviation is).
+    """
+    try:
+        # 1. Resolve company dynamically
+        company = _get_default_company()
+        if not company:
+            raise Exception("No company configured in the system")
+
+        # 2. Pull company's default accounts + cost center
+        company_doc = frappe.db.get_value(
+            "Company", company,
+            [
+                "default_receivable_account",
+                "default_cash_account",
+                "default_bank_account",
+                "cost_center",
+                "default_currency",
+            ],
+            as_dict=True,
+        )
+        if not company_doc:
+            raise Exception(f"Company '{company}' not found")
+
+        paid_from   = company_doc.get("default_receivable_account")
+        paid_to     = (
+            company_doc.get("default_cash_account")
+            or company_doc.get("default_bank_account")
+        )
+        currency    = company_doc.get("default_currency") or "INR"
+        cost_center = company_doc.get("cost_center")
+
+        if not paid_from:
+            raise Exception(
+                f"Company '{company}' has no default_receivable_account set. "
+                f"Configure it at /app/company/{company}"
+            )
+        if not paid_to:
+            raise Exception(
+                f"Company '{company}' has no default_cash_account or default_bank_account set. "
+                f"Configure it at /app/company/{company}"
+            )
+
+        # 3. Resolve Customer from Patient
+        customer = _resolve_customer_from_patient(booking.patient)
+        if not customer:
+            raise Exception(
+                f"No Customer linked to Patient '{booking.patient}'. "
+                f"Set Customer field on the Patient record."
+            )
+
+        # 4. Create Payment Entry with all required fields
         pe = frappe.new_doc("Payment Entry")
-        pe.payment_type    = "Receive"
-        pe.party_type      = "Customer"
-        pe.party           = booking.patient
-        pe.paid_amount     = amount
-        pe.received_amount = amount
-        pe.reference_no    = booking.payment_id
-        pe.reference_date  = booking.payment_received_at
-        pe.remarks         = (
+        pe.company                       = company
+        pe.posting_date                  = frappe.utils.nowdate()
+        pe.payment_type                  = "Receive"
+        pe.party_type                    = "Customer"
+        pe.party                         = customer
+        pe.paid_from                     = paid_from
+        pe.paid_to                       = paid_to
+        pe.paid_from_account_currency    = currency
+        pe.paid_to_account_currency      = currency
+        pe.paid_amount                   = amount
+        pe.received_amount               = amount
+        pe.source_exchange_rate          = 1
+        pe.target_exchange_rate          = 1
+        pe.mode_of_payment               = "Cash"
+        if cost_center:
+            pe.cost_center               = cost_center
+        pe.reference_no                  = booking.payment_id
+        pe.reference_date                = booking.payment_received_at
+        pe.remarks = (
             f"Razorpay Payment | "
             f"Booking: {booking.name} | "
             f"Service: {booking.selected_service} | "
@@ -396,7 +603,7 @@ def _create_payment_entry(booking, amount):
             "Interakt Booking",
             booking.name,
             "payment_entry",
-            pe.name
+            pe.name,
         )
         frappe.db.commit()
 
