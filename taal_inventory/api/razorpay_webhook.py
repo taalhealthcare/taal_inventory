@@ -98,11 +98,23 @@ def handle_razorpay_payment():
 # ──────────────────────────────────────────────────────────────────────────────
 
 @frappe.whitelist()
-def simulate_post_payment(booking_name=None):
+def simulate_post_payment(
+    booking_name=None,
+    real_payment_id=None,
+    real_order_id=None,
+):
     """
     Manually trigger the post-payment flow for an Interakt Booking, bypassing
-    Razorpay entirely. Useful for demo/QA. Builds a synthetic event and runs
-    the same _handle_payment_success that the live webhook uses.
+    Razorpay entirely. Useful for demo/QA and for manually completing bookings
+    where the real webhook failed (e.g. signature mismatch).
+
+    Parameters:
+      booking_name      — required, e.g. "IB-20260603-00004"
+      real_payment_id   — optional, the actual Razorpay payment_id (pay_xxxx)
+      real_order_id     — optional, the actual Razorpay order/plink_id
+
+    If real IDs are provided, they're stored on the booking instead of
+    placeholder MANUAL_TEST_* values.
     """
     if not booking_name:
         return {"error": "booking_name parameter required"}
@@ -119,13 +131,17 @@ def simulate_post_payment(booking_name=None):
             "hint": "Run the reset script first, or test a different booking.",
         }
 
+    # Use real Razorpay IDs if provided, otherwise placeholder
+    order_id   = real_order_id   or ("plink_MANUAL_TEST_" + booking_name)
+    payment_id = real_payment_id or ("pay_MANUAL_TEST_"   + booking_name)
+
     # Build a synthetic Razorpay payment_link.paid event
     fake_event = {
         "event": "payment_link.paid",
         "payload": {
             "payment_link": {
                 "entity": {
-                    "id": "plink_MANUAL_TEST_" + booking_name,
+                    "id": order_id,
                     "customer": {
                         "contact": "+" + (booking.whatsapp_number or ""),
                     },
@@ -133,7 +149,7 @@ def simulate_post_payment(booking_name=None):
             },
             "payment": {
                 "entity": {
-                    "id": "pay_MANUAL_TEST_" + booking_name,
+                    "id": payment_id,
                     "amount": int((booking.payment_amount_inr or 499) * 100),
                     "contact": "+" + (booking.whatsapp_number or ""),
                 },
@@ -144,25 +160,29 @@ def simulate_post_payment(booking_name=None):
     # Run the same handler the live webhook calls
     _handle_payment_success(fake_event)
 
-    # Reload and return the post-execution state
+    # Reload and return the post-execution state (defensive — fields may not exist)
     booking.reload()
+
+    def safe(field, default="(none)"):
+        return getattr(booking, field, None) or default
+
     return {
-        "booking_name": booking_name,
-        "payment_status": booking.payment_status,
-        "razorpay_order_id": booking.razorpay_order_id,
-        "payment_id": booking.payment_id,
-        "payment_received_at": str(booking.payment_received_at or ""),
-        "booking_status": booking.booking_status,
-        "assigned_team_member": booking.assigned_team_member or "(none)",
-        "patient_appointment": booking.patient_appointment or "(none)",
-        "payment_entry": booking.payment_entry or "(none)",
-        "google_meet_link": booking.google_meet_link or "(none)",
-        "google_calendar_event_id": booking.google_calendar_event_id or "(none)",
-        "meet_creation_status": booking.meet_creation_status or "(none)",
-        "meet_creation_error": booking.meet_creation_error or "(none)",
-        "patient_message_sent": booking.patient_message_sent,
-        "doctor_message_sent": booking.doctor_message_sent,
-        "admin_message_sent": booking.admin_message_sent,
+        "booking_name":             booking_name,
+        "payment_status":           safe("payment_status"),
+        "razorpay_order_id":        safe("razorpay_order_id"),
+        "payment_id":               safe("payment_id"),
+        "payment_received_at":      str(safe("payment_received_at", "")),
+        "booking_status":           safe("booking_status"),
+        "assigned_team_member":     safe("assigned_team_member"),
+        "patient_appointment":      safe("patient_appointment"),
+        "payment_entry":            safe("payment_entry"),
+        "google_meet_link":         safe("google_meet_link"),
+        "google_calendar_event_id": safe("google_calendar_event_id"),
+        "meet_creation_status":     safe("meet_creation_status"),
+        "meet_creation_error":      safe("meet_creation_error"),
+        "patient_message_sent":     getattr(booking, "patient_message_sent", 0),
+        "doctor_message_sent":      getattr(booking, "doctor_message_sent", 0),
+        "admin_message_sent":       getattr(booking, "admin_message_sent", 0),
     }
 
 
