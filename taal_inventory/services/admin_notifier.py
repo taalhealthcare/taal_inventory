@@ -2,14 +2,16 @@
 Admin Notifier
 
 Sends booking notifications to the administrator via:
-  1. WhatsApp template (Interakt) — using the `admin_template_name` template
+  1. WhatsApp template (Interakt) — using "admin_consultation_booked" template
   2. Email — using frappe.sendmail with an HTML body
 
 Settings come from `Booking API Settings`:
-  - admin_whatsapp_number
-  - admin_notification_email
-  - admin_template_name
-  - send_admin_notification (master toggle)
+  - admin_whatsapp_number    — if set, WhatsApp is sent
+  - admin_notification_email — if set, email is sent
+  - admin_template_name      — optional override; defaults to "admin_consultation_booked"
+
+The notifier is "always-on": no master toggle. If either channel's destination
+field is empty, that channel is silently skipped. Both empty → noop.
 """
 
 import frappe
@@ -41,17 +43,21 @@ def notify_admin(booking, doctor_display_name=None):
         "errors": []
     }
 
-    if not settings.send_admin_notification:
-        return result
-
     doctor_label = doctor_display_name or "Unassigned (Other)"
     patient_phone_no_prefix = _strip_country_code(booking.whatsapp_number)
     speciality = getattr(booking, "speciality", None) or "Other"
 
+    # Defensive field reads (Booking API Settings doesn't have these
+    # fields directly defined, so we use getattr with sensible defaults)
+    admin_whatsapp_number    = getattr(settings, "admin_whatsapp_number", None)
+    admin_notification_email = getattr(settings, "admin_notification_email", None)
+    admin_template_name      = getattr(settings, "admin_template_name", None) \
+                               or "admin_consultation_booked"
+
     # ──────────────────────────────────────────────────────────────────────
     # 1. WhatsApp via Interakt
     # ──────────────────────────────────────────────────────────────────────
-    if settings.admin_whatsapp_number:
+    if admin_whatsapp_number:
         body_values = [
             booking.patient_name or "-",
             patient_phone_no_prefix or "-",
@@ -63,26 +69,29 @@ def notify_admin(booking, doctor_display_name=None):
             str(flt(booking.payment_amount_inr or 0)),
             booking.name or "-",
             (booking.consultation_reason or "-")[:200],
-            booking.google_meet_link or "Not generated"
+            getattr(booking, "google_meet_link", None) or "Not generated"
         ]
 
-        wa_result = interakt_outbound.send_template_message(
-            phone_number=settings.admin_whatsapp_number,
-            template_name=settings.admin_template_name or "admin_consultation_booked",
-            body_values=body_values
-        )
+        try:
+            wa_result = interakt_outbound.send_template_message(
+                phone_number=admin_whatsapp_number,
+                template_name=admin_template_name,
+                body_values=body_values
+            )
 
-        if wa_result.get("success"):
-            result["whatsapp_sent"] = True
-        else:
-            result["errors"].append(f"Admin WhatsApp: {wa_result.get('error', 'unknown')}")
+            if wa_result.get("success"):
+                result["whatsapp_sent"] = True
+            else:
+                result["errors"].append(f"Admin WhatsApp: {wa_result.get('error', 'unknown')}")
+        except Exception as e:
+            result["errors"].append(f"Admin WhatsApp exception: {str(e)}")
     else:
         result["errors"].append("Admin WhatsApp skipped: admin_whatsapp_number not set")
 
     # ──────────────────────────────────────────────────────────────────────
     # 2. Email via frappe.sendmail
     # ──────────────────────────────────────────────────────────────────────
-    if settings.admin_notification_email:
+    if admin_notification_email:
         try:
             subject = f"[TAAL+] New Consultation Booked — {booking.patient_name or 'Patient'}"
             html_body = _build_admin_email_html(
@@ -90,7 +99,7 @@ def notify_admin(booking, doctor_display_name=None):
             )
 
             frappe.sendmail(
-                recipients=[settings.admin_notification_email],
+                recipients=[admin_notification_email],
                 subject=subject,
                 message=html_body,
                 now=True  # send synchronously so we know if it failed

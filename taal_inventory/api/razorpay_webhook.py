@@ -186,6 +186,174 @@ def simulate_post_payment(
     }
 
 
+@frappe.whitelist()
+def retry_post_payment_for_paid_booking(
+    booking_name=None,
+    real_payment_id=None,
+    real_order_id=None,
+):
+    """
+    Retry the FAILED steps of post-payment orchestration for a booking
+    that's already in "Paid" status — without re-creating Patient Appointment
+    or Payment Entry (those are protected against duplicates).
+
+    Use case: live webhook ran, Patient Appointment + Payment Entry succeeded,
+    but Google Meet / WhatsApp / Email failed due to code bugs that have
+    now been fixed.
+
+    Parameters:
+      booking_name      — required, e.g. "IB-20260603-00004"
+      real_payment_id   — optional, real Razorpay payment_id to replace placeholder
+      real_order_id     — optional, real Razorpay order_id to replace placeholder
+
+    Returns the same dict shape as simulate_post_payment.
+    """
+    if not booking_name:
+        return {"error": "booking_name parameter required"}
+
+    if not frappe.db.exists("Interakt Booking", booking_name):
+        return {"error": f"Booking {booking_name} not found"}
+
+    booking = frappe.get_doc("Interakt Booking", booking_name)
+
+    # 1. Update placeholder Razorpay IDs to real ones if provided
+    updated_ids = []
+    if real_payment_id and booking.payment_id and "MANUAL_TEST" in booking.payment_id:
+        frappe.db.set_value("Interakt Booking", booking_name, "payment_id", real_payment_id)
+        updated_ids.append("payment_id")
+    if real_order_id and booking.razorpay_order_id and "MANUAL_TEST" in booking.razorpay_order_id:
+        frappe.db.set_value("Interakt Booking", booking_name, "razorpay_order_id", real_order_id)
+        updated_ids.append("razorpay_order_id")
+    if updated_ids:
+        frappe.db.commit()
+
+    booking.reload()
+
+    # 2. Determine doctor details (booking already has assigned_team_member)
+    doctor_details = None
+    if booking.assigned_team_member:
+        doctor_details = doctor_assignment.get_doctor_details(booking.assigned_team_member)
+
+    speciality = (getattr(booking, "speciality", None) or "Other").strip()
+
+    step_results = {
+        "ids_updated": updated_ids,
+        "meet": "skipped",
+        "patient_whatsapp": "skipped",
+        "doctor_whatsapp": "skipped",
+        "admin": "skipped",
+        "errors": [],
+    }
+
+    # ── Retry Google Meet creation ─────────────────────────────────────
+    try:
+        booking.meet_creation_status = "Pending"
+        booking.save(ignore_permissions=True)
+        frappe.db.commit()
+
+        meet_result = google_meet_creator.create_meet_for_booking(booking)
+
+        if meet_result.get("success"):
+            booking.google_meet_link         = meet_result.get("meet_link", "")
+            booking.google_calendar_event_id = meet_result.get("event_id", "")
+            booking.meet_creation_status     = "Created"
+            booking.meet_creation_error      = ""
+            booking.save(ignore_permissions=True)
+            frappe.db.commit()
+            booking.reload()
+            step_results["meet"] = "success"
+        else:
+            booking.meet_creation_status = "Failed"
+            booking.meet_creation_error  = (meet_result.get("error") or "Unknown")[:500]
+            booking.save(ignore_permissions=True)
+            frappe.db.commit()
+            step_results["meet"] = "failed: " + (meet_result.get("error") or "Unknown")[:200]
+    except Exception as e:
+        step_results["meet"] = f"exception: {e}"
+        step_results["errors"].append(f"Meet: {e}")
+        frappe.log_error(frappe.get_traceback(), "Retry Meet Creation Error")
+
+    # ── Retry Patient WhatsApp (independent of Meet success) ───────────
+    try:
+        _send_patient_whatsapp(booking, doctor_details, speciality)
+        booking.reload()
+        step_results["patient_whatsapp"] = "sent" if booking.patient_message_sent else "failed (see error log)"
+    except Exception as e:
+        step_results["patient_whatsapp"] = f"exception: {e}"
+        step_results["errors"].append(f"Patient WhatsApp: {e}")
+        frappe.log_error(frappe.get_traceback(), "Retry Patient WhatsApp Error")
+
+    # ── Retry Doctor WhatsApp (only if doctor assigned) ────────────────
+    try:
+        settings_doc = frappe.get_single("Booking API Settings")
+        if (
+            doctor_details
+            and doctor_details.get("exists")
+            and getattr(settings_doc, "send_doctor_notification", 1)
+        ):
+            _send_doctor_whatsapp(booking, doctor_details, speciality)
+            booking.reload()
+            step_results["doctor_whatsapp"] = "sent" if booking.doctor_message_sent else "failed (see error log)"
+        else:
+            step_results["doctor_whatsapp"] = "skipped (no doctor or disabled)"
+    except Exception as e:
+        step_results["doctor_whatsapp"] = f"exception: {e}"
+        step_results["errors"].append(f"Doctor WhatsApp: {e}")
+        frappe.log_error(frappe.get_traceback(), "Retry Doctor WhatsApp Error")
+
+    # ── Retry Admin notification ───────────────────────────────────────
+    try:
+        doctor_display = (
+            doctor_details["display_name"]
+            if (doctor_details and doctor_details.get("exists"))
+            else None
+        )
+        admin_result = admin_notifier.notify_admin(booking, doctor_display)
+
+        if admin_result.get("whatsapp_sent") or admin_result.get("email_sent"):
+            frappe.db.set_value("Interakt Booking", booking_name, "admin_message_sent", 1)
+            frappe.db.commit()
+            step_results["admin"] = (
+                f"whatsapp={admin_result.get('whatsapp_sent')} "
+                f"email={admin_result.get('email_sent')}"
+            )
+        else:
+            step_results["admin"] = "no channel succeeded"
+
+        if admin_result.get("errors"):
+            step_results["errors"].extend(admin_result["errors"])
+
+    except Exception as e:
+        step_results["admin"] = f"exception: {e}"
+        step_results["errors"].append(f"Admin: {e}")
+        frappe.log_error(frappe.get_traceback(), "Retry Admin Notification Error")
+
+    # ── Return full status ─────────────────────────────────────────────
+    booking.reload()
+
+    def safe(field, default="(none)"):
+        return getattr(booking, field, None) or default
+
+    return {
+        "booking_name":             booking_name,
+        "step_results":             step_results,
+        "payment_status":           safe("payment_status"),
+        "razorpay_order_id":        safe("razorpay_order_id"),
+        "payment_id":               safe("payment_id"),
+        "booking_status":           safe("booking_status"),
+        "assigned_team_member":     safe("assigned_team_member"),
+        "patient_appointment":      safe("patient_appointment"),
+        "payment_entry":            safe("payment_entry"),
+        "google_meet_link":         safe("google_meet_link"),
+        "google_calendar_event_id": safe("google_calendar_event_id"),
+        "meet_creation_status":     safe("meet_creation_status"),
+        "meet_creation_error":      safe("meet_creation_error"),
+        "patient_message_sent":     getattr(booking, "patient_message_sent", 0),
+        "doctor_message_sent":      getattr(booking, "doctor_message_sent", 0),
+        "admin_message_sent":       getattr(booking, "admin_message_sent", 0),
+    }
+
+
 def _verify_razorpay_signature(raw_body, signature):
     """HMAC-SHA256 verification using the webhook secret."""
     expected = hmac.new(
@@ -204,6 +372,10 @@ def _handle_payment_success(event):
     """
     Triggered on payment_link.paid.
     Full orchestration of post-payment flow.
+
+    Designed so each step is isolated: a failure in (say) Google Meet creation
+    will NOT prevent Patient WhatsApp, Doctor WhatsApp, or Admin notification
+    from running.
     """
     try:
         # ── 1. Extract Razorpay IDs and customer phone ─────────────────
@@ -262,7 +434,7 @@ def _handle_payment_success(event):
 
         booking = frappe.get_doc("Interakt Booking", booking_name)
 
-        # ── 4. Update payment fields ───────────────────────────────────
+        # ── 4. Update payment fields (CRITICAL — must succeed) ────────
         booking.razorpay_order_id   = rzp_order_id
         booking.payment_status      = "Paid"
         booking.payment_id          = payment_id
@@ -273,80 +445,103 @@ def _handle_payment_success(event):
 
         # ── 5. Resolve assigned doctor (speciality + load-balancing) ──
         speciality = (booking.speciality or "Other").strip()
-        doctor_name = doctor_assignment.resolve_doctor(
-            speciality,
-            booking.preferred_date,
-            booking.preferred_time_slot
-        )
-
         doctor_details = None
-        if doctor_name:
-            booking.assigned_team_member = doctor_name
-            booking.save(ignore_permissions=True)
-            frappe.db.commit()
-            doctor_details = doctor_assignment.get_doctor_details(doctor_name)
+
+        try:
+            doctor_name = doctor_assignment.resolve_doctor(
+                speciality,
+                booking.preferred_date,
+                booking.preferred_time_slot
+            )
+            if doctor_name:
+                booking.assigned_team_member = doctor_name
+                booking.save(ignore_permissions=True)
+                frappe.db.commit()
+                doctor_details = doctor_assignment.get_doctor_details(doctor_name)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Doctor Assignment Error")
 
         # ── 6. Create Patient Appointment ──────────────────────────────
-        _create_patient_appointment(booking)
+        try:
+            _create_patient_appointment(booking)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Patient Appointment Creation Error")
 
         # ── 7. Create Payment Entry ────────────────────────────────────
-        _create_payment_entry(booking, amount_inr)
+        try:
+            _create_payment_entry(booking, amount_inr)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Payment Entry Creation Error")
 
-        # ── 8. Refresh booking and create Google Meet ──────────────────
         booking.reload()
-        booking.meet_creation_status = "Pending"
-        booking.save(ignore_permissions=True)
-        frappe.db.commit()
 
-        meet_result = google_meet_creator.create_meet_for_booking(booking)
-
-        if meet_result.get("success"):
-            booking.google_meet_link         = meet_result.get("meet_link", "")
-            booking.google_calendar_event_id = meet_result.get("event_id", "")
-            booking.meet_creation_status     = "Created"
-            booking.meet_creation_error      = ""
-        else:
-            booking.meet_creation_status = "Failed"
-            booking.meet_creation_error  = (meet_result.get("error") or "Unknown")[:500]
-
-        booking.save(ignore_permissions=True)
-        frappe.db.commit()
-
-        # ── 9. Patient WhatsApp (only if Meet succeeded) ───────────────
-        if meet_result.get("success"):
-            _send_patient_whatsapp(booking, doctor_details, speciality)
-
-        # ── 10. Doctor WhatsApp (only if assigned + Meet succeeded) ───
-        settings = frappe.get_single("Booking API Settings")
-        if (
-            meet_result.get("success")
-            and doctor_details
-            and doctor_details.get("exists")
-            and settings.send_doctor_notification
-        ):
-            _send_doctor_whatsapp(booking, doctor_details, speciality)
-
-        # ── 11. Admin notification (always — WhatsApp + email) ────────
-        doctor_display = (
-            doctor_details["display_name"]
-            if (doctor_details and doctor_details.get("exists"))
-            else None  # admin_notifier will fall back to "Unassigned (Other)"
-        )
-
-        admin_result = admin_notifier.notify_admin(booking, doctor_display)
-
-        if admin_result.get("whatsapp_sent") or admin_result.get("email_sent"):
-            booking.admin_message_sent = 1
+        # ── 8. Create Google Meet (failure does NOT block WhatsApp) ───
+        meet_succeeded = False
+        try:
+            booking.meet_creation_status = "Pending"
             booking.save(ignore_permissions=True)
             frappe.db.commit()
 
-        if admin_result.get("errors"):
-            frappe.log_error(
-                "\n".join(admin_result["errors"]),
-                f"Admin notification errors: {booking.name}"
-            )
+            meet_result = google_meet_creator.create_meet_for_booking(booking)
 
-    except Exception as e:
+            if meet_result.get("success"):
+                booking.google_meet_link         = meet_result.get("meet_link", "")
+                booking.google_calendar_event_id = meet_result.get("event_id", "")
+                booking.meet_creation_status     = "Created"
+                booking.meet_creation_error      = ""
+                meet_succeeded = True
+            else:
+                booking.meet_creation_status = "Failed"
+                booking.meet_creation_error  = (meet_result.get("error") or "Unknown")[:500]
+
+            booking.save(ignore_permissions=True)
+            frappe.db.commit()
+            booking.reload()
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Google Meet Creation Error")
+
+        # ── 9. Patient WhatsApp (always attempt; uses Meet link if available) ──
+        try:
+            _send_patient_whatsapp(booking, doctor_details, speciality)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Patient WhatsApp Error")
+
+        # ── 10. Doctor WhatsApp (only if doctor assigned + setting enabled) ─
+        try:
+            settings = frappe.get_single("Booking API Settings")
+            if (
+                doctor_details
+                and doctor_details.get("exists")
+                and getattr(settings, "send_doctor_notification", 1)
+            ):
+                _send_doctor_whatsapp(booking, doctor_details, speciality)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Doctor WhatsApp Error")
+
+        # ── 11. Admin notification (always — WhatsApp + email) ────────
+        try:
+            doctor_display = (
+                doctor_details["display_name"]
+                if (doctor_details and doctor_details.get("exists"))
+                else None
+            )
+            admin_result = admin_notifier.notify_admin(booking, doctor_display)
+
+            if admin_result.get("whatsapp_sent") or admin_result.get("email_sent"):
+                frappe.db.set_value(
+                    "Interakt Booking", booking.name, "admin_message_sent", 1
+                )
+                frappe.db.commit()
+
+            if admin_result.get("errors"):
+                frappe.log_error(
+                    "\n".join(admin_result["errors"]),
+                    f"Admin notification errors: {booking.name}"
+                )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Admin Notification Error")
+
+    except Exception:
         frappe.log_error(
             frappe.get_traceback(),
             "Razorpay Payment Success Handler Error"

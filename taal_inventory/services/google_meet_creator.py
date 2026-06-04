@@ -46,7 +46,7 @@ def create_meet_for_booking(booking):
         meet_settings = frappe.get_single("Doctor Consultation Meet Settings")
         booking_settings = frappe.get_single("Booking API Settings")
 
-        calendar_id = meet_settings.calendar_id or "primary"
+        calendar_id = meet_settings.google_calendar_id or "primary"
         duration_minutes = booking_settings.default_meet_duration_minutes or 30
 
         # --- 2. Parse the time slot string into start/end datetimes ---
@@ -148,16 +148,19 @@ def _refresh_access_token(meet_settings):
     """
     Refreshes the Google access token using the stored refresh_token.
     Returns the new access_token string, or None on failure.
+
+    Field names match the Doctor Consultation Meet Settings DocType:
+      - google_client_id, google_client_secret, google_refresh_token
     """
-    client_id = meet_settings.client_id
-    client_secret = meet_settings.get_password("client_secret") \
-        if hasattr(meet_settings, "get_password") else meet_settings.client_secret
-    refresh_token = meet_settings.get_password("refresh_token") \
-        if hasattr(meet_settings, "get_password") else meet_settings.refresh_token
+    client_id = meet_settings.google_client_id
+    client_secret = meet_settings.get_password("google_client_secret") \
+        if hasattr(meet_settings, "get_password") else meet_settings.google_client_secret
+    refresh_token = meet_settings.get_password("google_refresh_token") \
+        if hasattr(meet_settings, "get_password") else meet_settings.google_refresh_token
 
     if not (client_id and client_secret and refresh_token):
         frappe.log_error(
-            "Doctor Consultation Meet Settings missing client_id/secret/refresh_token",
+            "Doctor Consultation Meet Settings missing google_client_id / google_client_secret / google_refresh_token",
             "Google Meet OAuth Config Error"
         )
         return None
