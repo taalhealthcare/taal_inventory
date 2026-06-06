@@ -36,7 +36,7 @@ from taal_inventory.services import admin_notifier
 # Get from: Razorpay Dashboard → Settings → Webhooks → (your webhook) → Secret
 # This must MATCH the secret configured for your webhook in Razorpay.
 # ──────────────────────────────────────────────────────────────────────────────
-RAZORPAY_WEBHOOK_SECRET = "taalplus_razorpay_secret_2026"
+RAZORPAY_WEBHOOK_SECRET = "3a_JN39BAkMXYub"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
