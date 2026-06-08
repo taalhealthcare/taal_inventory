@@ -737,7 +737,17 @@ def _create_payment_entry(booking, amount):
     Auto-creates a Payment Entry for accounting reconciliation.
     Uses the configured company's default accounts and cost center — works
     on any environment (TCPL, TPC, or whatever the live abbreviation is).
+
+    IMPORTANT: Temporarily elevates session to Administrator. ERPNext's
+    Payment Entry validation internally calls `get_account_details` which
+    has its own `frappe.has_permission(throw=True)` check that is NOT
+    bypassed by `ignore_permissions=True` on the doc. When the webhook runs
+    as Guest, that permission check raises PermissionError.
     """
+    # Elevate to Administrator for the full duration of Payment Entry creation
+    original_user = frappe.session.user
+    frappe.set_user("Administrator")
+
     try:
         # 1. Resolve company dynamically
         company = _get_default_company()
@@ -829,6 +839,12 @@ def _create_payment_entry(booking, amount):
             frappe.get_traceback(),
             "Auto Create Payment Entry Error"
         )
+    finally:
+        # ALWAYS restore the original user, even if an exception occurred
+        try:
+            frappe.set_user(original_user)
+        except Exception:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────

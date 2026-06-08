@@ -71,11 +71,21 @@ def _handle_message_received(payload):
     Handles `message_received` events. Specifically: when a patient submits the
     WhatsApp Form (InteractiveFlowReply), Interakt updates customer.traits with
     RESOLVED values (e.g. consultation_time = "12:00 PM - 12:30 PM" instead of
-    the raw option_id). We use this to backfill the booking's preferred_time_slot
-    with the human-readable label, replacing the raw option_id stored by the
-    workflow_response_update handler.
+    the raw option_id).
 
-    Idempotent — only updates if the current value still looks like a raw option ID.
+    Two purposes:
+      1. BACKFILL — if a booking already exists for this phone with a raw
+         option_id time slot, update it with the resolved label.
+      2. CACHE — store the resolved traits keyed by phone so a SUBSEQUENT
+         workflow_response_update event (which arrives milliseconds later
+         and creates the booking) can pick up the resolved value even if
+         the booking didn't exist at this moment.
+
+    This solves the timing/ordering issue where message_received arrives
+    BEFORE workflow_response_update creates the booking.
+
+    Idempotent — only updates the booking if the current value still looks
+    like a raw option ID.
     """
     data = payload.get("data", {}) or {}
     message = data.get("message", {}) or {}
@@ -91,10 +101,29 @@ def _handle_message_received(payload):
     if not phone:
         return {"status": "ignored", "reason": "no phone in event"}
 
-    # Find the most-recent booking for this patient where time slot is still raw option_id.
-    # We scope to last 10 minutes to avoid touching old bookings.
-    from frappe.utils import add_to_date
+    # Extract resolved values from traits
+    resolved_time = (traits.get("consultation_time") or "").strip()
+    resolved_date = (traits.get("consultation_date") or "").strip()
 
+    # ── CACHE the resolved traits keyed by phone (5-minute TTL) ──
+    # This bridges the gap between this event and the subsequent
+    # workflow_response_update event that creates the booking.
+    if resolved_time and not resolved_time.startswith("option_"):
+        cache_payload = {
+            "consultation_time": resolved_time,
+            "consultation_date": resolved_date,
+        }
+        try:
+            frappe.cache().set_value(
+                f"interakt_traits:{phone}",
+                json.dumps(cache_payload),
+                expires_in_sec=300,  # 5 minutes
+            )
+        except Exception:
+            pass  # Cache failure is non-fatal
+
+    # ── BACKFILL an existing booking, if one exists ──
+    from frappe.utils import add_to_date
     window_start = add_to_date(now_datetime(), minutes=-10)
 
     bookings = frappe.get_all(
@@ -110,17 +139,13 @@ def _handle_message_received(payload):
     )
 
     if not bookings:
-        return {"status": "no_booking_to_update"}
+        return {"status": "cached_for_pending_booking", "phone": phone}
 
     booking = bookings[0]
-
-    # Extract resolved values from traits (Interakt strips leading spaces sometimes)
-    resolved_time = (traits.get("consultation_time") or "").strip()
 
     if not resolved_time or resolved_time.startswith("option_"):
         return {"status": "no_resolved_time_in_traits", "booking": booking["name"]}
 
-    # Update only the time slot field, leave everything else alone
     frappe.db.set_value(
         "Interakt Booking",
         booking["name"],
@@ -245,6 +270,27 @@ def _handle_workflow_completion(payload):
     preferred_time_slot = form_data.get("preferred_time_slot", "")
     consultation_reason = form_data.get("consultation_reason", "")
     speciality          = form_data.get("speciality", "") or "Other"
+
+    # ── Step 6a: Resolve raw option_id from cache (set by message_received) ──
+    # When the form is submitted, Interakt fires `message_received` first
+    # (with InteractiveFlowReply and resolved customer.traits) and THEN
+    # fires `workflow_response_update` (which we're handling now). The
+    # message_received handler cached the resolved label for us — pick it up.
+    if preferred_time_slot.startswith("option_"):
+        try:
+            cached_raw = frappe.cache().get_value(f"interakt_traits:{whatsapp_number}")
+            if cached_raw:
+                cached = json.loads(cached_raw)
+                cached_time = (cached.get("consultation_time") or "").strip()
+                if cached_time and not cached_time.startswith("option_"):
+                    preferred_time_slot = cached_time
+                    frappe.log_error(
+                        f"Resolved raw option_id from cache for phone {whatsapp_number}: "
+                        f"option → '{cached_time}'",
+                        "Interakt: Time Slot Cache Hit"
+                    )
+        except Exception:
+            pass  # Cache miss is non-fatal — we'll fall through with raw value
 
     # ── Step 7: Get or create Patient ────────────────────────────
     patient_id = _get_or_create_patient(
