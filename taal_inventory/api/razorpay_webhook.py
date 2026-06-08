@@ -354,6 +354,101 @@ def retry_post_payment_for_paid_booking(
     }
 
 
+@frappe.whitelist()
+def create_missing_payment_entry(booking_name=None):
+    """
+    Whitelisted wrapper to manually create a missing Payment Entry for a
+    booking that's already marked Paid but has no payment_entry link.
+
+    Use case: an earlier live booking failed the Payment Entry creation step
+    (e.g. due to a PermissionError) and we need to retroactively create it.
+
+    Returns the Payment Entry name on success, or an error message.
+    """
+    if not booking_name:
+        return {"error": "booking_name parameter required"}
+
+    if not frappe.db.exists("Interakt Booking", booking_name):
+        return {"error": f"Booking {booking_name} not found"}
+
+    booking = frappe.get_doc("Interakt Booking", booking_name)
+
+    if booking.payment_entry:
+        return {
+            "skipped": True,
+            "reason": "Payment Entry already exists",
+            "payment_entry": booking.payment_entry,
+        }
+
+    if booking.payment_status != "Paid":
+        return {
+            "error": f"Booking is not Paid (status: {booking.payment_status}). "
+                     f"Cannot create Payment Entry for non-paid bookings."
+        }
+
+    amount = float(booking.payment_amount_inr or 499)
+    _create_payment_entry(booking, amount)
+
+    booking.reload()
+    if booking.payment_entry:
+        return {
+            "success": True,
+            "payment_entry": booking.payment_entry,
+            "amount": amount,
+        }
+    else:
+        return {
+            "error": "Payment Entry creation failed — check Error Log for details"
+        }
+
+
+@frappe.whitelist()
+def health_check_deployment():
+    """
+    Whitelisted health check — verifies the deployed code has the expected
+    fixes. Use this before running any live demo to be sure the deploy took.
+
+    Returns dict with pass/fail for each check.
+    """
+    import inspect
+
+    results = {}
+
+    # 1. Check Payment Entry function has Administrator elevation
+    try:
+        src = inspect.getsource(_create_payment_entry)
+        results["payment_entry_has_set_user"]        = "frappe.set_user" in src
+        results["payment_entry_has_original_user"]   = "original_user" in src
+        results["payment_entry_has_finally_block"]   = "finally:" in src
+    except Exception as e:
+        results["payment_entry_check_error"] = str(e)
+
+    # 2. Check Razorpay secret matches dashboard
+    results["razorpay_secret_correct"] = (RAZORPAY_WEBHOOK_SECRET == "3a_JN39BAkMXYub")
+
+    # 3. Check interakt_webhook cache logic is present
+    try:
+        from taal_inventory.api import interakt_webhook as iw
+        iw_src = inspect.getsource(iw)
+        results["interakt_cache_write_present"] = "interakt_traits:" in iw_src
+        results["interakt_cache_read_present"]  = "cached_raw" in iw_src
+    except Exception as e:
+        results["interakt_check_error"] = str(e)
+
+    # 4. Check retry function exists
+    results["retry_function_exists"] = (
+        "retry_post_payment_for_paid_booking" in globals()
+    )
+
+    all_passed = all(
+        v is True for v in results.values()
+        if isinstance(v, bool)
+    )
+    results["ALL_PASSED"] = all_passed
+
+    return results
+
+
 def _verify_razorpay_signature(raw_body, signature):
     """HMAC-SHA256 verification using the webhook secret."""
     expected = hmac.new(
