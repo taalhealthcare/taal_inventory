@@ -215,6 +215,10 @@ def _parse_time_slot(time_slot_str, preferred_date, fallback_duration_minutes=30
     if not time_slot_str:
         raise ValueError("Empty time slot")
 
+    # Normalize weird spaces: "05: 30 PM" → "05:30 PM", collapse multiple spaces
+    time_slot_str = re.sub(r":\s+", ":", time_slot_str)
+    time_slot_str = re.sub(r"\s+", " ", time_slot_str).strip()
+
     # Normalize date
     if isinstance(preferred_date, str):
         date_obj = datetime.strptime(preferred_date, "%Y-%m-%d").date()
