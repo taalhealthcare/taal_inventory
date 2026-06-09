@@ -229,6 +229,10 @@ def retry_post_payment_for_paid_booking(
 
     booking.reload()
 
+    # Resolve raw option_id time slot if still present (uses cache or static map)
+    _resolve_raw_time_slot_if_needed(booking)
+    booking.reload()
+
     # 2. Determine doctor details (booking already has assigned_team_member)
     doctor_details = None
     if booking.assigned_team_member:
@@ -403,6 +407,103 @@ def create_missing_payment_entry(booking_name=None):
 
 
 @frappe.whitelist()
+def harvest_time_slot_option_ids(limit=500):
+    """
+    Mine the Error Log for past 'INTERAKT DEBUG: Incoming Webhook' entries
+    that captured InteractiveFlowReply events, and extract the
+    option_id → consultation_time mappings.
+
+    Each InteractiveFlowReply payload contains BOTH the raw option_id
+    (in the form's `preferred_appointment_time_PBvTYp` field) AND the
+    resolved consultation_time (in customer.traits). This function
+    correlates them and prints a ready-to-paste KNOWN_TIME_SLOT_OPTION_IDS
+    dictionary block you can drop into razorpay_webhook.py.
+
+    Parameters:
+      limit — how many recent Error Log entries to scan (default 500)
+
+    Returns:
+      dict with 'discovered_count', 'already_known_count', 'new_mappings',
+      'ready_to_paste' (string).
+    """
+    import re as re_mod
+
+    # Pattern to find the option_id under the preferred_appointment_time field.
+    # Robust to varying escaping levels (\, \\, \\\) in the raw log payload.
+    opt_pattern = re_mod.compile(
+        r'preferred_appointment_time_PBvTYp[\\\":\s]+(option_[a-z0-9_]+)'
+    )
+    # Pattern for the resolved consultation_time in customer.traits
+    time_pattern = re_mod.compile(
+        r'"consultation_time"\s*:\s*"([^"]+)"'
+    )
+
+    logs = frappe.get_all(
+        "Error Log",
+        filters={"method": "INTERAKT DEBUG: Incoming Webhook"},
+        fields=["error"],
+        order_by="creation desc",
+        limit=int(limit),
+    )
+
+    # Collect all unique option_id → time_value pairs
+    discovered = {}
+
+    for log in logs:
+        err = log.get("error", "")
+        if "InteractiveFlowReply" not in err:
+            continue
+
+        opt_match = opt_pattern.search(err)
+        time_match = time_pattern.search(err)
+        if not opt_match or not time_match:
+            continue
+
+        option_id = opt_match.group(1)
+        time_value = time_match.group(1).strip()
+
+        if not time_value or time_value.startswith("option_"):
+            continue
+
+        # Normalize weird spaces: "05: 30 PM" → "05:30 PM"
+        time_value = re_mod.sub(r":\s+", ":", time_value)
+        time_value = re_mod.sub(r"\s+", " ", time_value).strip()
+
+        # Keep the first-seen value per option_id
+        if option_id not in discovered:
+            discovered[option_id] = time_value
+
+    # Separate into already-known vs new
+    already_known = {}
+    new_mappings = {}
+    for opt, val in discovered.items():
+        if opt in KNOWN_TIME_SLOT_OPTION_IDS:
+            already_known[opt] = val
+        else:
+            new_mappings[opt] = val
+
+    # Build the ready-to-paste dict block
+    all_combined = dict(KNOWN_TIME_SLOT_OPTION_IDS)
+    all_combined.update(new_mappings)
+
+    lines = ["KNOWN_TIME_SLOT_OPTION_IDS = {"]
+    # Sort by the option_id (which has a timestamp embedded — gives rough chronological order)
+    for opt in sorted(all_combined.keys()):
+        lines.append(f'    "{opt}": "{all_combined[opt]}",')
+    lines.append("}")
+    ready_to_paste = "\n".join(lines)
+
+    return {
+        "logs_scanned": len(logs),
+        "discovered_count": len(discovered),
+        "already_known_count": len(already_known),
+        "new_mappings_count": len(new_mappings),
+        "new_mappings": new_mappings,
+        "ready_to_paste": ready_to_paste,
+    }
+
+
+@frappe.whitelist()
 def health_check_deployment():
     """
     Whitelisted health check — verifies the deployed code has the expected
@@ -449,6 +550,64 @@ def health_check_deployment():
     return results
 
 
+@frappe.whitelist()
+def list_learned_time_slots():
+    """
+    Diagnostic — show all time slot option_id ↔ resolved label mappings
+    that the system has auto-learned from past bookings.
+
+    Combines:
+      • Static KNOWN_TIME_SLOT_OPTION_IDS (manually populated)
+      • Auto-learned mappings from frappe.cache() with 30-day TTL
+      • All option_ids ever seen in past Interakt Booking records
+
+    Use this to confirm coverage before a client demo.
+    """
+    result = {
+        "static_map": dict(KNOWN_TIME_SLOT_OPTION_IDS),
+        "auto_learned": {},
+        "all_option_ids_seen_in_bookings": [],
+    }
+
+    # 1. Look at every Interakt Booking ever created — find which option_ids
+    # have appeared and whether they've been resolved on subsequent bookings.
+    all_bookings = frappe.get_all(
+        "Interakt Booking",
+        fields=["name", "preferred_time_slot"],
+        limit=500,
+    )
+
+    seen_option_ids = set()
+    for b in all_bookings:
+        slot = b.get("preferred_time_slot") or ""
+        if slot.startswith("option_"):
+            seen_option_ids.add(slot)
+
+    result["all_option_ids_seen_in_bookings"] = sorted(seen_option_ids)
+
+    # 2. For each seen option_id, try to find its learned mapping
+    for option_id in sorted(seen_option_ids):
+        try:
+            learned = frappe.cache().get_value(f"time_slot_resolved:{option_id}")
+            if learned:
+                result["auto_learned"][option_id] = learned
+        except Exception:
+            pass
+
+    # 3. Also dump anything in static map that's not been seen yet (sanity check)
+    result["coverage_summary"] = {
+        "in_static_map":       len(result["static_map"]),
+        "auto_learned":        len(result["auto_learned"]),
+        "raw_in_bookings":     len(seen_option_ids),
+        "unresolved":          [
+            oid for oid in seen_option_ids
+            if oid not in result["static_map"] and oid not in result["auto_learned"]
+        ],
+    }
+
+    return result
+
+
 def _verify_razorpay_signature(raw_body, signature):
     """HMAC-SHA256 verification using the webhook secret."""
     expected = hmac.new(
@@ -457,6 +616,125 @@ def _verify_razorpay_signature(raw_body, signature):
         hashlib.sha256
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Time slot resolver — handles race condition between Interakt webhook events
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Static fallback map: option_id → human-readable time label.
+# Populate from Interakt flow editor as you discover them.
+# Used as LAST-RESORT fallback if both cache lookup and trait normalization fail.
+KNOWN_TIME_SLOT_OPTION_IDS = {
+    "option_1779967864173_lppvz7yvs": "12:30 PM - 01:00 PM",
+    "option_1779967866725_8g7jao7ie": "02:00 PM - 02:30 PM",
+    "option_1779967868993_mvtiazkdb": "03:30 PM - 04:00 PM",
+    "option_1779968083706_4z0zpowea": "05:30 PM - 06:00 PM",
+    # ADD MORE AS DISCOVERED — get them from Interakt flow editor
+}
+
+
+def _normalize_time_slot_label(time_str):
+    """
+    Normalize human-typed time slot strings to canonical format.
+    Fixes weird spaces like '05: 30 PM - 06:00 PM' → '05:30 PM - 06:00 PM'.
+    """
+    if not time_str:
+        return time_str
+    # Remove spaces immediately after a colon: "05: 30" → "05:30"
+    cleaned = re.sub(r":\s+", ":", time_str)
+    # Collapse multiple spaces to single space
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _resolve_raw_time_slot_if_needed(booking):
+    """
+    If a booking's preferred_time_slot is still a raw 'option_xxx' ID,
+    resolve it to a human-readable label using (in order):
+      1. frappe.cache() entry written by _handle_message_received
+      2. Static KNOWN_TIME_SLOT_OPTION_IDS fallback map
+      3. Leave unchanged + log warning
+
+    Mutates the booking object AND commits to DB. Safe to call even if the
+    slot is already resolved (no-op in that case).
+
+    This is the safety net for the race condition where two Interakt webhooks
+    arrive within milliseconds of each other and the workflow_response_update
+    handler reads cache BEFORE message_received writes to it.
+    """
+    current_slot = booking.preferred_time_slot or ""
+
+    # Already resolved — also normalize weird spaces while we're at it
+    if current_slot and not current_slot.startswith("option_"):
+        normalized = _normalize_time_slot_label(current_slot)
+        if normalized != current_slot:
+            frappe.db.set_value(
+                "Interakt Booking", booking.name,
+                "preferred_time_slot", normalized
+            )
+            frappe.db.commit()
+            booking.reload()
+        return  # Already resolved
+
+    if not current_slot.startswith("option_"):
+        return  # Empty or already fine
+
+    phone = booking.whatsapp_number or ""
+    resolved = None
+    source = None
+
+    # Method 1: frappe.cache() (populated by _handle_message_received, phone-keyed)
+    try:
+        cached_raw = frappe.cache().get_value(f"interakt_traits:{phone}")
+        if cached_raw:
+            cached = json.loads(cached_raw)
+            cached_time = (cached.get("consultation_time") or "").strip()
+            if cached_time and not cached_time.startswith("option_"):
+                resolved = _normalize_time_slot_label(cached_time)
+                source = "cache_by_phone"
+    except Exception:
+        pass
+
+    # Method 2: Learned mapping cache (option_id-keyed, 30-day TTL)
+    # Auto-populated by _handle_message_received every time a form is submitted.
+    # Survives long after the phone-keyed cache expires. Resolves any time slot
+    # that has been booked at least once in the last 30 days.
+    if not resolved:
+        try:
+            learned = frappe.cache().get_value(f"time_slot_resolved:{current_slot}")
+            if learned:
+                resolved = _normalize_time_slot_label(learned)
+                source = "auto_learned"
+        except Exception:
+            pass
+
+    # Method 3: Static fallback map (manually populated)
+    if not resolved and current_slot in KNOWN_TIME_SLOT_OPTION_IDS:
+        resolved = KNOWN_TIME_SLOT_OPTION_IDS[current_slot]
+        source = "static_map"
+
+    # Apply resolution
+    if resolved:
+        frappe.db.set_value(
+            "Interakt Booking", booking.name,
+            "preferred_time_slot", resolved
+        )
+        frappe.db.commit()
+        booking.reload()
+        frappe.log_error(
+            f"Resolved raw time slot: '{current_slot}' → '{resolved}' (via {source}) "
+            f"for booking {booking.name}, phone {phone}",
+            "Time Slot Resolved"
+        )
+    else:
+        frappe.log_error(
+            f"COULD NOT RESOLVE raw time slot '{current_slot}' for booking {booking.name}, "
+            f"phone {phone}. Cache empty, not in static map. "
+            f"ADD THIS TO KNOWN_TIME_SLOT_OPTION_IDS in razorpay_webhook.py: "
+            f'"{current_slot}": "HH:MM AM/PM - HH:MM AM/PM"',
+            "Time Slot Resolution FAILED — manual fix needed"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -528,6 +806,13 @@ def _handle_payment_success(event):
             return
 
         booking = frappe.get_doc("Interakt Booking", booking_name)
+
+        # ── 3a. RESOLVE raw option_id time slot from cache ─────────────
+        # By the time Razorpay's webhook fires (30+ seconds after booking
+        # creation), the message_received cache is GUARANTEED to be populated.
+        # This catches the race condition where _handle_workflow_completion
+        # stored a raw option_id because message_received hadn't cached yet.
+        _resolve_raw_time_slot_if_needed(booking)
 
         # ── 4. Update payment fields (CRITICAL — must succeed) ────────
         booking.razorpay_order_id   = rzp_order_id

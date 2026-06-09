@@ -117,10 +117,47 @@ def _handle_message_received(payload):
             frappe.cache().set_value(
                 f"interakt_traits:{phone}",
                 json.dumps(cache_payload),
-                expires_in_sec=300,  # 5 minutes
+                expires_in_sec=3600,  # 1 hour — generous window for slow payments
             )
         except Exception:
             pass  # Cache failure is non-fatal
+
+    # ── AUTO-LEARN: extract option_id ↔ resolved label pairing ──
+    # Every InteractiveFlowReply carries BOTH the raw option_id (in form data)
+    # AND the resolved label (in customer.traits). We persist this pairing
+    # keyed by option_id with 30-day TTL so subsequent bookings of the SAME
+    # time slot can resolve instantly, regardless of payment timing.
+    #
+    # After every time slot has been booked even once, the system is
+    # permanently bulletproof — no manual mapping table required.
+    if resolved_time and not resolved_time.startswith("option_"):
+        try:
+            inner_message_str = message.get("message", "")
+            if inner_message_str:
+                outer = json.loads(inner_message_str)
+                if outer.get("type") == "nfm_reply":
+                    nfm = outer.get("nfm_reply", {}) or {}
+                    response_json_str = nfm.get("response_json", "")
+                    if response_json_str:
+                        form_data = json.loads(response_json_str)
+                        # Look for the time slot field (key contains
+                        # 'preferred_appointment_time' regardless of suffix)
+                        for key, val in form_data.items():
+                            if (
+                                isinstance(key, str)
+                                and "preferred_appointment_time" in key.lower()
+                                and isinstance(val, str)
+                                and val.startswith("option_")
+                            ):
+                                # Found! Persist the mapping for 30 days
+                                frappe.cache().set_value(
+                                    f"time_slot_resolved:{val}",
+                                    resolved_time,
+                                    expires_in_sec=86400 * 30,  # 30 days
+                                )
+                                break
+        except Exception:
+            pass  # Learning failure is non-fatal
 
     # ── BACKFILL an existing booking, if one exists ──
     from frappe.utils import add_to_date
