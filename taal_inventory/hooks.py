@@ -36,4 +36,8 @@ doc_events = {
         "after_insert": "taal_inventory.events.pharmacy_item.after_insert",
         "on_update":    "taal_inventory.events.pharmacy_item.on_update",
     },
+    "Purchase Invoice": {
+        "on_submit": "taal_inventory.events.purchase_invoice.on_submit",
+        "on_cancel": "taal_inventory.events.purchase_invoice.on_cancel",
+    },
 }
