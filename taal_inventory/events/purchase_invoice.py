@@ -187,25 +187,24 @@ def on_cancel(doc, method):
     """
     Triggered when Purchase Invoice is cancelled.
 
-    Handles two distinct cases based on how the batch was created:
-
     CASE A — Finance-only batch (qty_received = 0):
         This PI only linked itself to a pre-existing opening-stock batch.
-        On cancel: unlink the PI from that batch (restore purchase_invoice
-        to blank). Do NOT quarantine or touch stock — this PI never owned
-        the batch or changed its stock.
+        On cancel: unlink the PI from that batch.
+        Do NOT quarantine or touch stock.
 
     CASE B — Real batch (qty_received > 0):
-        This PI actually created the batch and added to current_stock.
-        On cancel: quarantine the batch + reverse remaining_qty from
-        current_stock (floored at 0). Mirrors stock_receipt.on_cancel.
+        This PI created the batch and added to current_stock.
+        On cancel: quarantine the batch + reverse remaining_qty
+        from current_stock (floored at 0).
+        Mirrors stock_receipt.on_cancel exactly.
 
-    PURCHASE RETURNS: exits immediately without touching anything.
+    PURCHASE RETURNS: exits immediately.
     """
     if doc.is_return:
         return
 
-    # Fetch all batches that are linked to this PI
+    # Fetch all batches linked to this PI using only the purchase_invoice
+    # field — which is guaranteed to exist after Migrate runs.
     batches = frappe.get_all(
         "Pharmacy Batch",
         filters={"purchase_invoice": doc.name},
@@ -215,7 +214,7 @@ def on_cancel(doc, method):
     for b in batches:
 
         if (b.qty_received or 0) == 0:
-            # ── CASE A: Finance-only — just unlink ───────────────────────────
+            # CASE A: Finance-only — just unlink
             frappe.db.set_value(
                 "Pharmacy Batch",
                 b.name,
@@ -224,7 +223,7 @@ def on_cancel(doc, method):
             )
 
         else:
-            # ── CASE B: Real batch — quarantine + reverse stock ───────────────
+            # CASE B: Real batch — quarantine + reverse stock
             frappe.db.set_value(
                 "Pharmacy Batch",
                 b.name,
@@ -252,43 +251,53 @@ def _resolve_batch_situation(row, doc):
     Returns a tuple: (outcome_constant, existing_batch_doc_or_None)
 
     Logic:
-      - batch_id not in DB at all           → _BATCH_CREATE,    None
-      - batch_id exists, no SR, no PI       → _BATCH_FINANCE,   <batch doc>
-      - batch_id exists, has SR or PI       → frappe.throw()  (blocks submit)
+      - batch_id not in DB at all              → _BATCH_CREATE,  None
+      - batch_id exists, no SR, no PI          → _BATCH_FINANCE, <batch doc>
+      - batch_id exists, has SR or PI          → frappe.throw()
 
-    The frappe.throw() inside this function automatically rolls back
-    the entire submit transaction — no cleanup needed by the caller.
+    DEFENSIVE APPROACH:
+    We fetch fields in two stages:
+      Stage 1: fetch only "name" — guaranteed to exist on every DocType.
+      Stage 2: use frappe.get_doc() on the found record to access all fields
+               safely via Python attribute access (no raw SQL column list).
+    This avoids OperationalError: (1054, "Unknown column 'X' in 'SELECT'")
+    if a field exists in the DocType definition but Migrate hasn't run yet.
     """
     if not row.custom_batch_id:
-        # Shouldn't reach here — _validate_pharmacy_row catches this first.
-        # Guard for safety.
         return _BATCH_CREATE, None
 
-    existing = frappe.db.get_value(
+    # Stage 1: Does this batch_id exist at all?
+    existing_name = frappe.db.get_value(
         "Pharmacy Batch",
         {"batch_id": row.custom_batch_id},
-        ["name", "stock_receipt", "purchase_invoice", "qty_received",
-         "item", "status"],
-        as_dict=True
+        "name"
     )
 
-    if not existing:
+    if not existing_name:
         # Brand new batch ID — safe to create
         return _BATCH_CREATE, None
 
-    has_stock_receipt    = bool(existing.stock_receipt)
-    has_purchase_invoice = bool(existing.purchase_invoice)
+    # Stage 2: Load the full batch document safely
+    existing = frappe.get_doc("Pharmacy Batch", existing_name)
+
+    # getattr with defaults prevents AttributeError if a field doesn't exist
+    has_stock_receipt    = bool(getattr(existing, "stock_receipt", None))
+    has_purchase_invoice = bool(getattr(existing, "purchase_invoice", None))
 
     if not has_stock_receipt and not has_purchase_invoice:
         # No source document = opening stock import
         # This PI is the accounting document for that physical stock
-        return _BATCH_FINANCE, frappe.get_doc("Pharmacy Batch", existing.name)
+        return _BATCH_FINANCE, existing
 
     # Batch is already linked to a real prior transaction — block submit
-    if existing.stock_receipt:
-        source_label = f"Stock Receipt <b>{existing.stock_receipt}</b>"
+    if getattr(existing, "stock_receipt", None):
+        source_label = (
+            f"Stock Receipt <b>{existing.stock_receipt}</b>"
+        )
     else:
-        source_label = f"Purchase Invoice <b>{existing.purchase_invoice}</b>"
+        source_label = (
+            f"Purchase Invoice <b>{existing.purchase_invoice}</b>"
+        )
 
     frappe.throw(
         f"Row #{row.idx} ({row.item_name}): Batch ID "
@@ -302,8 +311,7 @@ def _validate_pharmacy_row(row, doc, batch_ids_in_invoice):
     """
     Validates one pharmacy row before any DB write.
     Throws frappe.ValidationError on the first failure.
-    All messages are prefixed with the row index and item name so the
-    user can identify the offending line instantly.
+    All messages are prefixed with row index and item name.
 
     Checks (in order):
       1. custom_batch_id is set
@@ -311,49 +319,49 @@ def _validate_pharmacy_row(row, doc, batch_ids_in_invoice):
       3. custom_mrp_price > 0
       4. custom_selling_price > 0
       5. rate (cost price) > 0
-      6. expiry_date is strictly after posting_date
-      7. manufacturing_date < expiry_date  (only if MFG date is provided)
-      8. batch_id not duplicated within THIS same invoice
+      6. expiry_date strictly after posting_date
+      7. manufacturing_date < expiry_date (only if MFG date provided)
+      8. batch_id not duplicated within this same invoice
     """
     idx  = row.idx
     name = row.item_name or row.item_code
 
-    # 1. Batch ID is required
+    # 1. Batch ID
     if not row.custom_batch_id:
         frappe.throw(
             f"Row #{idx} ({name}): "
             f"Batch ID is required for pharmacy items."
         )
 
-    # 2. Expiry Date is required
+    # 2. Expiry Date
     if not row.custom_expiry_date:
         frappe.throw(
             f"Row #{idx} ({name}): "
             f"Expiry Date is required for pharmacy items."
         )
 
-    # 3. MRP Price must be > 0
+    # 3. MRP Price
     if not row.custom_mrp_price or row.custom_mrp_price <= 0:
         frappe.throw(
             f"Row #{idx} ({name}): "
             f"MRP Price is required and must be greater than 0."
         )
 
-    # 4. Selling Price must be > 0
+    # 4. Selling Price
     if not row.custom_selling_price or row.custom_selling_price <= 0:
         frappe.throw(
             f"Row #{idx} ({name}): "
             f"Selling Price is required and must be greater than 0."
         )
 
-    # 5. Rate (cost price) must be > 0
+    # 5. Rate (cost price)
     if not row.rate or row.rate <= 0:
         frappe.throw(
             f"Row #{idx} ({name}): "
             f"Rate (cost price) must be greater than 0."
         )
 
-    # 6. Expiry Date must be strictly after Posting Date
+    # 6. Expiry must be strictly after posting date
     posting = getdate(doc.posting_date)
     expiry  = getdate(row.custom_expiry_date)
     if expiry <= posting:
@@ -373,7 +381,7 @@ def _validate_pharmacy_row(row, doc, batch_ids_in_invoice):
                 f"Expiry Date ({expiry})."
             )
 
-    # 8. Batch ID must be unique within this same invoice
+    # 8. No duplicate batch_id within this same invoice
     if row.custom_batch_id in batch_ids_in_invoice:
         frappe.throw(
             f"Row #{idx} ({name}): "
@@ -387,11 +395,9 @@ def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
     Create or update Item Price in the Standard Selling price list.
     VERBATIM copy of stock_receipt._sync_item_price for consistency.
 
-    Does NOT use the batch_no field on Item Price — that field links to
-    ERPNext's native Batch doctype which is separate from our Pharmacy Batch,
-    and using it causes errors. Instead, valid_upto stores the expiry date
-    for visibility. FEFO rate selection is handled by get_fifo_rate() in
-    sales_invoice.py, not by Item Price.
+    Does NOT use batch_no field — that links to ERPNext's native Batch
+    doctype, not our Pharmacy Batch. Uses valid_upto for expiry visibility.
+    FEFO rate selection is handled by get_fifo_rate() in sales_invoice.py.
     """
     try:
         existing = frappe.get_all(
