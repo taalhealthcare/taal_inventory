@@ -1,5 +1,14 @@
+"""
+taal_inventory/events/stock_receipt.py
+
+Handles Stock Receipt submit, cancel, and Stock Adjustment submit.
+  on_submit          : Creates Pharmacy Batches, updates stock, logs Stock IN.
+  on_cancel          : Quarantines batches, reverses stock, logs Reversal OUT.
+  on_adjustment_submit: Deducts stock via Stock Adjustment, logs Stock OUT.
+"""
+
 import frappe
-from frappe.utils import now_datetime
+from frappe.utils import now_datetime, flt
 
 
 def on_submit(doc, method):
@@ -7,19 +16,22 @@ def on_submit(doc, method):
     Triggered when Stock Receipt is submitted.
     Creates one Pharmacy Batch per line item.
     Updates current_stock on each Pharmacy Item.
-    Creates batch-specific Item Price with expiry date.
+    Syncs Item Price (Standard Selling).
     Calculates Stock Receipt totals.
+    Logs each batch creation as "Stock IN" in deduction_log.
     """
+    from taal_inventory.utils.stock_log import append_stock_log
+
     total_amount = 0
     total_tax    = 0
 
     for row in doc.items:
         pi = frappe.get_doc("Pharmacy Item", row.item)
 
-        profit     = (row.selling_price or 0) - (row.cost_price or 0)
-        line_total = (row.qty_received or 0) * (row.cost_price or 0)
-        gst_pct    = row.gst_pct or 0
-        pur_tax    = row.purchase_tax_pct or 0
+        profit     = flt(row.selling_price or 0) - flt(row.cost_price or 0)
+        line_total = flt(row.qty_received or 0) * flt(row.cost_price or 0)
+        gst_pct    = flt(row.gst_pct or 0)
+        pur_tax    = flt(row.purchase_tax_pct or 0)
         tax_amount = line_total * ((gst_pct + pur_tax) / 100)
 
         total_amount += line_total
@@ -33,19 +45,19 @@ def on_submit(doc, method):
             "batch_id":              row.batch_id,
             "manufacturing_date":    row.manufacturing_date,
             "expiry_date":           row.expiry_date,
-            "mrp_price":             row.mrp_price or 0,
-            "selling_price":         row.selling_price or 0,
-            "cost_price":            row.cost_price or 0,
+            "mrp_price":             flt(row.mrp_price or 0),
+            "selling_price":         flt(row.selling_price or 0),
+            "cost_price":            flt(row.cost_price or 0),
             "profit_per_uom":        profit,
             "gst_pct":               gst_pct,
             "purchase_tax_pct":      pur_tax,
-            "supplier_discount_pct": row.discount_pct or 0,
+            "supplier_discount_pct": flt(row.discount_pct or 0),
             "hsn_sac_code":          pi.hsn_sac_code or "",
             "manufacturer_name":     pi.manufacturer_name or "",
             "supplier_name":         doc.supplier,
             "supplier_invoice_no":   doc.supplier_invoice_no,
-            "qty_received":          row.qty_received,
-            "remaining_qty":         row.qty_received,
+            "qty_received":          flt(row.qty_received),
+            "remaining_qty":         flt(row.qty_received),
             "warehouse":             doc.warehouse,
             "stock_receipt":         doc.name,
             "status":                "Active",
@@ -65,22 +77,38 @@ def on_submit(doc, method):
         # Update current_stock on Pharmacy Item
         item_doc = frappe.get_doc("Pharmacy Item", row.item)
         item_doc.current_stock = (
-            item_doc.current_stock or 0
-        ) + row.qty_received
+            flt(item_doc.current_stock or 0)
+        ) + flt(row.qty_received)
         item_doc.save(ignore_permissions=True)
 
-        # Sync Item Price with batch name and expiry date
-        if row.selling_price and row.selling_price > 0:
+        # Sync Item Price (Standard Selling)
+        if row.selling_price and flt(row.selling_price) > 0:
             actual_item_code = frappe.db.get_value(
                 "Pharmacy Item", row.item, "item_code"
             )
             if actual_item_code:
                 _sync_item_price(
                     item_code=actual_item_code,
-                    selling_price=row.selling_price,
+                    selling_price=flt(row.selling_price),
                     batch_name=batch.name,
                     expiry_date=row.expiry_date
                 )
+
+        # Log Stock IN event to deduction_log
+        append_stock_log(
+            pharmacy_item_name=row.item,
+            event_type="Stock IN",
+            reference_doctype="Stock Receipt",
+            reference_no=doc.name,
+            batch_id=batch.name,
+            qty=flt(row.qty_received),
+            balance_after=flt(item_doc.current_stock),
+            cost_price=flt(row.cost_price or 0),
+            selling_price=flt(row.selling_price or 0),
+            mrp_price=flt(row.mrp_price or 0),
+            warehouse=doc.warehouse or "",
+            remarks=f"Batch {row.batch_id} created via SR {doc.name}"
+        )
 
     # Update Stock Receipt totals
     grand_total = total_amount + total_tax
@@ -100,8 +128,11 @@ def on_submit(doc, method):
 
 def on_cancel(doc, method):
     """
-    Quarantines batches and reverses current_stock.
+    Triggered when Stock Receipt is cancelled.
+    Quarantines batches, reverses current_stock, logs Reversal OUT.
     """
+    from taal_inventory.utils.stock_log import append_stock_log
+
     for row in doc.items:
         batches = frappe.get_all(
             "Pharmacy Batch",
@@ -109,20 +140,47 @@ def on_cancel(doc, method):
                 "stock_receipt": doc.name,
                 "item":          row.item
             },
-            fields=["name", "remaining_qty"]
+            fields=[
+                "name", "remaining_qty",
+                "cost_price", "selling_price",
+                "mrp_price", "warehouse"
+            ]
         )
+
         for b in batches:
+            remaining = flt(b.remaining_qty or 0)
+
+            # Quarantine the batch
             frappe.db.set_value(
                 "Pharmacy Batch", b.name,
                 "status", "Quarantined"
             )
+
+            # Reduce current_stock by remaining (un-sold) qty, floor at 0
             item_doc = frappe.get_doc("Pharmacy Item", row.item)
             item_doc.current_stock = max(
                 0,
-                (item_doc.current_stock or 0) - b.remaining_qty
+                flt(item_doc.current_stock or 0) - remaining
             )
             item_doc.save(ignore_permissions=True)
 
+            # Log Reversal OUT event to deduction_log
+            append_stock_log(
+                pharmacy_item_name=row.item,
+                event_type="Reversal OUT",
+                reference_doctype="Stock Receipt",
+                reference_no=doc.name,
+                batch_id=b.name,
+                qty=remaining,
+                balance_after=flt(item_doc.current_stock),
+                cost_price=flt(b.cost_price or 0),
+                selling_price=flt(b.selling_price or 0),
+                mrp_price=flt(b.mrp_price or 0),
+                warehouse=b.warehouse or "",
+                remarks=f"Cancelled SR {doc.name} — batch quarantined"
+            )
+
+    # Zero out Stock Receipt totals
     frappe.db.set_value("Stock Receipt", doc.name, {
         "total_amount": 0,
         "total_tax":    0,
@@ -134,6 +192,8 @@ def on_cancel(doc, method):
 def on_adjustment_submit(doc, method):
     """
     Handles Stock Adjustment submit.
+    Deducts stock via FIFO batch selection.
+    Logs Stock OUT event to deduction_log.
     """
     from taal_inventory.utils.fifo import (
         _recalculate_current_stock,
@@ -142,8 +202,8 @@ def on_adjustment_submit(doc, method):
 
     for row in doc.items:
         batch          = frappe.get_doc("Pharmacy Batch", row.batch_id)
-        balance_before = batch.remaining_qty
-        new_qty        = max(0, balance_before - row.qty)
+        balance_before = flt(batch.remaining_qty)
+        new_qty        = max(0, balance_before - flt(row.qty))
 
         frappe.db.set_value("Pharmacy Batch", batch.name, {
             "remaining_qty": new_qty,
@@ -162,7 +222,7 @@ def on_adjustment_submit(doc, method):
         _log_deduction(
             item_code=row.item,
             batch_id=row.batch_id,
-            qty_deducted=row.qty,
+            qty_deducted=flt(row.qty),
             reference_doctype="Stock Adjustment",
             reference_no=doc.name,
             patient_name="",
@@ -173,18 +233,12 @@ def on_adjustment_submit(doc, method):
     frappe.db.commit()
 
 
-def _sync_item_price(item_code, selling_price,
-                     batch_name, expiry_date):
+def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
     """
     Create or update Item Price in Standard Selling price list.
-    Does NOT use batch_no field (that links to native Batch doctype
-    which is different from our Pharmacy Batch — causes errors).
-    Uses valid_upto to store expiry date for visibility.
-    FEFO rate selection is handled by get_fifo_rate() in
-    sales_invoice.py — not by Item Price batch_no.
+    Verbatim copy from stock_receipt — see purchase_invoice.py for notes.
     """
     try:
-        # Check if Item Price already exists for this item
         existing = frappe.get_all(
             "Item Price",
             filters={
@@ -198,8 +252,6 @@ def _sync_item_price(item_code, selling_price,
         )
 
         if existing:
-            # Update existing Item Price with
-            # latest selling price and expiry date
             frappe.db.set_value(
                 "Item Price",
                 existing[0].name, {
@@ -208,7 +260,6 @@ def _sync_item_price(item_code, selling_price,
                 }
             )
         else:
-            # Create new Item Price
             ip = frappe.get_doc({
                 "doctype":         "Item Price",
                 "item_code":       item_code,

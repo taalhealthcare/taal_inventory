@@ -1,5 +1,13 @@
+"""
+taal_inventory/events/sales_invoice.py
+
+Handles Sales Invoice submit and cancel for pharmacy stock.
+  on_submit : FEFO deduction — nearest expiry batch consumed first.
+  on_cancel : Reverses FEFO deduction, restores stock, logs reversal.
+"""
+
 import frappe
-from frappe.utils import today, now_datetime
+from frappe.utils import today, now_datetime, flt
 
 
 @frappe.whitelist()
@@ -11,7 +19,6 @@ def get_fifo_rate(item_code):
     Returns that batch's selling price, remaining qty,
     and expiry date so the correct rate shows upfront.
     """
-    # Look up Pharmacy Item by item_code field
     pharmacy_items = frappe.get_all(
         "Pharmacy Item",
         filters={"item_code": item_code},
@@ -30,7 +37,6 @@ def get_fifo_rate(item_code):
 
     pi_name = pharmacy_items[0].name
 
-    # Fetch batch with nearest expiry date first (FEFO)
     batches = frappe.get_all(
         "Pharmacy Batch",
         filters={
@@ -72,7 +78,6 @@ def get_total_available_qty(item_code):
     """
     Returns total available qty across all active
     non-expired batches for this item.
-    Used to validate qty on Sales Invoice.
     """
     pharmacy_items = frappe.get_all(
         "Pharmacy Item",
@@ -103,6 +108,7 @@ def on_submit(doc, method):
     """
     Triggered when Sales Invoice is submitted.
     FEFO deduction — nearest expiry batch consumed first.
+    Logs each deduction to Pharmacy Item's deduction_log.
     """
     for row in doc.items:
         pharmacy_items = frappe.get_all(
@@ -126,7 +132,16 @@ def on_submit(doc, method):
 
 def on_cancel(doc, method):
     """
-    Reverses FEFO stock deduction on cancel.
+    Reverses FEFO stock deduction when Sales Invoice is cancelled.
+
+    For each Deduction Log entry linked to this SI:
+      1. Restore remaining_qty on the Pharmacy Batch
+      2. Set batch status back to Active
+      3. Recalculate current_stock on Pharmacy Item
+      4. Append a "Reversal IN" row to deduction_log
+
+    FIX: flt() wrapping on qty_deducted — frappe.get_all returns
+    child table Float fields as strings, causing TypeError on arithmetic.
     """
     for row in doc.items:
         pharmacy_items = frappe.get_all(
@@ -141,6 +156,7 @@ def on_cancel(doc, method):
 
         pi_name = pharmacy_items[0].name
 
+        # Fetch all deduction log entries for this SI on this item
         logs = frappe.get_all(
             "Deduction Log",
             filters={
@@ -148,24 +164,71 @@ def on_cancel(doc, method):
                 "reference_doctype": "Sales Invoice",
                 "parent":            pi_name
             },
-            fields=["batch_id", "qty_deducted"]
+            fields=[
+                "batch_id", "qty_deducted",
+                "cost_price", "selling_price",
+                "mrp_price", "warehouse"
+            ]
         )
 
         for log in logs:
-            current = frappe.db.get_value(
-                "Pharmacy Batch",
-                log.batch_id,
-                "remaining_qty"
-            ) or 0
+            # flt() converts string → float safely (fixes the TypeError crash)
+            qty_to_restore = flt(log.qty_deducted)
+
+            current = flt(
+                frappe.db.get_value(
+                    "Pharmacy Batch",
+                    log.batch_id,
+                    "remaining_qty"
+                ) or 0
+            )
+
+            # Restore the batch qty and set it back to Active
             frappe.db.set_value(
                 "Pharmacy Batch",
-                log.batch_id, {
-                    "remaining_qty": current + log.qty_deducted,
+                log.batch_id,
+                {
+                    "remaining_qty": current + qty_to_restore,
                     "status":        "Active"
                 }
             )
 
-        _recalculate_stock(pi_name)
+        # Recalculate current_stock from live batch totals
+        new_stock = _recalculate_stock(pi_name)
+
+        # Log each reversal row in deduction_log
+        from taal_inventory.utils.stock_log import append_stock_log
+
+        # Get patient name safely
+        patient = doc.patient_name or doc.customer_name or ""
+
+        for log in logs:
+            qty_to_restore = flt(log.qty_deducted)
+
+            # Fetch batch pricing at time of cancel for the log record
+            batch_data = frappe.db.get_value(
+                "Pharmacy Batch",
+                log.batch_id,
+                ["cost_price", "selling_price", "mrp_price", "warehouse"],
+                as_dict=True
+            ) or {}
+
+            append_stock_log(
+                pharmacy_item_name=pi_name,
+                event_type="Reversal IN",
+                reference_doctype="Sales Invoice",
+                reference_no=doc.name,
+                batch_id=log.batch_id,
+                qty=qty_to_restore,
+                balance_after=new_stock,
+                cost_price=batch_data.get("cost_price", 0),
+                selling_price=batch_data.get("selling_price", 0),
+                mrp_price=batch_data.get("mrp_price", 0),
+                warehouse=batch_data.get("warehouse", ""),
+                patient_name=patient,
+                remarks=f"Cancelled SI {doc.name} — stock restored"
+            )
+
         frappe.db.commit()
 
 
@@ -174,9 +237,11 @@ def _deduct_fefo(doc, row, pi_name):
     FEFO deduction engine.
     Nearest expiry batch consumed first.
     If qty spans multiple batches — deducts across them in order.
+    Logs each batch consumed to deduction_log with full pricing details.
     """
-    # Fetch all active non-expired batches
-    # ordered by nearest expiry first (FEFO)
+    from taal_inventory.utils.stock_log import append_stock_log
+
+    # Fetch all active non-expired batches ordered by nearest expiry (FEFO)
     batches = frappe.get_all(
         "Pharmacy Batch",
         filters={
@@ -188,7 +253,8 @@ def _deduct_fefo(doc, row, pi_name):
         fields=[
             "name", "batch_id",
             "remaining_qty", "expiry_date",
-            "selling_price"
+            "selling_price", "cost_price",
+            "mrp_price", "warehouse"
         ],
         order_by="expiry_date ASC",
         limit_page_length=0
@@ -200,7 +266,7 @@ def _deduct_fefo(doc, row, pi_name):
             f"All batches are expired or exhausted."
         )
 
-    total_available = sum(b.remaining_qty for b in batches)
+    total_available = sum(flt(b.remaining_qty) for b in batches)
     if total_available < row.qty:
         frappe.throw(
             f"Insufficient stock for {row.item_code}. "
@@ -209,15 +275,15 @@ def _deduct_fefo(doc, row, pi_name):
             f"Please reduce quantity."
         )
 
-    remaining = row.qty
+    remaining = flt(row.qty)
     consumed  = []
 
     # Deduct from nearest expiry batch first
     for batch in batches:
         if remaining <= 0:
             break
-        deduct  = min(batch.remaining_qty, remaining)
-        new_qty = batch.remaining_qty - deduct
+        deduct  = min(flt(batch.remaining_qty), remaining)
+        new_qty = flt(batch.remaining_qty) - deduct
 
         frappe.db.set_value("Pharmacy Batch", batch.name, {
             "remaining_qty": new_qty,
@@ -225,38 +291,40 @@ def _deduct_fefo(doc, row, pi_name):
         })
 
         consumed.append({
-            "batch":         batch.name,
+            "batch_name":    batch.name,
             "batch_id":      batch.batch_id,
             "qty":           deduct,
-            "selling_price": batch.selling_price or 0,
+            "selling_price": flt(batch.selling_price),
+            "cost_price":    flt(batch.cost_price),
+            "mrp_price":     flt(batch.mrp_price),
+            "warehouse":     batch.warehouse or "",
             "expiry_date":   str(batch.expiry_date)
         })
         remaining -= deduct
 
-    # Recalculate current stock
+    # Recalculate current stock from live batch totals
     new_stock = _recalculate_stock(pi_name)
 
-    # Get patient name safely
-    patient = ""
-    if doc.patient_name:
-        patient = doc.patient_name
-    elif doc.customer_name:
-        patient = doc.customer_name
+    # Get patient / customer name safely
+    patient = doc.patient_name or doc.customer_name or ""
 
-    # Log each batch consumed in Deduction Log
+    # Log each batch consumed — one deduction_log row per batch
     for entry in consumed:
-        pi_doc = frappe.get_doc("Pharmacy Item", pi_name)
-        pi_doc.append("deduction_log", {
-            "deduction_datetime": now_datetime(),
-            "reference_doctype":  "Sales Invoice",
-            "reference_no":       doc.name,
-            "patient_name":       patient,
-            "batch_id":           entry["batch"],
-            "qty_deducted":       entry["qty"],
-            "balance_after":      new_stock,
-            "deducted_by":        frappe.session.user
-        })
-        pi_doc.save(ignore_permissions=True)
+        append_stock_log(
+            pharmacy_item_name=pi_name,
+            event_type="Stock OUT",
+            reference_doctype="Sales Invoice",
+            reference_no=doc.name,
+            batch_id=entry["batch_name"],
+            qty=entry["qty"],
+            balance_after=new_stock,
+            cost_price=entry["cost_price"],
+            selling_price=entry["selling_price"],
+            mrp_price=entry["mrp_price"],
+            warehouse=entry["warehouse"],
+            patient_name=patient,
+            remarks=""
+        )
 
     frappe.db.commit()
 
@@ -265,7 +333,7 @@ def _deduct_fefo(doc, row, pi_name):
 
 
 def _recalculate_stock(pi_name):
-    """Recalculate current_stock from all active batches."""
+    """Recalculate current_stock from sum of all active batch remaining_qty."""
     result = frappe.db.sql("""
         SELECT COALESCE(SUM(remaining_qty), 0) as total
         FROM `tabPharmacy Batch`
