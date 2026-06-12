@@ -11,17 +11,17 @@ THREE scenarios on submit per pharmacy row:
 
   SCENARIO 2 — OPENING STOCK BATCH
     (batch exists, no SR, no PI linked — imported as opening balance)
-    PI is finance-only: links PI to batch for traceability.
+    PI is finance-only: links PI to batch, logs "Stock IN" (finance-only).
     Does NOT create duplicate batch or change stock.
-    Logs "Stock IN" with remarks "Finance-only — opening stock".
 
   SCENARIO 3 — REAL TRANSACTION DUPLICATE
     (batch exists AND linked to another SR or PI)
     Blocks submit with clear error.
 
-NON-PHARMACY LINES: skipped silently.
-PURCHASE RETURNS: entire handler exits immediately.
-WAREHOUSE FALLBACK: row.warehouse → doc.set_warehouse → Finished Goods - TM
+FIXES IN THIS VERSION:
+  1. Stock log uses append_stock_log (append+save pattern)
+  2. flt() on all numeric reads
+  3. "purchsase_tax_pct" (typo) used to match Pharmacy Batch DB column
 """
 
 import frappe
@@ -51,7 +51,7 @@ def on_submit(doc, method):
 
     for row in doc.items:
 
-        # ── Is this a pharmacy item? ──────────────────────────────────────────
+        # Is this a pharmacy item?
         pharmacy_item_name = frappe.db.get_value(
             "Pharmacy Item",
             {"item_code": row.item_code},
@@ -60,10 +60,10 @@ def on_submit(doc, method):
         if not pharmacy_item_name:
             continue   # Non-pharmacy line — skip silently
 
-        # ── Validate required fields and date logic ───────────────────────────
+        # Validate required fields and date logic
         _validate_pharmacy_row(row, doc, batch_ids_in_invoice)
 
-        # ── Resolve batch situation ───────────────────────────────────────────
+        # Resolve batch situation
         outcome, existing_batch_doc = _resolve_batch_situation(row, doc)
 
         if outcome == _BATCH_DUPLICATE:
@@ -71,7 +71,6 @@ def on_submit(doc, method):
 
         # ── SCENARIO 2: Finance-only (opening stock batch) ────────────────────
         if outcome == _BATCH_FINANCE:
-            # Link this PI to the existing batch for traceability
             frappe.db.set_value(
                 "Pharmacy Batch",
                 existing_batch_doc.name,
@@ -83,13 +82,13 @@ def on_submit(doc, method):
             finance_only_rows += 1
             batch_ids_in_invoice.add(row.custom_batch_id)
 
-            # Log as Stock IN (finance-only) — no stock quantity changes
-            # but we record the accounting event for audit trail
+            # Current stock unchanged — log the accounting event only
             current_stock = flt(
                 frappe.db.get_value(
                     "Pharmacy Item", pharmacy_item_name, "current_stock"
                 ) or 0
             )
+
             append_stock_log(
                 pharmacy_item_name=pharmacy_item_name,
                 event_type="Stock IN",
@@ -135,7 +134,9 @@ def on_submit(doc, method):
             or DEFAULT_WAREHOUSE
         )
 
-        # Create Pharmacy Batch
+        # NOTE: "purchsase_tax_pct" is the ACTUAL DB fieldname on Pharmacy
+        # Batch (typo in original DocType — extra 's'). Do not change until
+        # a proper DocType rename + Migrate is done.
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  pharmacy_item_name,
@@ -148,7 +149,7 @@ def on_submit(doc, method):
             "cost_price":            cost_price,
             "profit_per_uom":        profit,
             "gst_pct":               gst_pct,
-            "purchase_tax_pct":      gst_pct,
+            "purchsase_tax_pct":     gst_pct,
             "supplier_discount_pct": flt(row.discount_percentage or 0),
             "hsn_sac_code":          row.gst_hsn_code or pi.hsn_sac_code or "",
             "manufacturer_name":     pi.manufacturer_name or "",
@@ -172,7 +173,7 @@ def on_submit(doc, method):
         ) + flt(row.qty)
         item_doc.save(ignore_permissions=True)
 
-        # Sync Item Price (Standard Selling)
+        # Sync Item Price
         if selling_price > 0:
             _sync_item_price(
                 item_code=row.item_code,
@@ -181,7 +182,7 @@ def on_submit(doc, method):
                 expiry_date=row.custom_expiry_date
             )
 
-        # Log Stock IN event
+        # Log Stock IN
         append_stock_log(
             pharmacy_item_name=pharmacy_item_name,
             event_type="Stock IN",
@@ -202,7 +203,6 @@ def on_submit(doc, method):
 
     frappe.db.commit()
 
-    # Final summary alert
     parts = []
     if batches_created:
         parts.append(
@@ -224,12 +224,12 @@ def on_cancel(doc, method):
     """
     Triggered when Purchase Invoice is cancelled.
 
-    CASE A — Finance-only batch (qty_received = 0):
-        Unlinks PI from batch. Stock unchanged. Logs reversal note.
+    CASE A — Finance-only (qty_received = 0):
+        Unlinks PI from batch. Logs Reversal OUT with qty=0.
 
     CASE B — Real batch (qty_received > 0):
-        Quarantines batch, reverses remaining_qty from current_stock,
-        logs "Reversal OUT".
+        Quarantines batch, reverses remaining_qty from current_stock.
+        Logs Reversal OUT with actual qty.
     """
     from taal_inventory.utils.stock_log import append_stock_log
 
@@ -251,22 +251,18 @@ def on_cancel(doc, method):
         remaining    = flt(b.remaining_qty or 0)
 
         if qty_received == 0:
-            # CASE A: Finance-only — just unlink
+            # CASE A: Finance-only — unlink only
             frappe.db.set_value(
-                "Pharmacy Batch",
-                b.name,
-                "purchase_invoice",
-                None
+                "Pharmacy Batch", b.name,
+                "purchase_invoice", None
             )
 
-            # Get current stock for log
             current_stock = flt(
                 frappe.db.get_value(
                     "Pharmacy Item", b.item, "current_stock"
                 ) or 0
             )
 
-            # Log the unlink event for audit trail
             append_stock_log(
                 pharmacy_item_name=b.item,
                 event_type="Reversal OUT",
@@ -288,10 +284,8 @@ def on_cancel(doc, method):
         else:
             # CASE B: Real batch — quarantine + reverse stock
             frappe.db.set_value(
-                "Pharmacy Batch",
-                b.name,
-                "status",
-                "Quarantined"
+                "Pharmacy Batch", b.name,
+                "status", "Quarantined"
             )
 
             item_doc = frappe.get_doc("Pharmacy Item", b.item)
@@ -301,7 +295,6 @@ def on_cancel(doc, method):
             )
             item_doc.save(ignore_permissions=True)
 
-            # Log Reversal OUT event
             append_stock_log(
                 pharmacy_item_name=b.item,
                 event_type="Reversal OUT",
@@ -330,12 +323,7 @@ def on_cancel(doc, method):
 def _resolve_batch_situation(row, doc):
     """
     Determines what to do with the batch_id on this row.
-    Returns (outcome_constant, existing_batch_doc_or_None).
-
-    Defensive two-stage fetch:
-      Stage 1: fetch only "name" (always exists).
-      Stage 2: frappe.get_doc() for full field access without raw column list.
-    This avoids OperationalError: Unknown column if Migrate hasn't run.
+    Defensive two-stage fetch — avoids Unknown column SQL errors.
     """
     if not row.custom_batch_id:
         return _BATCH_CREATE, None
@@ -371,39 +359,26 @@ def _resolve_batch_situation(row, doc):
 
 
 def _validate_pharmacy_row(row, doc, batch_ids_in_invoice):
-    """
-    Validates one pharmacy row before any DB write.
-    Throws on first failure — rolls back the entire submit.
-    """
+    """Validates one pharmacy row. Throws on first failure."""
     idx  = row.idx
     name = row.item_name or row.item_code
 
     if not row.custom_batch_id:
-        frappe.throw(
-            f"Row #{idx} ({name}): Batch ID is required for pharmacy items."
-        )
+        frappe.throw(f"Row #{idx} ({name}): Batch ID is required.")
     if not row.custom_expiry_date:
-        frappe.throw(
-            f"Row #{idx} ({name}): Expiry Date is required for pharmacy items."
-        )
+        frappe.throw(f"Row #{idx} ({name}): Expiry Date is required.")
     if not row.custom_mrp_price or flt(row.custom_mrp_price) <= 0:
-        frappe.throw(
-            f"Row #{idx} ({name}): MRP Price is required and must be > 0."
-        )
+        frappe.throw(f"Row #{idx} ({name}): MRP Price must be > 0.")
     if not row.custom_selling_price or flt(row.custom_selling_price) <= 0:
-        frappe.throw(
-            f"Row #{idx} ({name}): Selling Price is required and must be > 0."
-        )
+        frappe.throw(f"Row #{idx} ({name}): Selling Price must be > 0.")
     if not row.rate or flt(row.rate) <= 0:
-        frappe.throw(
-            f"Row #{idx} ({name}): Rate (cost price) must be > 0."
-        )
+        frappe.throw(f"Row #{idx} ({name}): Rate (cost price) must be > 0.")
 
     posting = getdate(doc.posting_date)
     expiry  = getdate(row.custom_expiry_date)
     if expiry <= posting:
         frappe.throw(
-            f"Row #{idx} ({name}): Expiry Date ({expiry}) must be "
+            f"Row #{idx} ({name}): Expiry ({expiry}) must be "
             f"after Posting Date ({posting})."
         )
 
@@ -411,8 +386,8 @@ def _validate_pharmacy_row(row, doc, batch_ids_in_invoice):
         mfg = getdate(row.custom_manufacturing_date)
         if mfg >= expiry:
             frappe.throw(
-                f"Row #{idx} ({name}): Manufacturing Date ({mfg}) "
-                f"must be before Expiry Date ({expiry})."
+                f"Row #{idx} ({name}): MFG date ({mfg}) must be "
+                f"before Expiry ({expiry})."
             )
 
     if row.custom_batch_id in batch_ids_in_invoice:
@@ -423,10 +398,7 @@ def _validate_pharmacy_row(row, doc, batch_ids_in_invoice):
 
 
 def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
-    """
-    Create or update Item Price in Standard Selling price list.
-    Verbatim copy of stock_receipt._sync_item_price for consistency.
-    """
+    """Create or update Item Price in Standard Selling price list."""
     try:
         existing = frappe.get_all(
             "Item Price",
@@ -442,8 +414,7 @@ def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
 
         if existing:
             frappe.db.set_value(
-                "Item Price",
-                existing[0].name,
+                "Item Price", existing[0].name,
                 {
                     "price_list_rate": selling_price,
                     "valid_upto":      expiry_date
@@ -464,11 +435,6 @@ def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
             ip.insert()
 
         frappe.db.commit()
-
-        frappe.logger().info(
-            f"Item Price synced: {item_code} "
-            f"rate {selling_price} expiry {expiry_date}"
-        )
 
     except Exception as e:
         frappe.log_error(

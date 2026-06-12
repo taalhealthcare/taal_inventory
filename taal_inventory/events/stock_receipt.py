@@ -2,9 +2,13 @@
 taal_inventory/events/stock_receipt.py
 
 Handles Stock Receipt submit, cancel, and Stock Adjustment submit.
-  on_submit          : Creates Pharmacy Batches, updates stock, logs Stock IN.
-  on_cancel          : Quarantines batches, reverses stock, logs Reversal OUT.
-  on_adjustment_submit: Deducts stock via Stock Adjustment, logs Stock OUT.
+
+FIXES IN THIS VERSION:
+  1. Stock log uses append_stock_log (append+save pattern, not db.insert)
+  2. flt() on all numeric reads
+  3. purchase_tax_pct written as "purchsase_tax_pct" to match DB typo on
+     Pharmacy Batch DocType (fieldname has extra 's' — do NOT fix without
+     running Migrate, as the DB column name must match exactly)
 """
 
 import frappe
@@ -38,6 +42,8 @@ def on_submit(doc, method):
         total_tax    += tax_amount
 
         # Create Pharmacy Batch
+        # NOTE: "purchsase_tax_pct" (with extra 's') is the ACTUAL fieldname
+        # on Pharmacy Batch DocType — must match DB column exactly
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  row.item,
@@ -50,7 +56,7 @@ def on_submit(doc, method):
             "cost_price":            flt(row.cost_price or 0),
             "profit_per_uom":        profit,
             "gst_pct":               gst_pct,
-            "purchase_tax_pct":      pur_tax,
+            "purchsase_tax_pct":     pur_tax,
             "supplier_discount_pct": flt(row.discount_pct or 0),
             "hsn_sac_code":          pi.hsn_sac_code or "",
             "manufacturer_name":     pi.manufacturer_name or "",
@@ -94,7 +100,7 @@ def on_submit(doc, method):
                     expiry_date=row.expiry_date
                 )
 
-        # Log Stock IN event to deduction_log
+        # Log Stock IN to deduction_log
         append_stock_log(
             pharmacy_item_name=row.item,
             event_type="Stock IN",
@@ -129,7 +135,8 @@ def on_submit(doc, method):
 def on_cancel(doc, method):
     """
     Triggered when Stock Receipt is cancelled.
-    Quarantines batches, reverses current_stock, logs Reversal OUT.
+    Quarantines batches, reverses current_stock.
+    Logs "Reversal OUT" per batch quarantined.
     """
     from taal_inventory.utils.stock_log import append_stock_log
 
@@ -156,7 +163,7 @@ def on_cancel(doc, method):
                 "status", "Quarantined"
             )
 
-            # Reduce current_stock by remaining (un-sold) qty, floor at 0
+            # Reduce current_stock by remaining qty, floor at 0
             item_doc = frappe.get_doc("Pharmacy Item", row.item)
             item_doc.current_stock = max(
                 0,
@@ -164,7 +171,7 @@ def on_cancel(doc, method):
             )
             item_doc.save(ignore_permissions=True)
 
-            # Log Reversal OUT event to deduction_log
+            # Log Reversal OUT
             append_stock_log(
                 pharmacy_item_name=row.item,
                 event_type="Reversal OUT",
@@ -192,8 +199,8 @@ def on_cancel(doc, method):
 def on_adjustment_submit(doc, method):
     """
     Handles Stock Adjustment submit.
-    Deducts stock via FIFO batch selection.
-    Logs Stock OUT event to deduction_log.
+    Deducts stock per adjustment rows.
+    Logs "Stock OUT" per adjustment.
     """
     from taal_inventory.utils.fifo import (
         _recalculate_current_stock,
@@ -234,10 +241,7 @@ def on_adjustment_submit(doc, method):
 
 
 def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
-    """
-    Create or update Item Price in Standard Selling price list.
-    Verbatim copy from stock_receipt — see purchase_invoice.py for notes.
-    """
+    """Create or update Item Price in Standard Selling price list."""
     try:
         existing = frappe.get_all(
             "Item Price",
