@@ -40,4 +40,8 @@ doc_events = {
         "on_submit": "taal_inventory.events.purchase_invoice.on_submit",
         "on_cancel": "taal_inventory.events.purchase_invoice.on_cancel",
     },
+    "Pharmacy Stock Transfer": {
+        "on_submit": "taal_inventory.events.pharmacy_stock_transfer.on_submit",
+        "on_cancel": "taal_inventory.events.pharmacy_stock_transfer.on_cancel",
+    },
 }
