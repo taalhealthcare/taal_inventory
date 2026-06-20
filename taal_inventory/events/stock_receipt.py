@@ -3,13 +3,22 @@ taal_inventory/events/stock_receipt.py
 
 Handles Stock Receipt submit, cancel, and Stock Adjustment submit.
 
-FIXES IN THIS VERSION:
-  1. _get_pharmacy_item_name() resolves PI name from item_code or direct name
-  2. on_adjustment_submit now uses append_stock_log directly instead of
-     _log_deduction from fifo.py — ensures event_type, cost_price,
-     selling_price, mrp_price, warehouse, remarks are all written correctly
-  3. flt() on all numeric reads
-  4. "purchsase_tax_pct" (typo) used to match Pharmacy Batch DB column
+UPDATED FOR MULTI-COMPANY SUPPORT:
+  Stock Receipt now has a mandatory `company` field (added via
+  Customize Form). Every new Pharmacy Batch created from a Stock
+  Receipt now correctly carries the `company` value, so multi-company
+  stock tracking (Point 3 — Inter-Company Transfer) works correctly
+  going forward.
+
+  Also calls recalculate_company_stock() to keep the new
+  Pharmacy Item.company_stock child table in sync on every
+  Stock Receipt submit/cancel.
+
+PRIOR FIXES RETAINED:
+  - _get_pharmacy_item_name() resolves PI name from item_code or direct name
+  - on_adjustment_submit uses append_stock_log directly
+  - flt() on all numeric reads
+  - "purchsase_tax_pct" (typo) used to match Pharmacy Batch DB column
 """
 
 import frappe
@@ -26,20 +35,14 @@ def _get_pharmacy_item_name(row_item):
       - The Pharmacy Item item_code      (e.g. TPCHC-PI-000054)    — old
 
     This function tries both and returns the document name, or None.
-
-    NOTE: Stock Adjustment Item.item is a direct Link → Pharmacy Item
-    and always stores the document name — no resolution needed there.
-    This function is only needed for Stock Receipt.
     """
     if not row_item:
         return None
 
-    # Strategy 1: Direct name lookup
     direct = frappe.db.get_value("Pharmacy Item", row_item, "name")
     if direct:
         return direct
 
-    # Strategy 2: item_code lookup
     by_code = frappe.db.get_value(
         "Pharmacy Item",
         {"item_code": row_item},
@@ -51,19 +54,25 @@ def _get_pharmacy_item_name(row_item):
 def on_submit(doc, method):
     """
     Triggered when Stock Receipt is submitted.
-    Creates one Pharmacy Batch per line item.
-    Updates current_stock on each Pharmacy Item.
+    Creates one Pharmacy Batch per line item, tagged with doc.company.
+    Updates current_stock on each Pharmacy Item (global + per-company).
     Syncs Item Price (Standard Selling).
     Calculates Stock Receipt totals.
     Logs each batch creation as "Stock IN" in deduction_log.
     """
     from taal_inventory.utils.stock_log import append_stock_log
+    from taal_inventory.utils.company_stock import recalculate_company_stock
+
+    if not doc.company:
+        frappe.throw(
+            "Company is mandatory on Stock Receipt. "
+            "Please select which company this stock belongs to."
+        )
 
     total_amount = 0
     total_tax    = 0
 
     for row in doc.items:
-        # Resolve Pharmacy Item document name
         pi_name = _get_pharmacy_item_name(row.item)
         if not pi_name:
             frappe.throw(
@@ -82,8 +91,7 @@ def on_submit(doc, method):
         total_amount += line_total
         total_tax    += tax_amount
 
-        # Create Pharmacy Batch
-        # NOTE: "purchsase_tax_pct" (extra 's') is the ACTUAL DB fieldname
+        # Create Pharmacy Batch — NOW tagged with company
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  pi_name,
@@ -105,6 +113,7 @@ def on_submit(doc, method):
             "qty_received":          flt(row.qty_received),
             "remaining_qty":         flt(row.qty_received),
             "warehouse":             doc.warehouse,
+            "company":               doc.company,   # ← CRITICAL FIX
             "stock_receipt":         doc.name,
             "status":                "Active",
             "creation_date":         now_datetime()
@@ -120,13 +129,6 @@ def on_submit(doc, method):
             round(line_total, 2)
         )
 
-        # Update current_stock on Pharmacy Item
-        item_doc = frappe.get_doc("Pharmacy Item", pi_name)
-        item_doc.current_stock = (
-            flt(item_doc.current_stock or 0)
-        ) + flt(row.qty_received)
-        item_doc.save(ignore_permissions=True)
-
         # Sync Item Price (Standard Selling)
         if row.selling_price and flt(row.selling_price) > 0:
             actual_item_code = frappe.db.get_value(
@@ -140,6 +142,9 @@ def on_submit(doc, method):
                     expiry_date=row.expiry_date
                 )
 
+        # Refresh company_stock child table AND global current_stock
+        new_company_stock = recalculate_company_stock(pi_name, doc.company)
+
         # Log Stock IN
         append_stock_log(
             pharmacy_item_name=pi_name,
@@ -148,15 +153,15 @@ def on_submit(doc, method):
             reference_no=doc.name,
             batch_id=batch.name,
             qty=flt(row.qty_received),
-            balance_after=flt(item_doc.current_stock),
+            balance_after=new_company_stock,
             cost_price=flt(row.cost_price or 0),
             selling_price=flt(row.selling_price or 0),
             mrp_price=flt(row.mrp_price or 0),
             warehouse=doc.warehouse or "",
-            remarks=f"Batch {row.batch_id} created via SR {doc.name}"
+            remarks=f"Batch {row.batch_id} created via SR {doc.name} "
+                    f"for company {doc.company}"
         )
 
-    # Update Stock Receipt totals
     grand_total = total_amount + total_tax
     frappe.db.set_value("Stock Receipt", doc.name, {
         "total_amount": round(total_amount, 2),
@@ -166,8 +171,8 @@ def on_submit(doc, method):
 
     frappe.db.commit()
     frappe.msgprint(
-        "Stock Receipt submitted. "
-        "Batches created and stock updated.",
+        f"Stock Receipt submitted for {doc.company}. "
+        f"Batches created and stock updated.",
         alert=True
     )
 
@@ -175,10 +180,11 @@ def on_submit(doc, method):
 def on_cancel(doc, method):
     """
     Triggered when Stock Receipt is cancelled.
-    Quarantines batches, reverses current_stock.
+    Quarantines batches, reverses current_stock (global + per-company).
     Logs "Reversal OUT" per batch quarantined.
     """
     from taal_inventory.utils.stock_log import append_stock_log
+    from taal_inventory.utils.company_stock import recalculate_company_stock
 
     for row in doc.items:
         pi_name = _get_pharmacy_item_name(row.item)
@@ -197,7 +203,7 @@ def on_cancel(doc, method):
                 "item":          pi_name
             },
             fields=[
-                "name", "remaining_qty",
+                "name", "remaining_qty", "company",
                 "cost_price", "selling_price",
                 "mrp_price", "warehouse"
             ]
@@ -211,12 +217,8 @@ def on_cancel(doc, method):
                 "status", "Quarantined"
             )
 
-            item_doc = frappe.get_doc("Pharmacy Item", pi_name)
-            item_doc.current_stock = max(
-                0,
-                flt(item_doc.current_stock or 0) - remaining
-            )
-            item_doc.save(ignore_permissions=True)
+            # Refresh company_stock for this batch's company
+            new_company_stock = recalculate_company_stock(pi_name, b.company)
 
             append_stock_log(
                 pharmacy_item_name=pi_name,
@@ -225,7 +227,7 @@ def on_cancel(doc, method):
                 reference_no=doc.name,
                 batch_id=b.name,
                 qty=remaining,
-                balance_after=flt(item_doc.current_stock),
+                balance_after=new_company_stock,
                 cost_price=flt(b.cost_price or 0),
                 selling_price=flt(b.selling_price or 0),
                 mrp_price=flt(b.mrp_price or 0),
@@ -244,41 +246,29 @@ def on_cancel(doc, method):
 def on_adjustment_submit(doc, method):
     """
     Handles Stock Adjustment submit.
+    Deducts stock per adjustment rows.
+    Logs "Stock OUT" with full pricing to deduction_log.
+    Refreshes company_stock for the batch's company.
 
-    For each row in doc.items:
-      1. Reads Pharmacy Batch remaining_qty (balance_before)
-      2. Deducts row.qty → new remaining_qty (balance_after)
-      3. Sets batch status Active or Exhausted
-      4. Writes balance_before and balance_after to Stock Adjustment Item row
-      5. Recalculates Pharmacy Item.current_stock from all active batches
-      6. Logs "Stock OUT" with full pricing to deduction_log
-
-    NOTE: Stock Adjustment Item.item is a direct Link → Pharmacy Item
-    and stores the document name directly (e.g. TPCHC-PI-2026-0055).
-    No _get_pharmacy_item_name() resolution needed here.
-
-    NOTE: Previously used _log_deduction from fifo.py which did not write
-    event_type, cost_price, selling_price, mrp_price, warehouse, remarks.
-    Now uses append_stock_log directly for complete, consistent logging.
+    NOTE: Stock Adjustment Item.item is a direct Link → Pharmacy Item.
+    Stock Adjustment Item.batch_id is a direct Link → Pharmacy Batch,
+    which already carries its own `company` field — read from there.
     """
     from taal_inventory.utils.stock_log import append_stock_log
+    from taal_inventory.utils.company_stock import recalculate_company_stock
 
     for row in doc.items:
-        # row.item is the Pharmacy Item document name (direct Link)
-        # row.batch_id is the Pharmacy Batch document name (direct Link)
         batch = frappe.get_doc("Pharmacy Batch", row.batch_id)
 
         balance_before = flt(batch.remaining_qty)
         new_qty        = max(0, balance_before - flt(row.qty))
         new_status     = "Exhausted" if new_qty == 0 else "Active"
 
-        # Update batch
         frappe.db.set_value("Pharmacy Batch", batch.name, {
             "remaining_qty": new_qty,
             "status":        new_status
         })
 
-        # Write balance before/after to the adjustment row
         frappe.db.set_value(
             "Stock Adjustment Item", row.name, {
                 "balance_before": balance_before,
@@ -286,27 +276,15 @@ def on_adjustment_submit(doc, method):
             }
         )
 
-        # Recalculate Pharmacy Item current_stock from all active batches
-        result = frappe.db.sql("""
-            SELECT COALESCE(SUM(remaining_qty), 0) as total
-            FROM `tabPharmacy Batch`
-            WHERE item = %s AND status = 'Active'
-        """, row.item, as_dict=True)
-        new_stock = float(result[0].total) if result else 0.0
+        # Refresh company_stock for the batch's own company
+        # (Stock Adjustment doesn't need its own company field —
+        # the batch being adjusted already belongs to a company)
+        new_company_stock = recalculate_company_stock(row.item, batch.company)
 
-        frappe.db.set_value(
-            "Pharmacy Item",
-            row.item,
-            "current_stock",
-            new_stock
-        )
-
-        # Build remarks from adjustment type and reason
         adj_type = doc.adjustment_type or ""
         reason   = doc.reason or ""
         remarks  = f"{adj_type} adjustment — {reason}" if reason else adj_type
 
-        # Log Stock OUT with full pricing from the batch
         append_stock_log(
             pharmacy_item_name=row.item,
             event_type="Stock OUT",
@@ -314,7 +292,7 @@ def on_adjustment_submit(doc, method):
             reference_no=doc.name,
             batch_id=row.batch_id,
             qty=flt(row.qty),
-            balance_after=new_stock,
+            balance_after=new_company_stock,
             cost_price=flt(batch.cost_price or 0),
             selling_price=flt(batch.selling_price or 0),
             mrp_price=flt(batch.mrp_price or 0),
@@ -363,11 +341,6 @@ def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
             ip.insert()
 
         frappe.db.commit()
-
-        frappe.logger().info(
-            f"Item Price synced: {item_code} "
-            f"rate {selling_price} expiry {expiry_date}"
-        )
 
     except Exception as e:
         frappe.log_error(
