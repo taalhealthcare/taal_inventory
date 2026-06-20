@@ -4,21 +4,12 @@ taal_inventory/events/stock_receipt.py
 Handles Stock Receipt submit, cancel, and Stock Adjustment submit.
 
 UPDATED FOR MULTI-COMPANY SUPPORT:
-  Stock Receipt now has a mandatory `company` field (added via
-  Customize Form). Every new Pharmacy Batch created from a Stock
-  Receipt now correctly carries the `company` value, so multi-company
-  stock tracking (Point 3 — Inter-Company Transfer) works correctly
-  going forward.
-
-  Also calls recalculate_company_stock() to keep the new
-  Pharmacy Item.company_stock child table in sync on every
-  Stock Receipt submit/cancel.
-
-PRIOR FIXES RETAINED:
-  - _get_pharmacy_item_name() resolves PI name from item_code or direct name
-  - on_adjustment_submit uses append_stock_log directly
-  - flt() on all numeric reads
-  - "purchsase_tax_pct" (typo) used to match Pharmacy Batch DB column
+  - Stock Receipt has a mandatory `company` field. Every new Pharmacy
+    Batch created from a Stock Receipt carries this company.
+  - Every deduction_log entry now also records `company` for full
+    multi-company audit trail (Point 3 — Inter-Company Transfer).
+  - Calls recalculate_company_stock() to keep Pharmacy Item's
+    company_stock child table in sync on every submit/cancel.
 """
 
 import frappe
@@ -33,8 +24,6 @@ def _get_pharmacy_item_name(row_item):
     Stock Receipt stores either:
       - The Pharmacy Item document name  (e.g. TPCHC-PI-2026-0055) — new
       - The Pharmacy Item item_code      (e.g. TPCHC-PI-000054)    — old
-
-    This function tries both and returns the document name, or None.
     """
     if not row_item:
         return None
@@ -58,7 +47,7 @@ def on_submit(doc, method):
     Updates current_stock on each Pharmacy Item (global + per-company).
     Syncs Item Price (Standard Selling).
     Calculates Stock Receipt totals.
-    Logs each batch creation as "Stock IN" in deduction_log.
+    Logs each batch creation as "Stock IN" in deduction_log, with company.
     """
     from taal_inventory.utils.stock_log import append_stock_log
     from taal_inventory.utils.company_stock import recalculate_company_stock
@@ -91,7 +80,7 @@ def on_submit(doc, method):
         total_amount += line_total
         total_tax    += tax_amount
 
-        # Create Pharmacy Batch — NOW tagged with company
+        # Create Pharmacy Batch — tagged with company
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  pi_name,
@@ -113,7 +102,7 @@ def on_submit(doc, method):
             "qty_received":          flt(row.qty_received),
             "remaining_qty":         flt(row.qty_received),
             "warehouse":             doc.warehouse,
-            "company":               doc.company,   # ← CRITICAL FIX
+            "company":               doc.company,
             "stock_receipt":         doc.name,
             "status":                "Active",
             "creation_date":         now_datetime()
@@ -145,7 +134,7 @@ def on_submit(doc, method):
         # Refresh company_stock child table AND global current_stock
         new_company_stock = recalculate_company_stock(pi_name, doc.company)
 
-        # Log Stock IN
+        # Log Stock IN — with company
         append_stock_log(
             pharmacy_item_name=pi_name,
             event_type="Stock IN",
@@ -158,6 +147,7 @@ def on_submit(doc, method):
             selling_price=flt(row.selling_price or 0),
             mrp_price=flt(row.mrp_price or 0),
             warehouse=doc.warehouse or "",
+            company=doc.company,
             remarks=f"Batch {row.batch_id} created via SR {doc.name} "
                     f"for company {doc.company}"
         )
@@ -181,7 +171,7 @@ def on_cancel(doc, method):
     """
     Triggered when Stock Receipt is cancelled.
     Quarantines batches, reverses current_stock (global + per-company).
-    Logs "Reversal OUT" per batch quarantined.
+    Logs "Reversal OUT" per batch quarantined, with company.
     """
     from taal_inventory.utils.stock_log import append_stock_log
     from taal_inventory.utils.company_stock import recalculate_company_stock
@@ -217,7 +207,6 @@ def on_cancel(doc, method):
                 "status", "Quarantined"
             )
 
-            # Refresh company_stock for this batch's company
             new_company_stock = recalculate_company_stock(pi_name, b.company)
 
             append_stock_log(
@@ -232,6 +221,7 @@ def on_cancel(doc, method):
                 selling_price=flt(b.selling_price or 0),
                 mrp_price=flt(b.mrp_price or 0),
                 warehouse=b.warehouse or "",
+                company=b.company,
                 remarks=f"Cancelled SR {doc.name} — batch quarantined"
             )
 
@@ -247,7 +237,7 @@ def on_adjustment_submit(doc, method):
     """
     Handles Stock Adjustment submit.
     Deducts stock per adjustment rows.
-    Logs "Stock OUT" with full pricing to deduction_log.
+    Logs "Stock OUT" with full pricing AND company to deduction_log.
     Refreshes company_stock for the batch's company.
 
     NOTE: Stock Adjustment Item.item is a direct Link → Pharmacy Item.
@@ -276,9 +266,6 @@ def on_adjustment_submit(doc, method):
             }
         )
 
-        # Refresh company_stock for the batch's own company
-        # (Stock Adjustment doesn't need its own company field —
-        # the batch being adjusted already belongs to a company)
         new_company_stock = recalculate_company_stock(row.item, batch.company)
 
         adj_type = doc.adjustment_type or ""
@@ -297,6 +284,7 @@ def on_adjustment_submit(doc, method):
             selling_price=flt(batch.selling_price or 0),
             mrp_price=flt(batch.mrp_price or 0),
             warehouse=doc.warehouse or batch.warehouse or "",
+            company=batch.company,
             remarks=remarks
         )
 

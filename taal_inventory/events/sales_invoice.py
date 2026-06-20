@@ -3,14 +3,9 @@ taal_inventory/events/sales_invoice.py
 
 Handles Sales Invoice submit and cancel for pharmacy stock.
   on_submit : FEFO deduction — nearest expiry batch consumed first.
-              Logs "Stock OUT" per batch consumed.
+              Logs "Stock OUT" per batch consumed, with company.
   on_cancel : Reverses FEFO deduction, restores batch qty and stock.
-              Logs "Reversal IN" per batch restored.
-
-FIXES IN THIS VERSION:
-  1. flt() on all qty_deducted reads from frappe.get_all (returns strings)
-  2. _check_notify wrapped in try/except — WA token expiry never blocks submit
-  3. Stock log uses append_stock_log from utils/stock_log.py
+              Logs "Reversal IN" per batch restored, with company.
 """
 
 import frappe
@@ -112,7 +107,7 @@ def on_submit(doc, method):
     """
     Triggered when Sales Invoice is submitted.
     FEFO deduction — nearest expiry batch consumed first.
-    Logs each deduction as "Stock OUT" in deduction_log.
+    Logs each deduction as "Stock OUT" in deduction_log, with company.
     """
     for row in doc.items:
         pharmacy_items = frappe.get_all(
@@ -142,7 +137,7 @@ def on_cancel(doc, method):
       1. Restore remaining_qty on the Pharmacy Batch
       2. Set batch status back to Active
       3. Recalculate current_stock on Pharmacy Item
-      4. Append "Reversal IN" to deduction_log
+      4. Append "Reversal IN" to deduction_log, with company
 
     KEY FIX: flt() on log.qty_deducted — frappe.get_all returns
     Float child table fields as strings, causing TypeError on arithmetic.
@@ -162,7 +157,6 @@ def on_cancel(doc, method):
 
         pi_name = pharmacy_items[0].name
 
-        # Fetch all deduction log rows for this SI + this item
         logs = frappe.get_all(
             "Deduction Log",
             filters={
@@ -178,7 +172,6 @@ def on_cancel(doc, method):
         )
 
         for log in logs:
-            # flt() converts string → float safely — definitive fix for crash
             qty_to_restore = flt(log.qty_deducted)
 
             current = flt(
@@ -187,7 +180,6 @@ def on_cancel(doc, method):
                 ) or 0
             )
 
-            # Restore batch qty and activate
             frappe.db.set_value(
                 "Pharmacy Batch",
                 log.batch_id,
@@ -197,21 +189,18 @@ def on_cancel(doc, method):
                 }
             )
 
-        # Recalculate current_stock from live batch totals
         new_stock = _recalculate_stock(pi_name)
 
-        # Get patient name safely
         patient = doc.patient_name or doc.customer_name or ""
 
-        # Log each reversal to deduction_log
         for log in logs:
             qty_to_restore = flt(log.qty_deducted)
 
-            # Re-fetch pricing from batch (may have changed since submit)
             batch_data = frappe.db.get_value(
                 "Pharmacy Batch",
                 log.batch_id,
-                ["cost_price", "selling_price", "mrp_price", "warehouse"],
+                ["cost_price", "selling_price", "mrp_price",
+                 "warehouse", "company"],
                 as_dict=True
             ) or {}
 
@@ -227,6 +216,7 @@ def on_cancel(doc, method):
                 selling_price=flt(batch_data.get("selling_price", 0)),
                 mrp_price=flt(batch_data.get("mrp_price", 0)),
                 warehouse=batch_data.get("warehouse", ""),
+                company=batch_data.get("company", ""),
                 patient_name=patient,
                 remarks=f"Cancelled SI {doc.name} — stock restored"
             )
@@ -239,11 +229,10 @@ def _deduct_fefo(doc, row, pi_name):
     FEFO deduction engine.
     Nearest expiry batch consumed first.
     Deducts across multiple batches if qty spans them.
-    Logs each batch consumed as "Stock OUT" in deduction_log.
+    Logs each batch consumed as "Stock OUT" in deduction_log, with company.
     """
     from taal_inventory.utils.stock_log import append_stock_log
 
-    # Fetch all active non-expired batches, nearest expiry first (FEFO)
     batches = frappe.get_all(
         "Pharmacy Batch",
         filters={
@@ -256,7 +245,7 @@ def _deduct_fefo(doc, row, pi_name):
             "name", "batch_id",
             "remaining_qty", "expiry_date",
             "selling_price", "cost_price",
-            "mrp_price", "warehouse"
+            "mrp_price", "warehouse", "company"
         ],
         order_by="expiry_date ASC",
         limit_page_length=0
@@ -280,7 +269,6 @@ def _deduct_fefo(doc, row, pi_name):
     remaining = flt(row.qty)
     consumed  = []
 
-    # Deduct from nearest expiry batch first
     for batch in batches:
         if remaining <= 0:
             break
@@ -299,16 +287,14 @@ def _deduct_fefo(doc, row, pi_name):
             "cost_price":    flt(batch.cost_price),
             "mrp_price":     flt(batch.mrp_price),
             "warehouse":     batch.warehouse or "",
+            "company":       batch.company or "",
         })
         remaining -= deduct
 
-    # Recalculate current_stock from live batch totals
     new_stock = _recalculate_stock(pi_name)
 
-    # Get patient / customer name safely
     patient = doc.patient_name or doc.customer_name or ""
 
-    # Log each batch consumed — one deduction_log row per batch
     for entry in consumed:
         append_stock_log(
             pharmacy_item_name=pi_name,
@@ -322,14 +308,13 @@ def _deduct_fefo(doc, row, pi_name):
             selling_price=entry["selling_price"],
             mrp_price=entry["mrp_price"],
             warehouse=entry["warehouse"],
+            company=entry["company"],
             patient_name=patient,
             remarks=""
         )
 
     frappe.db.commit()
 
-    # Fire notifications if stock crosses thresholds
-    # Wrapped in try/except — WA token expiry must NEVER block SI submit
     try:
         _check_notify(pi_name, new_stock)
     except Exception as notify_err:
@@ -359,11 +344,7 @@ def _recalculate_stock(pi_name):
 
 
 def _check_notify(pi_name, new_stock):
-    """
-    Fire notifications if stock crosses thresholds.
-    Called inside try/except in _deduct_fefo — any error here is logged
-    but never propagates to block the Sales Invoice submit.
-    """
+    """Fire notifications if stock crosses thresholds."""
     from taal_inventory.utils.notifications import send_stock_alert
     pi = frappe.get_doc("Pharmacy Item", pi_name)
 

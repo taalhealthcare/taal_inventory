@@ -2,33 +2,43 @@
 //
 // Client Script for Pharmacy Stock Transfer.
 //
-// PURPOSE:
-//   When the user selects a Source Batch in the child table row,
-//   immediately fetch and display:
-//     - Available Qty (remaining_qty on that batch)
-//     - From Cost Price (cost_price on that batch)
-//     - Item Name auto-fill from the batch's item link
-//   This gives live visibility BEFORE submit — previously these
-//   fields stayed blank until after submit, since the Python
-//   on_submit hook only writes them as part of the actual transfer.
-//
-// Also validates that the selected batch belongs to from_company,
-// catching mismatches early instead of letting submit fail later.
+// FEATURES:
+//   1. source_batch Link field is filtered to only show batches
+//      matching the row's selected pharmacy_item AND from_company.
+//   2. On selecting source_batch, immediately (live, before submit)
+//      populates: available_qty, from_cost_price, from_selling_price,
+//      from_mrp_price — all fetched directly from the Pharmacy Batch.
+//   3. Validates company match and Active status, warns immediately.
+//   4. Validates qty does not exceed available_qty.
 
 frappe.ui.form.on("Pharmacy Stock Transfer Item", {
+
+    pharmacy_item: function(frm, cdt, cdn) {
+        var row = locals[cdt][cdn];
+        // Clear source_batch when pharmacy_item changes — forces
+        // re-selection so the filter applies cleanly
+        if (row.source_batch) {
+            frappe.model.set_value(cdt, cdn, "source_batch", "");
+        }
+    },
+
     source_batch: function(frm, cdt, cdn) {
         var row = locals[cdt][cdn];
 
         if (!row.source_batch) {
             frappe.model.set_value(cdt, cdn, "available_qty", 0);
             frappe.model.set_value(cdt, cdn, "from_cost_price", 0);
+            frappe.model.set_value(cdt, cdn, "from_selling_price", 0);
+            frappe.model.set_value(cdt, cdn, "from_mrp_price", 0);
             return;
         }
 
         frappe.db.get_doc("Pharmacy Batch", row.source_batch).then(function(batch) {
-            // Populate available qty and cost price immediately
+            // Live-populate all 4 fields immediately on selection
             frappe.model.set_value(cdt, cdn, "available_qty", batch.remaining_qty || 0);
             frappe.model.set_value(cdt, cdn, "from_cost_price", batch.cost_price || 0);
+            frappe.model.set_value(cdt, cdn, "from_selling_price", batch.selling_price || 0);
+            frappe.model.set_value(cdt, cdn, "from_mrp_price", batch.mrp_price || 0);
 
             // Auto-fill pharmacy_item if not already set
             if (!row.pharmacy_item && batch.item) {
@@ -38,7 +48,7 @@ frappe.ui.form.on("Pharmacy Stock Transfer Item", {
             // Validate batch belongs to the selected from_company
             if (frm.doc.from_company && batch.company !== frm.doc.from_company) {
                 frappe.show_alert({
-                    message: "⚠️ Warning: Batch " + row.source_batch +
+                    message: "⚠️ Batch " + row.source_batch +
                         " belongs to '" + batch.company + "', not '" +
                         frm.doc.from_company + "'. This batch cannot be " +
                         "transferred from the selected From Company.",
@@ -49,7 +59,7 @@ frappe.ui.form.on("Pharmacy Stock Transfer Item", {
             // Validate batch status is Active
             if (batch.status !== "Active") {
                 frappe.show_alert({
-                    message: "⚠️ Warning: Batch " + row.source_batch +
+                    message: "⚠️ Batch " + row.source_batch +
                         " is '" + batch.status + "', not Active. " +
                         "Only Active batches can be transferred.",
                     indicator: "orange"
@@ -63,7 +73,6 @@ frappe.ui.form.on("Pharmacy Stock Transfer Item", {
     qty: function(frm, cdt, cdn) {
         var row = locals[cdt][cdn];
 
-        // Live validation: qty cannot exceed available_qty
         if (row.qty && row.available_qty && row.qty > row.available_qty) {
             frappe.show_alert({
                 message: "⚠️ Qty to Transfer (" + row.qty +
@@ -75,6 +84,7 @@ frappe.ui.form.on("Pharmacy Stock Transfer Item", {
 });
 
 frappe.ui.form.on("Pharmacy Stock Transfer", {
+
     from_company: function(frm) {
         // Re-validate all existing rows when from_company changes
         if (frm.doc.items && frm.doc.items.length) {
@@ -95,6 +105,9 @@ frappe.ui.form.on("Pharmacy Stock Transfer", {
                 }
             });
         }
+        // Refresh the source_batch filter on all rows
+        frm.fields_dict.items.grid.get_field("source_batch").get_query =
+            get_source_batch_query(frm);
     },
 
     to_company: function(frm) {
@@ -105,5 +118,41 @@ frappe.ui.form.on("Pharmacy Stock Transfer", {
                 indicator: "red"
             }, 6);
         }
+    },
+
+    onload: function(frm) {
+        // Set up the source_batch filter as soon as the form loads
+        frm.fields_dict.items.grid.get_field("source_batch").get_query =
+            get_source_batch_query(frm);
+    },
+
+    refresh: function(frm) {
+        frm.fields_dict.items.grid.get_field("source_batch").get_query =
+            get_source_batch_query(frm);
     }
 });
+
+// ── Filter Query: source_batch dropdown ───────────────────────
+// Only show batches that:
+//   1. Belong to the currently selected From Company
+//   2. Match the row's selected Pharmacy Item (if one is set)
+//   3. Are Active with remaining_qty > 0
+function get_source_batch_query(frm) {
+    return function(doc, cdt, cdn) {
+        var row = locals[cdt][cdn];
+        var filters = {
+            "status": "Active",
+            "remaining_qty": [">", 0]
+        };
+
+        if (frm.doc.from_company) {
+            filters["company"] = frm.doc.from_company;
+        }
+
+        if (row.pharmacy_item) {
+            filters["item"] = row.pharmacy_item;
+        }
+
+        return { filters: filters };
+    };
+}

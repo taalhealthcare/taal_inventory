@@ -6,22 +6,17 @@ Handles Purchase Invoice submit and cancel for pharmacy stock.
 THREE scenarios on submit per pharmacy row:
 
   SCENARIO 1 — NEW BATCH (batch_id never seen before)
-    Creates Pharmacy Batch, updates current_stock,
-    syncs Item Price, logs "Stock IN".
+    Creates Pharmacy Batch (tagged with doc.company), updates
+    current_stock, syncs Item Price, logs "Stock IN" with company.
 
   SCENARIO 2 — OPENING STOCK BATCH
     (batch exists, no SR, no PI linked — imported as opening balance)
-    PI is finance-only: links PI to batch, logs "Stock IN" (finance-only).
-    Does NOT create duplicate batch or change stock.
+    PI is finance-only: links PI to batch, logs "Stock IN" (finance-only)
+    with company. Does NOT create duplicate batch or change stock.
 
   SCENARIO 3 — REAL TRANSACTION DUPLICATE
     (batch exists AND linked to another SR or PI)
     Blocks submit with clear error.
-
-FIXES IN THIS VERSION:
-  1. Stock log uses append_stock_log (append+save pattern)
-  2. flt() on all numeric reads
-  3. "purchsase_tax_pct" (typo) used to match Pharmacy Batch DB column
 """
 
 import frappe
@@ -51,23 +46,20 @@ def on_submit(doc, method):
 
     for row in doc.items:
 
-        # Is this a pharmacy item?
         pharmacy_item_name = frappe.db.get_value(
             "Pharmacy Item",
             {"item_code": row.item_code},
             "name"
         )
         if not pharmacy_item_name:
-            continue   # Non-pharmacy line — skip silently
+            continue
 
-        # Validate required fields and date logic
         _validate_pharmacy_row(row, doc, batch_ids_in_invoice)
 
-        # Resolve batch situation
         outcome, existing_batch_doc = _resolve_batch_situation(row, doc)
 
         if outcome == _BATCH_DUPLICATE:
-            return  # frappe.throw() already called inside _resolve
+            return
 
         # ── SCENARIO 2: Finance-only (opening stock batch) ────────────────────
         if outcome == _BATCH_FINANCE:
@@ -82,7 +74,6 @@ def on_submit(doc, method):
             finance_only_rows += 1
             batch_ids_in_invoice.add(row.custom_batch_id)
 
-            # Current stock unchanged — log the accounting event only
             current_stock = flt(
                 frappe.db.get_value(
                     "Pharmacy Item", pharmacy_item_name, "current_stock"
@@ -101,6 +92,7 @@ def on_submit(doc, method):
                 selling_price=flt(row.custom_selling_price or 0),
                 mrp_price=flt(row.custom_mrp_price or 0),
                 warehouse=getattr(existing_batch_doc, "warehouse", ""),
+                company=doc.company,
                 remarks=(
                     f"Finance-only — opening stock batch "
                     f"{row.custom_batch_id} linked to PI {doc.name}"
@@ -134,9 +126,6 @@ def on_submit(doc, method):
             or DEFAULT_WAREHOUSE
         )
 
-        # NOTE: "purchsase_tax_pct" is the ACTUAL DB fieldname on Pharmacy
-        # Batch (typo in original DocType — extra 's'). Do not change until
-        # a proper DocType rename + Migrate is done.
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  pharmacy_item_name,
@@ -158,6 +147,7 @@ def on_submit(doc, method):
             "qty_received":          flt(row.qty),
             "remaining_qty":         flt(row.qty),
             "warehouse":             warehouse,
+            "company":               doc.company,
             "purchase_invoice":      doc.name,
             "stock_receipt":         None,
             "status":                "Active",
@@ -166,14 +156,12 @@ def on_submit(doc, method):
         batch.insert(ignore_permissions=True)
         frappe.db.commit()
 
-        # Update current_stock on Pharmacy Item
         item_doc = frappe.get_doc("Pharmacy Item", pharmacy_item_name)
         item_doc.current_stock = (
             flt(item_doc.current_stock or 0)
         ) + flt(row.qty)
         item_doc.save(ignore_permissions=True)
 
-        # Sync Item Price
         if selling_price > 0:
             _sync_item_price(
                 item_code=row.item_code,
@@ -182,7 +170,6 @@ def on_submit(doc, method):
                 expiry_date=row.custom_expiry_date
             )
 
-        # Log Stock IN
         append_stock_log(
             pharmacy_item_name=pharmacy_item_name,
             event_type="Stock IN",
@@ -195,6 +182,7 @@ def on_submit(doc, method):
             selling_price=selling_price,
             mrp_price=flt(row.custom_mrp_price or 0),
             warehouse=warehouse,
+            company=doc.company,
             remarks=f"Batch {row.custom_batch_id} created via PI {doc.name}"
         )
 
@@ -225,11 +213,11 @@ def on_cancel(doc, method):
     Triggered when Purchase Invoice is cancelled.
 
     CASE A — Finance-only (qty_received = 0):
-        Unlinks PI from batch. Logs Reversal OUT with qty=0.
+        Unlinks PI from batch. Logs Reversal OUT with qty=0 and company.
 
     CASE B — Real batch (qty_received > 0):
         Quarantines batch, reverses remaining_qty from current_stock.
-        Logs Reversal OUT with actual qty.
+        Logs Reversal OUT with actual qty and company.
     """
     from taal_inventory.utils.stock_log import append_stock_log
 
@@ -242,7 +230,7 @@ def on_cancel(doc, method):
         fields=[
             "name", "item", "qty_received", "remaining_qty",
             "status", "cost_price", "selling_price",
-            "mrp_price", "warehouse"
+            "mrp_price", "warehouse", "company"
         ]
     )
 
@@ -275,6 +263,7 @@ def on_cancel(doc, method):
                 selling_price=flt(b.selling_price or 0),
                 mrp_price=flt(b.mrp_price or 0),
                 warehouse=b.warehouse or "",
+                company=b.company,
                 remarks=(
                     f"Cancelled PI {doc.name} — finance-only batch "
                     f"unlinked (opening stock, no stock change)"
@@ -307,6 +296,7 @@ def on_cancel(doc, method):
                 selling_price=flt(b.selling_price or 0),
                 mrp_price=flt(b.mrp_price or 0),
                 warehouse=b.warehouse or "",
+                company=b.company,
                 remarks=(
                     f"Cancelled PI {doc.name} — batch quarantined, "
                     f"{remaining} units reversed from stock"

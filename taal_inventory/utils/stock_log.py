@@ -2,27 +2,32 @@
 taal_inventory/utils/stock_log.py
 
 Single source of truth for all stock movement logging.
-Every stock event (IN, OUT, Reversal) writes one row to
+Every stock event (IN, OUT, Reversal, Transfer) writes one row to
 Pharmacy Item's deduction_log child table.
 
+UPDATED: Added `company` parameter — every deduction_log entry now
+records WHICH company the event happened in. Critical for multi-company
+operations (Point 3 — Inter-Company Transfer) where the same Pharmacy
+Item can have events happening across multiple companies, and audit
+trail must clearly show which company each event belongs to.
+
 CRITICAL PATTERN: Uses pi_doc.append() + pi_doc.save() — NOT frappe.db.insert().
-frappe.db.insert() bypasses naming series (TPCHC-DL-.YYYY.-.########),
-bypasses idx assignment, and produces rows that never appear in the UI.
-The append+save pattern is the only correct way to write child table rows.
+frappe.db.insert() bypasses naming series, idx assignment, and produces
+rows that never appear in the UI.
 
 Called by:
-  - events/sales_invoice.py    (Stock OUT on submit, Reversal IN on cancel)
-  - events/stock_receipt.py    (Stock IN on submit, Reversal OUT on cancel)
-  - events/purchase_invoice.py (Stock IN on submit, Reversal OUT on cancel)
-  - utils/fifo.py              (_log_deduction for Stock Adjustment)
+  - events/sales_invoice.py        (Stock OUT, Reversal IN)
+  - events/stock_receipt.py        (Stock IN, Reversal OUT)
+  - events/purchase_invoice.py     (Stock IN, Reversal OUT)
+  - events/pharmacy_stock_transfer.py (Transfer OUT, Transfer IN)
 
 Event types (must match Deduction Log.event_type Select options):
   "Stock IN"      - stock added (SR submit, PI submit)
-  "Stock OUT"     - stock deducted (SI submit)
+  "Stock OUT"     - stock deducted (SI submit, Stock Adjustment)
   "Reversal IN"   - stock restored (SI cancel)
   "Reversal OUT"  - stock removed (SR cancel, PI cancel)
-  "Transfer IN"   - stock received from another company (future use)
-  "Transfer OUT"  - stock sent to another company (future use)
+  "Transfer IN"   - stock received from another company
+  "Transfer OUT"  - stock sent to another company
 """
 
 import frappe
@@ -41,6 +46,7 @@ def append_stock_log(
     selling_price=0,
     mrp_price=0,
     warehouse="",
+    company="",
     patient_name="",
     deducted_by=None,
     remarks=""
@@ -57,7 +63,7 @@ def append_stock_log(
                 Transfer IN, Transfer OUT
     reference_doctype : str
         Sales Invoice / Purchase Invoice / Stock Receipt /
-        Stock Adjustment / Opening Stock
+        Stock Adjustment / Pharmacy Stock Transfer / Opening Stock
     reference_no : str
         The document name (e.g. SINV-26-00010)
     batch_id : str
@@ -65,11 +71,15 @@ def append_stock_log(
     qty : float
         Quantity moved — always positive, event_type conveys direction
     balance_after : float
-        current_stock AFTER this event
+        Stock balance AFTER this event (company-specific when relevant)
     cost_price, selling_price, mrp_price : float
         Pricing at time of event
     warehouse : str
         Warehouse involved
+    company : str
+        Which company this event happened in — CRITICAL for multi-company
+        audit trail. Always pass this explicitly; do not leave blank
+        for any event going forward.
     patient_name : str
         Patient / customer name (for SI events)
     deducted_by : str
@@ -78,12 +88,8 @@ def append_stock_log(
         Free text note
     """
     try:
-        # Load the Pharmacy Item document
         pi_doc = frappe.get_doc("Pharmacy Item", pharmacy_item_name)
 
-        # Append a new row to the deduction_log child table
-        # This is the ONLY correct pattern — ensures naming series,
-        # idx, parent/parentfield/parenttype are all set correctly
         pi_doc.append("deduction_log", {
             "deduction_datetime": now_datetime(),
             "event_type":         event_type,
@@ -96,18 +102,16 @@ def append_stock_log(
             "selling_price":      flt(selling_price),
             "mrp_price":          flt(mrp_price),
             "warehouse":          warehouse or "",
+            "company":            company or "",
             "patient_name":       patient_name or "",
             "deducted_by":        deducted_by or frappe.session.user,
             "remarks":            remarks or "",
         })
 
-        # Save with ignore_permissions to avoid permission blocks
         pi_doc.save(ignore_permissions=True)
         frappe.db.commit()
 
     except Exception as e:
-        # Log errors but NEVER crash the parent transaction
-        # A logging failure must never block a SI/PI/SR submit or cancel
         frappe.log_error(
             f"Stock log write failed — item: {pharmacy_item_name}, "
             f"event: {event_type}, ref: {reference_no}\n"

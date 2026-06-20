@@ -13,24 +13,16 @@ BUSINESS LOGIC:
     destination company's NEW cost_price.
   - Destination warehouse is always the fixed "Finished Goods - <abbr>"
     warehouse for the receiving company.
-  - Full deduction_log integration:
-        Source company      -> event_type = "Transfer OUT"
-        Destination company -> event_type = "Transfer IN"
+  - Full deduction_log integration, now including `company`:
+        Source company      -> event_type = "Transfer OUT", company=from_company
+        Destination company -> event_type = "Transfer IN",  company=to_company
+  - Pharmacy Stock Transfer Item now also records from_selling_price
+    and from_mrp_price (live-fetched on the client side, written
+    again server-side on submit for data integrity).
 
   - Pharmacy Item stays a SINGLE global record per item_code.
-    Per-company stock breakdown lives in the new `company_stock`
-    child table (see utils/company_stock.py). The existing
-    `current_stock` field on Pharmacy Item remains the GLOBAL total
-    across all companies — fully backward compatible with all
-    existing reports and code.
-
-PREREQUISITES (must exist before this code runs):
-  1. Pharmacy Batch has a `company` Link field (added via Customize Form)
-  2. All existing batches backfilled with company = "Taalplus CHC Private Limited"
-  3. Pharmacy Item has a `company_stock` Table field (child: Pharmacy Item
-     Company Stock) added via Customize Form
-  4. DocType "Pharmacy Stock Transfer" + child "Pharmacy Stock Transfer Item"
-     created per the schema provided
+    Per-company stock breakdown lives in the `company_stock`
+    child table (see utils/company_stock.py).
 """
 
 import frappe
@@ -47,8 +39,9 @@ def on_submit(doc, method):
       3. Mark source batch Exhausted if remaining_qty becomes 0
       4. Create a NEW Pharmacy Batch at to_company
       5. Refresh company_stock child table rows on BOTH companies
-      6. Log "Transfer OUT" on source side, "Transfer IN" on destination side
-      7. Write new_batch reference back onto the transfer item row
+      6. Log "Transfer OUT" on source side, "Transfer IN" on destination
+         side — both with company recorded
+      7. Write new_batch + pricing reference fields back onto the row
     """
     from taal_inventory.utils.stock_log import append_stock_log
     from taal_inventory.utils.company_stock import recalculate_company_stock
@@ -146,19 +139,19 @@ def on_submit(doc, method):
         new_batch.insert(ignore_permissions=True)
         frappe.db.commit()
 
-        # Write the new batch reference back onto the transfer row
+        # Write batch references and pricing snapshot back onto the row
         frappe.db.set_value(
             "Pharmacy Stock Transfer Item", row.name,
             {
-                "new_batch":       new_batch.name,
-                "available_qty":   available,
-                "from_cost_price": source_batch.cost_price
+                "new_batch":          new_batch.name,
+                "available_qty":      available,
+                "from_cost_price":    source_batch.cost_price,
+                "from_selling_price": source_batch.selling_price,
+                "from_mrp_price":     source_batch.mrp_price
             }
         )
 
         # ── Step 5: Refresh company_stock on BOTH companies ────────────────────
-        # Pharmacy Item is the SAME single record — source_batch.item already
-        # equals new_batch.item since it's the same medicine
         pharmacy_item_name = source_batch.item
 
         source_company_stock = recalculate_company_stock(pharmacy_item_name, doc.from_company)
@@ -177,6 +170,7 @@ def on_submit(doc, method):
             selling_price=flt(source_batch.selling_price),
             mrp_price=flt(source_batch.mrp_price),
             warehouse=source_batch.warehouse or "",
+            company=doc.from_company,
             remarks=f"Transferred to {doc.to_company} via {doc.name} "
                     f"(company stock at source after: {source_company_stock})"
         )
@@ -194,6 +188,7 @@ def on_submit(doc, method):
             selling_price=to_selling_price,
             mrp_price=to_mrp_price,
             warehouse=destination_warehouse,
+            company=doc.to_company,
             remarks=f"Received from {doc.from_company} via {doc.name}, "
                     f"new batch {new_batch.batch_id} created "
                     f"(company stock at destination after: {dest_company_stock})"
@@ -221,7 +216,7 @@ def on_cancel(doc, method):
       2. Reactivate source batch if it was Exhausted
       3. Quarantine the NEW batch created at destination
       4. Refresh company_stock on both companies
-      5. Log reversal entries on both sides
+      5. Log reversal entries on both sides, each with correct company
     """
     from taal_inventory.utils.stock_log import append_stock_log
     from taal_inventory.utils.company_stock import recalculate_company_stock
@@ -265,6 +260,7 @@ def on_cancel(doc, method):
             selling_price=flt(source_batch.selling_price),
             mrp_price=flt(source_batch.mrp_price),
             warehouse=source_batch.warehouse or "",
+            company=doc.from_company,
             remarks=f"Cancelled Transfer {doc.name} — stock restored at source"
         )
 
@@ -281,6 +277,7 @@ def on_cancel(doc, method):
             selling_price=flt(new_batch.selling_price),
             mrp_price=flt(new_batch.mrp_price),
             warehouse=new_batch.warehouse or "",
+            company=doc.to_company,
             remarks=f"Cancelled Transfer {doc.name} — batch quarantined at destination"
         )
 
