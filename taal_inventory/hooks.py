@@ -9,6 +9,7 @@ app_license = "MIT"
 doctype_js = {
     "Stock Receipt":  "public/js/stock_receipt.js",
     "Sales Invoice":  "public/js/sales_invoice.js",
+    "Pharmacy Stock Transfer": "public/js/pharmacy_stock_transfer.js",
 }
 
 # ── Scheduler Jobs ──────────────────────────────────────────────
