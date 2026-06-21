@@ -2,14 +2,81 @@
 //
 // Client Script for Pharmacy Stock Transfer.
 //
+// FIX APPLIED: Replaced the unreliable
+//   frm.fields_dict.items.grid.get_field(...).get_query = ...
+// pattern (which returns undefined if the grid isn't fully
+// initialized at onload/refresh time) with the standard, reliable
+// frm.set_query() pattern. frm.set_query() registers the filter
+// against the fieldname declaratively and Frappe guarantees it is
+// applied whenever that field's dropdown is opened, regardless of
+// grid render timing.
+//
 // FEATURES:
-//   1. source_batch Link field is filtered to only show batches
+//   1. source_batch Link field filtered to only show batches
 //      matching the row's selected pharmacy_item AND from_company.
 //   2. On selecting source_batch, immediately (live, before submit)
 //      populates: available_qty, from_cost_price, from_selling_price,
 //      from_mrp_price — all fetched directly from the Pharmacy Batch.
 //   3. Validates company match and Active status, warns immediately.
 //   4. Validates qty does not exceed available_qty.
+
+frappe.ui.form.on("Pharmacy Stock Transfer", {
+
+    setup: function(frm) {
+        // setup() fires before onload/refresh and is the correct place
+        // to register set_query for child table fields — guaranteed
+        // to be available regardless of grid render timing.
+        frm.set_query("source_batch", "items", function(doc, cdt, cdn) {
+            var row = locals[cdt][cdn];
+            var filters = {
+                "status": "Active",
+                "remaining_qty": [">", 0]
+            };
+
+            if (frm.doc.from_company) {
+                filters["company"] = frm.doc.from_company;
+            }
+
+            if (row.pharmacy_item) {
+                filters["item"] = row.pharmacy_item;
+            }
+
+            return { filters: filters };
+        });
+    },
+
+    from_company: function(frm) {
+        // Re-validate all existing rows when from_company changes
+        if (frm.doc.items && frm.doc.items.length) {
+            frm.doc.items.forEach(function(row) {
+                if (row.source_batch) {
+                    frappe.db.get_value(
+                        "Pharmacy Batch", row.source_batch, "company"
+                    ).then(function(r) {
+                        if (r.message && r.message.company !== frm.doc.from_company) {
+                            frappe.show_alert({
+                                message: "⚠️ Row with batch " + row.source_batch +
+                                    " does not belong to the newly selected " +
+                                    "From Company. Please review.",
+                                indicator: "orange"
+                            }, 6);
+                        }
+                    });
+                }
+            });
+        }
+    },
+
+    to_company: function(frm) {
+        if (frm.doc.from_company && frm.doc.to_company &&
+            frm.doc.from_company === frm.doc.to_company) {
+            frappe.show_alert({
+                message: "⚠️ From Company and To Company cannot be the same.",
+                indicator: "red"
+            }, 6);
+        }
+    }
+});
 
 frappe.ui.form.on("Pharmacy Stock Transfer Item", {
 
@@ -19,6 +86,10 @@ frappe.ui.form.on("Pharmacy Stock Transfer Item", {
         // re-selection so the filter applies cleanly
         if (row.source_batch) {
             frappe.model.set_value(cdt, cdn, "source_batch", "");
+            frappe.model.set_value(cdt, cdn, "available_qty", 0);
+            frappe.model.set_value(cdt, cdn, "from_cost_price", 0);
+            frappe.model.set_value(cdt, cdn, "from_selling_price", 0);
+            frappe.model.set_value(cdt, cdn, "from_mrp_price", 0);
         }
     },
 
@@ -82,77 +153,3 @@ frappe.ui.form.on("Pharmacy Stock Transfer Item", {
         }
     }
 });
-
-frappe.ui.form.on("Pharmacy Stock Transfer", {
-
-    from_company: function(frm) {
-        // Re-validate all existing rows when from_company changes
-        if (frm.doc.items && frm.doc.items.length) {
-            frm.doc.items.forEach(function(row) {
-                if (row.source_batch) {
-                    frappe.db.get_value(
-                        "Pharmacy Batch", row.source_batch, "company"
-                    ).then(function(r) {
-                        if (r.message && r.message.company !== frm.doc.from_company) {
-                            frappe.show_alert({
-                                message: "⚠️ Row with batch " + row.source_batch +
-                                    " does not belong to the newly selected " +
-                                    "From Company. Please review.",
-                                indicator: "orange"
-                            }, 6);
-                        }
-                    });
-                }
-            });
-        }
-        // Refresh the source_batch filter on all rows
-        frm.fields_dict.items.grid.get_field("source_batch").get_query =
-            get_source_batch_query(frm);
-    },
-
-    to_company: function(frm) {
-        if (frm.doc.from_company && frm.doc.to_company &&
-            frm.doc.from_company === frm.doc.to_company) {
-            frappe.show_alert({
-                message: "⚠️ From Company and To Company cannot be the same.",
-                indicator: "red"
-            }, 6);
-        }
-    },
-
-    onload: function(frm) {
-        // Set up the source_batch filter as soon as the form loads
-        frm.fields_dict.items.grid.get_field("source_batch").get_query =
-            get_source_batch_query(frm);
-    },
-
-    refresh: function(frm) {
-        frm.fields_dict.items.grid.get_field("source_batch").get_query =
-            get_source_batch_query(frm);
-    }
-});
-
-// ── Filter Query: source_batch dropdown ───────────────────────
-// Only show batches that:
-//   1. Belong to the currently selected From Company
-//   2. Match the row's selected Pharmacy Item (if one is set)
-//   3. Are Active with remaining_qty > 0
-function get_source_batch_query(frm) {
-    return function(doc, cdt, cdn) {
-        var row = locals[cdt][cdn];
-        var filters = {
-            "status": "Active",
-            "remaining_qty": [">", 0]
-        };
-
-        if (frm.doc.from_company) {
-            filters["company"] = frm.doc.from_company;
-        }
-
-        if (row.pharmacy_item) {
-            filters["item"] = row.pharmacy_item;
-        }
-
-        return { filters: filters };
-    };
-}
