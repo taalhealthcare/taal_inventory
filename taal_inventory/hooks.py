@@ -9,7 +9,6 @@ app_license = "MIT"
 doctype_js = {
     "Stock Receipt":  "public/js/stock_receipt.js",
     "Sales Invoice":  "public/js/sales_invoice.js",
-    "Pharmacy Stock Transfer": "public/js/pharmacy_stock_transfer.js",
 }
 
 # ── Scheduler Jobs ──────────────────────────────────────────────
@@ -32,6 +31,7 @@ doc_events = {
     },
     "Stock Adjustment": {
         "on_submit": "taal_inventory.events.stock_receipt.on_adjustment_submit",
+        "on_cancel": "taal_inventory.events.stock_receipt.on_adjustment_cancel",
     },
     "Pharmacy Item": {
         "after_insert": "taal_inventory.events.pharmacy_item.after_insert",

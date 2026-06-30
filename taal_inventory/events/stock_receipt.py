@@ -1,19 +1,30 @@
 """
 taal_inventory/events/stock_receipt.py
 
-Handles Stock Receipt submit, cancel, and Stock Adjustment submit.
+Handles Stock Receipt submit, cancel, and Stock Adjustment submit/cancel.
 
 UPDATED FOR MULTI-COMPANY SUPPORT:
   - Stock Receipt has a mandatory `company` field. Every new Pharmacy
     Batch created from a Stock Receipt carries this company.
   - Every deduction_log entry now also records `company` for full
-    multi-company audit trail (Point 3 — Inter-Company Transfer).
+    multi-company audit trail.
   - Calls recalculate_company_stock() to keep Pharmacy Item's
     company_stock child table in sync on every submit/cancel.
+
+POINT 3 — STOCK ADJUSTMENT GL POSTING:
+  - on_adjustment_submit now posts a Journal Entry recording the
+    write-off loss (Debit Stock Adjustment, Credit Stock In Hand),
+    grouped per company, valued at batch cost_price x qty.
+  - "Opening Stock" adjustment type is GL-silent.
+  - on_adjustment_cancel restores stock AND cancels the Journal Entry.
 """
 
 import frappe
 from frappe.utils import now_datetime, flt
+
+
+# Adjustment types that should NOT post to GL
+_GL_SILENT_ADJUSTMENT_TYPES = ["Opening Stock"]
 
 
 def _get_pharmacy_item_name(row_item):
@@ -22,8 +33,8 @@ def _get_pharmacy_item_name(row_item):
     Item row's `item` field value.
 
     Stock Receipt stores either:
-      - The Pharmacy Item document name  (e.g. TPCHC-PI-2026-0055) — new
-      - The Pharmacy Item item_code      (e.g. TPCHC-PI-000054)    — old
+      - The Pharmacy Item document name  (e.g. TPCHC-PI-2026-0055) - new
+      - The Pharmacy Item item_code      (e.g. TPCHC-PI-000054)    - old
     """
     if not row_item:
         return None
@@ -80,7 +91,7 @@ def on_submit(doc, method):
         total_amount += line_total
         total_tax    += tax_amount
 
-        # Create Pharmacy Batch — tagged with company
+        # Create Pharmacy Batch - tagged with company
         batch = frappe.get_doc({
             "doctype":               "Pharmacy Batch",
             "item":                  pi_name,
@@ -134,7 +145,7 @@ def on_submit(doc, method):
         # Refresh company_stock child table AND global current_stock
         new_company_stock = recalculate_company_stock(pi_name, doc.company)
 
-        # Log Stock IN — with company
+        # Log Stock IN - with company
         append_stock_log(
             pharmacy_item_name=pi_name,
             event_type="Stock IN",
@@ -182,7 +193,7 @@ def on_cancel(doc, method):
             frappe.log_error(
                 f"SR Cancel: Pharmacy Item '{row.item}' not found "
                 f"(SR: {doc.name}, row #{row.idx}). Skipped.",
-                "SR Cancel — Item Not Found"
+                "SR Cancel - Item Not Found"
             )
             continue
 
@@ -222,7 +233,7 @@ def on_cancel(doc, method):
                 mrp_price=flt(b.mrp_price or 0),
                 warehouse=b.warehouse or "",
                 company=b.company,
-                remarks=f"Cancelled SR {doc.name} — batch quarantined"
+                remarks=f"Cancelled SR {doc.name} - batch quarantined"
             )
 
     frappe.db.set_value("Stock Receipt", doc.name, {
@@ -240,12 +251,19 @@ def on_adjustment_submit(doc, method):
     Logs "Stock OUT" with full pricing AND company to deduction_log.
     Refreshes company_stock for the batch's company.
 
-    NOTE: Stock Adjustment Item.item is a direct Link → Pharmacy Item.
-    Stock Adjustment Item.batch_id is a direct Link → Pharmacy Batch,
-    which already carries its own `company` field — read from there.
+    POINT 3: posts a Journal Entry recording the write-off loss,
+    grouped per company, valued at batch cost_price x qty. Skips GL
+    for "Opening Stock" adjustment type.
+
+    NOTE: Stock Adjustment Item.item is a direct Link -> Pharmacy Item.
+    Stock Adjustment Item.batch_id is a direct Link -> Pharmacy Batch,
+    which already carries its own `company` field - read from there.
     """
     from taal_inventory.utils.stock_log import append_stock_log
     from taal_inventory.utils.company_stock import recalculate_company_stock
+
+    # Accumulate write-off value per company for the Journal Entry(ies)
+    company_loss_totals = {}
 
     for row in doc.items:
         batch = frappe.get_doc("Pharmacy Batch", row.batch_id)
@@ -270,7 +288,7 @@ def on_adjustment_submit(doc, method):
 
         adj_type = doc.adjustment_type or ""
         reason   = doc.reason or ""
-        remarks  = f"{adj_type} adjustment — {reason}" if reason else adj_type
+        remarks  = f"{adj_type} adjustment - {reason}" if reason else adj_type
 
         append_stock_log(
             pharmacy_item_name=row.item,
@@ -288,7 +306,137 @@ def on_adjustment_submit(doc, method):
             remarks=remarks
         )
 
+        # Accumulate loss value for GL (skip if GL-silent type)
+        if adj_type not in _GL_SILENT_ADJUSTMENT_TYPES:
+            loss_value = flt(row.qty) * flt(batch.cost_price or 0)
+            if loss_value > 0:
+                company = batch.company
+                if company not in company_loss_totals:
+                    company_loss_totals[company] = 0
+                company_loss_totals[company] += loss_value
+
     frappe.db.commit()
+
+    # Post Journal Entry per company (POINT 3)
+    for company, total_loss in company_loss_totals.items():
+        if total_loss <= 0:
+            continue
+        _post_adjustment_journal_entry(doc, company, total_loss)
+
+    frappe.db.commit()
+
+
+def on_adjustment_cancel(doc, method):
+    """
+    POINT 3: Handles Stock Adjustment cancel.
+    Restores stock to the batch (reverses the write-off), logs Reversal IN,
+    refreshes company_stock, and cancels the linked Journal Entry.
+    """
+    from taal_inventory.utils.stock_log import append_stock_log
+    from taal_inventory.utils.company_stock import recalculate_company_stock
+
+    for row in doc.items:
+        batch = frappe.get_doc("Pharmacy Batch", row.batch_id)
+
+        # Restore the adjusted quantity back to the batch
+        restored_qty = flt(batch.remaining_qty) + flt(row.qty)
+        new_status   = "Active" if restored_qty > 0 else "Exhausted"
+
+        frappe.db.set_value("Pharmacy Batch", batch.name, {
+            "remaining_qty": restored_qty,
+            "status":        new_status
+        })
+
+        new_company_stock = recalculate_company_stock(row.item, batch.company)
+
+        append_stock_log(
+            pharmacy_item_name=row.item,
+            event_type="Reversal IN",
+            reference_doctype="Stock Adjustment",
+            reference_no=doc.name,
+            batch_id=row.batch_id,
+            qty=flt(row.qty),
+            balance_after=new_company_stock,
+            cost_price=flt(batch.cost_price or 0),
+            selling_price=flt(batch.selling_price or 0),
+            mrp_price=flt(batch.mrp_price or 0),
+            warehouse=doc.warehouse or batch.warehouse or "",
+            company=batch.company,
+            remarks=f"Cancelled Stock Adjustment {doc.name} - stock restored"
+        )
+
+    # Cancel the linked Journal Entry(ies) (POINT 3)
+    linked_jes = frappe.get_all(
+        "Journal Entry",
+        filters={
+            "cheque_no": doc.name,          # SA name stamped here on creation
+            "docstatus": 1
+        },
+        fields=["name"]
+    )
+    for je in linked_jes:
+        je_doc = frappe.get_doc("Journal Entry", je.name)
+        je_doc.cancel()
+
+    frappe.db.commit()
+
+
+def _post_adjustment_journal_entry(doc, company, total_loss):
+    """
+    Creates and submits a Journal Entry recording a stock write-off loss
+    for one company.
+
+        Debit   Stock Adjustment - {company}   (expense / loss -> P&L)
+        Credit  Stock In Hand - {company}        (asset reduction)
+
+    The Stock Adjustment name is stamped into cheque_no so the cancel
+    handler can find and reverse this JE.
+    """
+    loss_account  = frappe.db.get_value("Company", company, "stock_adjustment_account")
+    stock_account = frappe.db.get_value("Company", company, "default_inventory_account")
+    cost_center   = frappe.db.get_value("Company", company, "cost_center")
+
+    if not loss_account or not stock_account:
+        frappe.log_error(
+            f"Stock Adjustment {doc.name}: missing loss/stock account for "
+            f"company {company}. JE not posted.",
+            "Stock Adjustment GL - Missing Account"
+        )
+        return
+
+    je = frappe.get_doc({
+        "doctype": "Journal Entry",
+        "voucher_type": "Journal Entry",
+        "company": company,
+        "posting_date": doc.adjustment_date or frappe.utils.nowdate(),
+        "cheque_no": doc.name,                       # link back to the SA
+        "cheque_date": doc.adjustment_date or frappe.utils.nowdate(),
+        "user_remark": (
+            f"Stock write-off ({doc.adjustment_type}) via Stock Adjustment "
+            f"{doc.name}. Reason: {doc.reason or 'N/A'}"
+        ),
+        "accounts": [
+            {
+                "account": loss_account,
+                "debit_in_account_currency": total_loss,
+                "cost_center": cost_center
+            },
+            {
+                "account": stock_account,
+                "credit_in_account_currency": total_loss,
+                "cost_center": cost_center
+            }
+        ]
+    })
+    je.insert(ignore_permissions=True)
+    je.submit()
+
+    frappe.msgprint(
+        f"Stock write-off of "
+        f"{frappe.utils.fmt_money(total_loss, currency='INR')} "
+        f"posted to accounts ({company}) - Journal Entry {je.name}.",
+        alert=True
+    )
 
 
 def _sync_item_price(item_code, selling_price, batch_name, expiry_date):
