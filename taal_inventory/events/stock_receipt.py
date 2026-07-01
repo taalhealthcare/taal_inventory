@@ -386,19 +386,23 @@ def _post_adjustment_journal_entry(doc, company, total_loss):
     Creates and submits a Journal Entry recording a stock write-off loss
     for one company.
 
-        Debit   Stock Adjustment - {company}   (expense / loss -> P&L)
-        Credit  Stock In Hand - {company}        (asset reduction)
+        Debit   Stock Adjustment - {company}                (expense -> P&L)
+        Credit  Stock Received But Not Billed - {company}     (stock value out)
+
+    NOTE: We credit SRBNB (a Liability account), NOT Stock In Hand.
+    Stock In Hand is account_type "Stock" which ERPNext protects from
+    manual Journal Entries. SRBNB holds the stock's value in this setup.
 
     The Stock Adjustment name is stamped into cheque_no so the cancel
     handler can find and reverse this JE.
     """
     loss_account  = frappe.db.get_value("Company", company, "stock_adjustment_account")
-    stock_account = frappe.db.get_value("Company", company, "default_inventory_account")
+    srbnb_account = frappe.db.get_value("Company", company, "stock_received_but_not_billed")
     cost_center   = frappe.db.get_value("Company", company, "cost_center")
 
-    if not loss_account or not stock_account:
+    if not loss_account or not srbnb_account:
         frappe.log_error(
-            f"Stock Adjustment {doc.name}: missing loss/stock account for "
+            f"Stock Adjustment {doc.name}: missing loss/SRBNB account for "
             f"company {company}. JE not posted.",
             "Stock Adjustment GL - Missing Account"
         )
@@ -422,7 +426,7 @@ def _post_adjustment_journal_entry(doc, company, total_loss):
                 "cost_center": cost_center
             },
             {
-                "account": stock_account,
+                "account": srbnb_account,
                 "credit_in_account_currency": total_loss,
                 "cost_center": cost_center
             }
