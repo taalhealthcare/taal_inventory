@@ -5,18 +5,25 @@ Handles Purchase Invoice submit and cancel for pharmacy stock.
 
 THREE scenarios on submit per pharmacy row:
 
-  SCENARIO 1 — NEW BATCH (batch_id never seen before)
+  SCENARIO 1 - NEW BATCH (batch_id never seen before)
     Creates Pharmacy Batch (tagged with doc.company), updates
     current_stock, syncs Item Price, logs "Stock IN" with company.
 
-  SCENARIO 2 — OPENING STOCK BATCH
-    (batch exists, no SR, no PI linked — imported as opening balance)
+  SCENARIO 2 - OPENING STOCK BATCH
+    (batch exists, no SR, no PI linked - imported as opening balance)
     PI is finance-only: links PI to batch, logs "Stock IN" (finance-only)
     with company. Does NOT create duplicate batch or change stock.
 
-  SCENARIO 3 — REAL TRANSACTION DUPLICATE
+  SCENARIO 3 - REAL TRANSACTION DUPLICATE
     (batch exists AND linked to another SR or PI)
     Blocks submit with clear error.
+
+POINT 4 - REAL-TIME STOCK-IN-HAND RECLASSIFICATION:
+  After the PI's own GL is posted, ERPNext parks the stock value in
+  "Stock Received But Not Billed" (SRBNB). _sweep_srbnb_to_inventory()
+  immediately posts a Journal Entry moving THIS PI's SRBNB debit into
+  "Stock In Hand (Inventory) - {abbr}" so purchased stock shows as an
+  ASSET on the Balance Sheet in real time. on_cancel reverses that JE.
 """
 
 import frappe
@@ -28,6 +35,23 @@ DEFAULT_WAREHOUSE = "Finished Goods - TM"
 _BATCH_CREATE    = "create"
 _BATCH_FINANCE   = "finance"
 _BATCH_DUPLICATE = "duplicate"
+
+
+# Maps each company to its SRBNB source account and inventory-asset target.
+# The inventory account is the non-protected Asset account created for
+# Point 4 (Stock In Hand (Inventory)) that shows under Current Assets.
+_INVENTORY_SWEEP_CONFIG = {
+    "Taalplus CHC Private Limited": {
+        "srbnb":       "Stock Received But Not Billed - TPC",
+        "inventory":   "Stock In Hand (Inventory) - TPC",
+        "cost_center": "Main - TPC",
+    },
+    "NMP_Taal Plus": {
+        "srbnb":       "Stock Received But Not Billed - NP",
+        "inventory":   "Stock In Hand (Inventory) - NP",
+        "cost_center": "Main - NP",
+    },
+}
 
 
 def on_submit(doc, method):
@@ -61,7 +85,7 @@ def on_submit(doc, method):
         if outcome == _BATCH_DUPLICATE:
             return
 
-        # ── SCENARIO 2: Finance-only (opening stock batch) ────────────────────
+        # -- SCENARIO 2: Finance-only (opening stock batch) --------------------
         if outcome == _BATCH_FINANCE:
             frappe.db.set_value(
                 "Pharmacy Batch",
@@ -94,7 +118,7 @@ def on_submit(doc, method):
                 warehouse=getattr(existing_batch_doc, "warehouse", ""),
                 company=doc.company,
                 remarks=(
-                    f"Finance-only — opening stock batch "
+                    f"Finance-only - opening stock batch "
                     f"{row.custom_batch_id} linked to PI {doc.name}"
                 )
             )
@@ -103,7 +127,7 @@ def on_submit(doc, method):
                 f"Row #{row.idx} ({row.item_name}): Batch "
                 f"<b>{row.custom_batch_id}</b> already exists as opening "
                 f"stock (<b>{existing_batch_doc.name}</b>).<br>"
-                f"Purchase Invoice recorded as <b>finance-only</b> — "
+                f"Purchase Invoice recorded as <b>finance-only</b> - "
                 f"no duplicate batch created, stock is unchanged.<br>"
                 f"Batch linked to this PI for traceability.",
                 title="Finance-Only Row",
@@ -111,7 +135,7 @@ def on_submit(doc, method):
             )
             continue
 
-        # ── SCENARIO 1: New batch — create everything ─────────────────────────
+        # -- SCENARIO 1: New batch - create everything -------------------------
         pi = frappe.get_doc("Pharmacy Item", pharmacy_item_name)
 
         gst_pct = flt(row.igst_rate or 0) or (
@@ -191,6 +215,9 @@ def on_submit(doc, method):
 
     frappe.db.commit()
 
+    # -- POINT 4: real-time SRBNB -> Stock In Hand (Inventory) sweep -----------
+    _sweep_srbnb_to_inventory(doc)
+
     parts = []
     if batches_created:
         parts.append(
@@ -199,7 +226,7 @@ def on_submit(doc, method):
     if finance_only_rows:
         parts.append(
             f"{finance_only_rows} row(s) recorded as finance-only "
-            f"(opening stock — batch already in system, stock unchanged)"
+            f"(opening stock - batch already in system, stock unchanged)"
         )
     if parts:
         frappe.msgprint(
@@ -212,17 +239,23 @@ def on_cancel(doc, method):
     """
     Triggered when Purchase Invoice is cancelled.
 
-    CASE A — Finance-only (qty_received = 0):
+    CASE A - Finance-only (qty_received = 0):
         Unlinks PI from batch. Logs Reversal OUT with qty=0 and company.
 
-    CASE B — Real batch (qty_received > 0):
+    CASE B - Real batch (qty_received > 0):
         Quarantines batch, reverses remaining_qty from current_stock.
         Logs Reversal OUT with actual qty and company.
+
+    POINT 4: also cancels the SRBNB -> Inventory sweep Journal Entry
+    created at submit, so the reclassification is cleanly reversed.
     """
     from taal_inventory.utils.stock_log import append_stock_log
 
     if doc.is_return:
         return
+
+    # -- POINT 4: reverse the inventory sweep JE first -------------------------
+    _reverse_inventory_sweep(doc)
 
     batches = frappe.get_all(
         "Pharmacy Batch",
@@ -239,7 +272,7 @@ def on_cancel(doc, method):
         remaining    = flt(b.remaining_qty or 0)
 
         if qty_received == 0:
-            # CASE A: Finance-only — unlink only
+            # CASE A: Finance-only - unlink only
             frappe.db.set_value(
                 "Pharmacy Batch", b.name,
                 "purchase_invoice", None
@@ -265,13 +298,13 @@ def on_cancel(doc, method):
                 warehouse=b.warehouse or "",
                 company=b.company,
                 remarks=(
-                    f"Cancelled PI {doc.name} — finance-only batch "
+                    f"Cancelled PI {doc.name} - finance-only batch "
                     f"unlinked (opening stock, no stock change)"
                 )
             )
 
         else:
-            # CASE B: Real batch — quarantine + reverse stock
+            # CASE B: Real batch - quarantine + reverse stock
             frappe.db.set_value(
                 "Pharmacy Batch", b.name,
                 "status", "Quarantined"
@@ -298,7 +331,7 @@ def on_cancel(doc, method):
                 warehouse=b.warehouse or "",
                 company=b.company,
                 remarks=(
-                    f"Cancelled PI {doc.name} — batch quarantined, "
+                    f"Cancelled PI {doc.name} - batch quarantined, "
                     f"{remaining} units reversed from stock"
                 )
             )
@@ -306,14 +339,114 @@ def on_cancel(doc, method):
     frappe.db.commit()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# POINT 4 - INVENTORY RECLASSIFICATION HELPERS
+# -----------------------------------------------------------------------------
+
+def _sweep_srbnb_to_inventory(doc):
+    """
+    After a Purchase Invoice posts, ERPNext parks the stock value in SRBNB.
+    This moves THIS invoice's SRBNB debit into the Stock In Hand (Inventory)
+    asset account via a Journal Entry, so purchased stock shows as an ASSET
+    on the Balance Sheet in real time.
+
+    The amount is read directly from THIS PI's own GL entries (the SRBNB
+    debit for this voucher), so it's always exact - no recalculation.
+
+    The PI name is stamped into the JE's cheque_no so on_cancel can find
+    and reverse it.
+    """
+    cfg = _INVENTORY_SWEEP_CONFIG.get(doc.company)
+    if not cfg:
+        # Company not configured for inventory reclassification - skip safely.
+        return
+
+    # Read the SRBNB debit that THIS PI posted (net of any credit).
+    srbnb_rows = frappe.get_all(
+        "GL Entry",
+        filters={
+            "voucher_no": doc.name,
+            "account": cfg["srbnb"],
+            "is_cancelled": 0,
+        },
+        fields=["debit", "credit"]
+    )
+
+    srbnb_value = 0
+    for r in srbnb_rows:
+        srbnb_value += flt(r.debit) - flt(r.credit)
+
+    # Nothing parked in SRBNB for this PI (e.g. finance-only) - nothing to do.
+    if srbnb_value <= 0:
+        return
+
+    je = frappe.get_doc({
+        "doctype": "Journal Entry",
+        "voucher_type": "Journal Entry",
+        "company": doc.company,
+        "posting_date": doc.posting_date or frappe.utils.nowdate(),
+        "cheque_no": doc.name,                       # link back to the PI
+        "cheque_date": doc.posting_date or frappe.utils.nowdate(),
+        "user_remark": (
+            f"Auto-reclassification: move stock value {srbnb_value} from "
+            f"Stock Received But Not Billed to Stock In Hand (Inventory) "
+            f"for Purchase Invoice {doc.name}."
+        ),
+        "accounts": [
+            {
+                "account": cfg["inventory"],
+                "debit_in_account_currency": srbnb_value,
+                "cost_center": cfg["cost_center"],
+            },
+            {
+                "account": cfg["srbnb"],
+                "credit_in_account_currency": srbnb_value,
+                "cost_center": cfg["cost_center"],
+            },
+        ]
+    })
+    je.insert(ignore_permissions=True)
+    je.submit()
+    frappe.db.commit()
+
+    frappe.msgprint(
+        f"Stock value of "
+        f"{frappe.utils.fmt_money(srbnb_value, currency='INR')} "
+        f"reclassified to Stock In Hand (Inventory) - Journal Entry "
+        f"{je.name}.",
+        alert=True
+    )
+
+
+def _reverse_inventory_sweep(doc):
+    """
+    Cancels the SRBNB -> Inventory sweep Journal Entry that was created for
+    this Purchase Invoice at submit (found via cheque_no = PI name).
+    """
+    linked_jes = frappe.get_all(
+        "Journal Entry",
+        filters={
+            "cheque_no": doc.name,
+            "docstatus": 1,
+        },
+        fields=["name"]
+    )
+    for je in linked_jes:
+        je_doc = frappe.get_doc("Journal Entry", je.name)
+        je_doc.cancel()
+
+    if linked_jes:
+        frappe.db.commit()
+
+
+# -----------------------------------------------------------------------------
 # INTERNAL HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _resolve_batch_situation(row, doc):
     """
     Determines what to do with the batch_id on this row.
-    Defensive two-stage fetch — avoids Unknown column SQL errors.
+    Defensive two-stage fetch - avoids Unknown column SQL errors.
     """
     if not row.custom_batch_id:
         return _BATCH_CREATE, None
