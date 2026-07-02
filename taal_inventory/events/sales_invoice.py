@@ -2,14 +2,35 @@
 taal_inventory/events/sales_invoice.py
 
 Handles Sales Invoice submit and cancel for pharmacy stock.
-  on_submit : FEFO deduction — nearest expiry batch consumed first.
+  on_submit : FEFO deduction - nearest expiry batch consumed first.
               Logs "Stock OUT" per batch consumed, with company.
+              POINT 4 (COGS): posts Dr Cost of Goods Sold / Cr Stock In
+              Hand (Inventory) for the cost of stock sold, per company.
   on_cancel : Reverses FEFO deduction, restores batch qty and stock.
               Logs "Reversal IN" per batch restored, with company.
+              POINT 4 (COGS): cancels the COGS Journal Entry.
 """
 
 import frappe
 from frappe.utils import today, now_datetime, flt
+
+
+# Per-company accounts for the COGS-on-sale posting (Point 4).
+# Cr side uses the non-protected "Stock In Hand (Inventory)" account
+# (same account Purchase Invoices sweep stock value INTO), so stock
+# value flows out at cost when sold - matching the accountant's Step 4.
+_COGS_CONFIG = {
+    "Taalplus CHC Private Limited": {
+        "cogs":        "Cost of Goods Sold - TPC",
+        "inventory":   "Stock In Hand (Inventory) - TPC",
+        "cost_center": "Main - TPC",
+    },
+    "NMP_Taal Plus": {
+        "cogs":        "Cost of Goods Sold - NP",
+        "inventory":   "Stock In Hand (Inventory) - NP",
+        "cost_center": "Main - NP",
+    },
+}
 
 
 @frappe.whitelist()
@@ -106,9 +127,15 @@ def get_total_available_qty(item_code):
 def on_submit(doc, method):
     """
     Triggered when Sales Invoice is submitted.
-    FEFO deduction — nearest expiry batch consumed first.
+    FEFO deduction - nearest expiry batch consumed first.
     Logs each deduction as "Stock OUT" in deduction_log, with company.
+
+    POINT 4 (COGS): accumulates the cost of stock consumed per company,
+    then posts a Cost of Goods Sold Journal Entry after all items.
     """
+    # Accumulate COGS value per company across all line items.
+    company_cogs_totals = {}
+
     for row in doc.items:
         pharmacy_items = frappe.get_all(
             "Pharmacy Item",
@@ -126,7 +153,21 @@ def on_submit(doc, method):
             continue
 
         pi_name = pharmacy_items[0].name
-        _deduct_fefo(doc=doc, row=row, pi_name=pi_name)
+        consumed = _deduct_fefo(doc=doc, row=row, pi_name=pi_name)
+
+        # Accumulate cost of goods sold per company (Point 4)
+        for entry in consumed:
+            company = entry["company"]
+            cogs_value = flt(entry["qty"]) * flt(entry["cost_price"])
+            if cogs_value > 0 and company:
+                if company not in company_cogs_totals:
+                    company_cogs_totals[company] = 0
+                company_cogs_totals[company] += cogs_value
+
+    # Post COGS Journal Entry per company (Point 4)
+    for company, total_cogs in company_cogs_totals.items():
+        if total_cogs > 0:
+            _post_cogs_journal_entry(doc, company, total_cogs)
 
 
 def on_cancel(doc, method):
@@ -139,10 +180,16 @@ def on_cancel(doc, method):
       3. Recalculate current_stock on Pharmacy Item
       4. Append "Reversal IN" to deduction_log, with company
 
-    KEY FIX: flt() on log.qty_deducted — frappe.get_all returns
+    POINT 4 (COGS): cancels the COGS Journal Entry so the inventory
+    value is restored and COGS reversed.
+
+    KEY FIX: flt() on log.qty_deducted - frappe.get_all returns
     Float child table fields as strings, causing TypeError on arithmetic.
     """
     from taal_inventory.utils.stock_log import append_stock_log
+
+    # POINT 4: reverse the COGS JE(s) first
+    _reverse_cogs_journal_entry(doc)
 
     for row in doc.items:
         pharmacy_items = frappe.get_all(
@@ -218,7 +265,7 @@ def on_cancel(doc, method):
                 warehouse=batch_data.get("warehouse", ""),
                 company=batch_data.get("company", ""),
                 patient_name=patient,
-                remarks=f"Cancelled SI {doc.name} — stock restored"
+                remarks=f"Cancelled SI {doc.name} - stock restored"
             )
 
         frappe.db.commit()
@@ -230,6 +277,8 @@ def _deduct_fefo(doc, row, pi_name):
     Nearest expiry batch consumed first.
     Deducts across multiple batches if qty spans them.
     Logs each batch consumed as "Stock OUT" in deduction_log, with company.
+
+    RETURNS the `consumed` list so the caller can compute COGS (Point 4).
     """
     from taal_inventory.utils.stock_log import append_stock_log
 
@@ -323,6 +372,88 @@ def _deduct_fefo(doc, row, pi_name):
             f"{str(notify_err)}",
             "Stock Alert Notification Error"
         )
+
+    return consumed
+
+
+def _post_cogs_journal_entry(doc, company, total_cogs):
+    """
+    POINT 4: Post Cost of Goods Sold for a sale (per company).
+
+        Dr Cost of Goods Sold - {abbr}         (expense -> P&L)
+        Cr Stock In Hand (Inventory) - {abbr}   (inventory asset reduced)
+
+    Valued at FEFO batch cost (qty consumed x cost_price). The SI name
+    is stamped into cheque_no so on_cancel can find and reverse this JE.
+
+    Per the accountant's rule: this posts COGS only - NOT profit.
+    Profit (Sales - COGS) is computed in reports, never posted here.
+    """
+    cfg = _COGS_CONFIG.get(company)
+    if not cfg:
+        # Company not configured for COGS posting - skip safely.
+        return
+
+    cogs_account = cfg["cogs"]
+    inv_account  = cfg["inventory"]
+    cost_center  = cfg["cost_center"]
+
+    je = frappe.get_doc({
+        "doctype": "Journal Entry",
+        "voucher_type": "Journal Entry",
+        "company": company,
+        "posting_date": doc.posting_date or frappe.utils.nowdate(),
+        "cheque_no": doc.name,                       # link back to the SI
+        "cheque_date": doc.posting_date or frappe.utils.nowdate(),
+        "user_remark": (
+            f"Cost of Goods Sold for Sales Invoice {doc.name} "
+            f"(FEFO batch cost). Inventory reduced at cost."
+        ),
+        "accounts": [
+            {
+                "account": cogs_account,
+                "debit_in_account_currency": total_cogs,
+                "cost_center": cost_center,
+            },
+            {
+                "account": inv_account,
+                "credit_in_account_currency": total_cogs,
+                "cost_center": cost_center,
+            },
+        ]
+    })
+    je.insert(ignore_permissions=True)
+    je.submit()
+    frappe.db.commit()
+
+    frappe.msgprint(
+        f"Cost of Goods Sold "
+        f"{frappe.utils.fmt_money(total_cogs, currency='INR')} "
+        f"posted ({company}) - Journal Entry {je.name}.",
+        alert=True
+    )
+
+
+def _reverse_cogs_journal_entry(doc):
+    """
+    POINT 4: Cancel the COGS Journal Entry(ies) created for this Sales
+    Invoice at submit (found via cheque_no = SI name), restoring
+    inventory value and reversing COGS.
+    """
+    linked_jes = frappe.get_all(
+        "Journal Entry",
+        filters={
+            "cheque_no": doc.name,
+            "docstatus": 1,
+        },
+        fields=["name"]
+    )
+    for je in linked_jes:
+        je_doc = frappe.get_doc("Journal Entry", je.name)
+        je_doc.cancel()
+
+    if linked_jes:
+        frappe.db.commit()
 
 
 def _recalculate_stock(pi_name):
