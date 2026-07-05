@@ -4,9 +4,12 @@
 //  Page : woocommerce-dashboard
 //  URL  : /app/woocommerce-dashboard
 //
-//  Every card, chart and section shows the active period label.
-//  All Online metrics filter to woocommerce_status IN (Shipped, Processing).
-//  Date presets use pure JavaScript — no Frappe date helpers needed.
+//  v2 changes:
+//    - Defaults to Current Month on page load
+//    - Date range display bar beside toolbar buttons
+//    - _monthsAgo anchors to 1st of start month
+//    - Period bar shows correct note for Online vs Offline
+//    - Top customer tie-aware (handled in Python, displayed here)
 // ================================================================
 
 frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
@@ -16,24 +19,17 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
         single_column: true
     });
 
-    window._woo_page_ref    = page;
-    window._woo_mode        = "online";
-    window._woo_from_date   = null;
-    window._woo_to_date     = null;
+    window._woo_page_ref     = page;
+    window._woo_mode         = "online";
+    window._woo_from_date    = null;
+    window._woo_to_date      = null;
     window._woo_period_label = "All Time";
     window._woo_period_range = "";
 
-    page.add_inner_button(__("Refresh"), function () {
-        _dash_load(window._woo_mode, window._woo_from_date,
-                   window._woo_to_date, window._woo_period_label);
-    });
-
-    // ── Pure-JS date helpers (frappe.datetime.month_start etc
-    //    do NOT exist in Frappe v15 — never use them) ──────────
+    // ── Pure-JS date helpers ──────────────────────────────────
     function _pad(n) { return String(n).padStart(2, "0"); }
 
     function _fmt(d) {
-        // Returns YYYY-MM-DD from a Date object
         return d.getFullYear() + "-" + _pad(d.getMonth() + 1) + "-" + _pad(d.getDate());
     }
 
@@ -42,52 +38,88 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
     }
 
     function _monthEnd(dateStr) {
-        var p = dateStr.split("-");
+        var p    = dateStr.split("-");
         var last = new Date(parseInt(p[0]), parseInt(p[1]), 0).getDate();
         return p[0] + "-" + p[1] + "-" + _pad(last);
     }
 
     function _weekStart(dateStr) {
         var d   = new Date(dateStr);
-        var day = d.getDay();                      // 0=Sun
-        var diff = (day === 0) ? -6 : 1 - day;    // to Monday
+        var day = d.getDay();
+        var diff = (day === 0) ? -6 : 1 - day;
         d.setDate(d.getDate() + diff);
         return _fmt(d);
     }
 
+    // Returns 1st of the month N months before dateStr's month
     function _monthsAgo(dateStr, n) {
         var p = dateStr.split("-");
         var y = parseInt(p[0]), m = parseInt(p[1]) - n;
         while (m <= 0) { m += 12; y -= 1; }
-        var mm  = _pad(m);
-        var last = new Date(y, m, 0).getDate();
-        var dd  = _pad(Math.min(parseInt(p[2]), last));
-        return y + "-" + mm + "-" + dd;
+        return y + "-" + _pad(m) + "-01";
     }
 
-    // Friendly display of date range, e.g. "Apr 24, 2026" or "Apr 1 – Apr 24, 2026"
     function _rangeDisplay(fd, td) {
         if (!fd || !td) return "";
         var months = ["Jan","Feb","Mar","Apr","May","Jun",
                       "Jul","Aug","Sep","Oct","Nov","Dec"];
-        var fd_parts = fd.split("-"), td_parts = td.split("-");
-        var fdStr = months[parseInt(fd_parts[1])-1] + " " + parseInt(fd_parts[2]) + ", " + fd_parts[0];
-        var tdStr = months[parseInt(td_parts[1])-1] + " " + parseInt(td_parts[2]) + ", " + td_parts[0];
+        var fp = fd.split("-"), tp = td.split("-");
+        var fdStr = months[parseInt(fp[1])-1] + " " + parseInt(fp[2]) + ", " + fp[0];
+        var tdStr = months[parseInt(tp[1])-1] + " " + parseInt(tp[2]) + ", " + tp[0];
         return fd === td ? fdStr : fdStr + " – " + tdStr;
     }
 
+    // ── Date bar injected beside toolbar ─────────────────────
+    var $dateBar = $(
+        '<div id="dw-datebar" style="'
+        + 'display:inline-flex;align-items:center;gap:6px;'
+        + 'background:#f8fafc;border:1.5px solid #e2e8f0;'
+        + 'border-radius:8px;padding:5px 12px;'
+        + 'font-size:12px;font-weight:500;color:#374151;'
+        + 'margin-right:6px;white-space:nowrap;cursor:default;'
+        + 'transition:border-color .2s,background .2s'
+        + '">'
+        + '<svg width="13" height="13" viewBox="0 0 14 14" fill="none" style="flex-shrink:0">'
+        + '<rect x="1" y="2" width="12" height="11" rx="2" stroke="#94a3b8" stroke-width="1.3"/>'
+        + '<path d="M4 1v2M10 1v2M1 5h12" stroke="#94a3b8" stroke-width="1.3" stroke-linecap="round"/>'
+        + '</svg>'
+        + '<span id="dw-datebar-label" style="color:#64748b"></span>'
+        + '<span id="dw-datebar-range" style="color:#374151;font-weight:600"></span>'
+        + '</div>'
+    );
+    $(page.wrapper).find('.page-actions').prepend($dateBar);
+
+    window._update_datebar = function (label, fd, td) {
+        var rangeStr = _rangeDisplay(fd, td);
+        if (!label || label === "All Time") {
+            $('#dw-datebar-label').text("All Time");
+            $('#dw-datebar-range').text("");
+            $('#dw-datebar').css({ 'border-color': '#e2e8f0', 'background': '#f8fafc' });
+        } else {
+            $('#dw-datebar-label').text(label + ":  ");
+            $('#dw-datebar-range').text(rangeStr);
+            $('#dw-datebar').css({ 'border-color': '#F59E0B', 'background': '#FFFBEB' });
+        }
+    };
+
+    // ── Refresh button ────────────────────────────────────────
+    page.add_inner_button(__("Refresh"), function () {
+        _dash_load(window._woo_mode, window._woo_from_date,
+                   window._woo_to_date, window._woo_period_label);
+    });
+
     // ── Date preset buttons ───────────────────────────────────
     var presets = [
-        { label: "Today",           abbr: "Today" },
-        { label: "This Week",       abbr: "This Week" },
-        { label: "This Month",      abbr: "This Month" },
-        { label: "Last 3 Months",   abbr: "Last 3 Months" },
-        { label: "Last 6 Months",   abbr: "Last 6 Months" }
+        { label: "Today"         },
+        { label: "This Week"     },
+        { label: "This Month"    },
+        { label: "Last 3 Months" },
+        { label: "Last 6 Months" }
     ];
 
     presets.forEach(function (preset) {
         page.add_inner_button(__(preset.label), function () {
-            var today = frappe.datetime.get_today();   // YYYY-MM-DD ✓ always works
+            var today = frappe.datetime.get_today();
             var fd, td;
 
             if      (preset.label === "Today")         { fd = today;                  td = today; }
@@ -106,7 +138,7 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
             window._woo_period_label = preset.label;
             window._woo_period_range = _rangeDisplay(fd, td);
 
-            console.log("[Dashboard] Preset:", preset.label, "| fd:", fd, "| td:", td);
+            window._update_datebar(preset.label, fd, td);
             _dash_load(window._woo_mode, fd, td, preset.label);
         }, __("Date Presets"));
     });
@@ -116,11 +148,25 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
         window._woo_to_date      = null;
         window._woo_period_label = "All Time";
         window._woo_period_range = "";
+        window._update_datebar("All Time", null, null);
         _dash_load(window._woo_mode, null, null, "All Time");
     }, __("Date Presets"));
 
+    // ── Styles & default load: Current Month ─────────────────
     _dash_styles();
-    _dash_load("online", null, null, "All Time");
+
+    var _today       = frappe.datetime.get_today();
+    var _defaultFd   = _monthStart(_today);
+    var _defaultTd   = _today;
+    var _defaultLbl  = "This Month";
+
+    window._woo_from_date    = _defaultFd;
+    window._woo_to_date      = _defaultTd;
+    window._woo_period_label = _defaultLbl;
+    window._woo_period_range = _rangeDisplay(_defaultFd, _defaultTd);
+
+    window._update_datebar(_defaultLbl, _defaultFd, _defaultTd);
+    _dash_load("online", _defaultFd, _defaultTd, _defaultLbl);
 };
 
 
@@ -130,6 +176,13 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
 window._dash_switch = function (mode) {
     if (mode === window._woo_mode) return;
     window._woo_mode = mode;
+    if (window._update_datebar) {
+        window._update_datebar(
+            window._woo_period_label,
+            window._woo_from_date,
+            window._woo_to_date
+        );
+    }
     _dash_load(mode, window._woo_from_date, window._woo_to_date, window._woo_period_label);
 };
 
@@ -142,8 +195,6 @@ function _dash_load(mode, fd, td, periodLabel) {
     if (!page) return;
     $(page.main).find(".dw,.dw-loading").remove();
     $(page.main).append('<div class="dw-loading">Loading dashboard…</div>');
-
-    console.log("[Dashboard] API call — mode:", mode, "from:", fd||"all", "to:", td||"all", "period:", periodLabel);
 
     frappe.call({
         method: "taal_inventory.utils.woocommerce_dashboard.get_woocommerce_dashboard_data",
@@ -207,13 +258,10 @@ function _dash_styles() {
         + ".dw-sub{font-size:11px;color:#94a3b8}"
         + ".dw-chips{display:flex;gap:8px;flex-wrap:wrap}"
         + ".dw-chip{font-size:11px;font-weight:500;padding:3px 10px;border-radius:999px;border:0.5px solid}"
-        // Period badge — prominent orange pill
         + ".dw-period-badge{display:inline-flex;align-items:center;gap:6px;"
         +   "background:#FAEEDA;color:#633806;border:1.5px solid #BA7517;"
         +   "border-radius:8px;padding:5px 12px;font-size:12px;font-weight:600;"
         +   "white-space:nowrap}"
-        + ".dw-period-badge svg{flex-shrink:0}"
-        // Period tag on cards and chart subtitles
         + ".dw-period-tag{display:inline-block;background:#EAF3DE;color:#27500A;"
         +   "border:0.5px solid #639922;border-radius:4px;padding:1px 7px;"
         +   "font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;"
@@ -225,7 +273,6 @@ function _dash_styles() {
         +   "font-size:11px;font-weight:500}"
         + ".dw-notice-g{background:#EAF3DE;border:0.5px solid #639922;color:#27500A}"
         + ".dw-notice-b{background:#E6F1FB;border:0.5px solid #378ADD;color:#0C447C}"
-        // Period filter bar — shows active period across full width
         + ".dw-period-bar{background:#FFF7ED;border:1.5px solid #F59E0B;"
         +   "border-radius:10px;padding:10px 16px;margin-bottom:16px;"
         +   "display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px}"
@@ -271,7 +318,7 @@ function _dash_styles() {
         + ".dw-stc:hover{transform:translateY(-2px)}"
         + ".dw-stl{font-size:10px;font-weight:500;text-transform:uppercase;"
         +   "letter-spacing:.05em;color:#94a3b8;margin-bottom:5px}"
-        + ".dw-stv{font-size:13px;font-weight:500;color:#111;margin-bottom:2px}"
+        + ".dw-stv{font-size:13px;font-weight:500;color:#111;margin-bottom:2px;word-break:break-word}"
         + ".dw-sts{font-size:10px;color:#94a3b8;margin-bottom:6px}"
         + ".dw-tax-row{display:flex;justify-content:space-between;align-items:center;"
         +   "padding:6px 0;border-bottom:0.5px solid #e2e8f0}"
@@ -377,13 +424,11 @@ function _dash_styles() {
 // ================================================================
 var _INR = function (n) { return "₹ " + Math.round(n || 0).toLocaleString("en-IN"); };
 
-// Period tag shown on every card — e.g. "Today" in green
 function _ptag(label) {
     if (!label || label === "All Time") return "";
     return '<span class="dw-period-tag">' + label + "</span>";
 }
 
-// Section header with period label
 function _sechd(lbl, periodLabel) {
     var pt = (periodLabel && periodLabel !== "All Time")
         ? ' <span style="font-size:9px;font-weight:600;text-transform:uppercase;'
@@ -394,8 +439,8 @@ function _sechd(lbl, periodLabel) {
          + '</span><div class="dw-sl-line"></div></div>';
 }
 
-// Period bar — prominent banner showing active filter
-function _period_bar(periodLabel, fd, td) {
+// Period bar — mode-aware right label
+function _period_bar(periodLabel, fd, td, mode) {
     if (!periodLabel || periodLabel === "All Time") return "";
     var months = ["Jan","Feb","Mar","Apr","May","Jun",
                   "Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -406,12 +451,15 @@ function _period_bar(periodLabel, fd, td) {
         var tStr = months[parseInt(tp[1])-1] + " " + parseInt(tp[2]) + ", " + tp[0];
         rangeStr = fd === td ? fStr : fStr + " – " + tStr;
     }
+    var modeNote = (mode === "offline")
+        ? "ERPNext native status · Offline orders"
+        : "Shipped + Processing only";
     return '<div class="dw-period-bar">'
         + '<div>'
         + '<div class="dw-period-bar-lbl">📅 Active filter: ' + periodLabel + "</div>"
         + (rangeStr ? '<div class="dw-period-bar-range">' + rangeStr + " · All sections filtered to this period</div>" : "")
         + "</div>"
-        + '<span style="font-size:11px;color:#92400e;font-weight:500">Shipped + Processing only</span>'
+        + '<span style="font-size:11px;color:#92400e;font-weight:500">' + modeNote + "</span>"
         + "</div>";
 }
 
@@ -542,13 +590,11 @@ function _customer_stats_html(sn, rateColor, periodLabel) {
     return H;
 }
 
-// Period sub for chart cards: "Shipped + Processing · Today"
 function _pcs(base, periodLabel) {
     if (!periodLabel || periodLabel === "All Time") return base;
     return base + " · " + periodLabel;
 }
 
-// Top bar
 function _dash_topbar(mode, kp, fd, td, periodLabel) {
     var isOnline = mode === "online";
     var chips = isOnline
@@ -603,9 +649,7 @@ function _online_html(d, fd, td, periodLabel) {
     var H = '<div class="dw">';
 
     H += _dash_topbar("online", kp, fd, td, periodLabel);
-
-    // Prominent period bar
-    H += _period_bar(periodLabel, fd, td);
+    H += _period_bar(periodLabel, fd, td, "online");
 
     H += '<div class="dw-notice dw-notice-b">All metrics: custom_offline__online = Online · '
        + 'All sections: woocommerce_status IN (Shipped, Processing) · Pending: status = Pending only'
@@ -616,7 +660,6 @@ function _online_html(d, fd, td, periodLabel) {
     H += _sechd("Section 1 — Revenue & order KPIs", periodLabel);
     H += '<div class="dw-g3">';
 
-    // Card 1: Total Revenue — labelled with period
     var revLabel = pl_active ? periodLabel + " revenue (Online)" : "Total revenue (Online)";
     H += _kpi("kg", revLabel, "dw-k1", _INR(kp.total_revenue||0),
         _trend_html(kp.month_rev_trend, false),
@@ -624,7 +667,6 @@ function _online_html(d, fd, td, periodLabel) {
         _pcs("Online · woocommerce_status IN (Shipped, Processing)", periodLabel),
         "dw-kf1","#639922",100);
 
-    // Card 2: Period revenue (adaptive label)
     var card2Label = pl_active ? periodLabel + " revenue" : "This month's revenue";
     H += _kpi("kb", card2Label, "dw-k2", _INR(kp.month_revenue||0),
         _trend_html(kp.month_rev_trend, false),
@@ -633,14 +675,12 @@ function _online_html(d, fd, td, periodLabel) {
         "dw-kf2","#378ADD",
         kp.total_revenue>0?Math.round(kp.month_revenue/kp.total_revenue*100):0);
 
-    // Card 3: AOV
     H += _kpi("kt","Average order value","dw-k3",_INR(kp.avg_order_value||0),
         _trend_html({dir:"flat",pct:0},false),
         "Shipped + Processing only",
         _pcs("base_net_total ÷ Shipped+Processing order count", periodLabel),
         "dw-kf3","#1D9E75",45);
 
-    // Card 4: Pending
     H += _kpi("ka","Pending delivery","dw-k4",String(kp.pending||0),
         _trend_html({dir:"flat",pct:0},true),
         "woocommerce_status = Pending only",
@@ -648,7 +688,6 @@ function _online_html(d, fd, td, periodLabel) {
         "dw-kf4","#BA7517",
         kp.total_orders>0?Math.round((kp.pending||0)/kp.total_orders*100):0);
 
-    // Card 5: Orders today
     var todayLabel = pl_active ? "Orders in period" : "Orders today";
     H += _kpi("kp", todayLabel, "dw-k5",
         String(pl_active ? (kp.ship_proc_count||0) : (kp.today_orders||0)),
@@ -659,7 +698,6 @@ function _online_html(d, fd, td, periodLabel) {
             : "transaction_date = " + frappe.datetime.get_today() + " · Online",
         "dw-kf5","#7F77DD",2);
 
-    // Card 6: Cancelled
     H += _kpi("kc","Cancelled orders","dw-k6",String(kp.cancelled||0),
         _trend_html({dir:"flat",pct:0},true),
         "Online orders only",
@@ -672,10 +710,14 @@ function _online_html(d, fd, td, periodLabel) {
     // S2 — Snapshot
     H += _sechd("Section 2 — Snapshot summary", periodLabel);
     H += '<div class="dw-g3">';
-    H += _snapshot_top("Top customer",
-        (sn.top_customer||"—"),
-        (sn.top_cust_cnt||0)+" orders · "+_INR(sn.top_cust_rev||0),
-        "#378ADD", periodLabel);
+
+    // Top customer — may contain multiple names if tied
+    var tcSub = (sn.top_cust_cnt||0) + " orders · " + _INR(sn.top_cust_rev||0);
+    if ((sn.top_customer||"").indexOf(" & ") !== -1) {
+        tcSub = "Tied · " + tcSub;
+    }
+    H += _snapshot_top("Top customer", (sn.top_customer||"—"), tcSub, "#378ADD", periodLabel);
+
     H += _snapshot_top("Top item by revenue",
         (sn.top_item||"—"),
         (sn.top_item_qty||0)+" units · "+_INR(sn.top_item_rev||0),
@@ -815,7 +857,7 @@ function _offline_html(d, fd, td, periodLabel) {
     var H = '<div class="dw">';
 
     H += _dash_topbar("offline", kp, fd, td, periodLabel);
-    H += _period_bar(periodLabel, fd, td);
+    H += _period_bar(periodLabel, fd, td, "offline");
     H += '<div class="dw-notice dw-notice-g">All metrics: custom_offline__online = Offline · ERPNext native status · Tax from tabSales Taxes and Charges'
        + (pl_active ? " · Period: <strong>" + periodLabel + "</strong>" : "") + "</div>";
 
@@ -824,7 +866,7 @@ function _offline_html(d, fd, td, periodLabel) {
     var revLbl2 = pl_active ? periodLabel + " revenue (Offline)" : "Total revenue (Offline)";
     H += _kpi("kg",revLbl2,"dw-k1",_INR(kp.total_revenue||0),_trend_html(kp.month_rev_trend,false),null,_pcs("SUM(base_net_total) · Offline Sales Orders",periodLabel),"dw-kf1","#639922",100);
     var c2lbl2 = pl_active ? periodLabel + " revenue" : "This month's revenue";
-    H += _kpi("kb",c2lbl2,"dw-k2",_INR(kp.month_revenue||0),_trend_html(kp.month_rev_trend,false),null,_pcs("Offline orders · "+( pl_active?periodLabel:"current month"),periodLabel),"dw-kf2","#378ADD",kp.total_revenue>0?Math.round(kp.month_revenue/kp.total_revenue*100):0);
+    H += _kpi("kb",c2lbl2,"dw-k2",_INR(kp.month_revenue||0),_trend_html(kp.month_rev_trend,false),null,_pcs("Offline orders · "+(pl_active?periodLabel:"current month"),periodLabel),"dw-kf2","#378ADD",kp.total_revenue>0?Math.round(kp.month_revenue/kp.total_revenue*100):0);
     H += _kpi("kt","Average order value","dw-k3",_INR(kp.avg_order_value||0),_trend_html({dir:"flat",pct:0},false),null,_pcs("base_net_total ÷ total Offline orders",periodLabel),"dw-kf3","#1D9E75",55);
     H += _kpi("ka","Pending delivery","dw-k4",String(kp.pending||0),_trend_html({dir:"flat",pct:0},true),null,_pcs("status = To Deliver and Bill · Offline",periodLabel),"dw-kf4","#BA7517",kp.total_orders>0?Math.round((kp.pending||0)/kp.total_orders*100):0);
     var kp5lbl2 = pl_active ? "Orders in period" : "Orders today";
@@ -834,7 +876,14 @@ function _offline_html(d, fd, td, periodLabel) {
 
     H += _sechd("Section 2 — Snapshot summary", periodLabel);
     H += '<div class="dw-g3">';
-    H += _snapshot_top("Top customer",(sn.top_customer||"—"),(sn.top_cust_cnt||0)+" Offline orders · "+_INR(sn.top_cust_rev||0),"#639922",periodLabel);
+
+    // Top customer — tie-aware
+    var tcSub2 = (sn.top_cust_cnt||0) + " Offline orders · " + _INR(sn.top_cust_rev||0);
+    if ((sn.top_customer||"").indexOf(" & ") !== -1) {
+        tcSub2 = "Tied · " + tcSub2;
+    }
+    H += _snapshot_top("Top customer", (sn.top_customer||"—"), tcSub2, "#639922", periodLabel);
+
     H += _snapshot_top("Top item by revenue",(sn.top_item||"—"),(sn.top_item_qty||0)+" units · "+_INR(sn.top_item_rev||0),"#D85A30",periodLabel);
     var sg=sn.tax_sgst||0,cg=sn.tax_cgst||0,ig=sn.tax_igst||0,tds=sn.tax_tds||0,gross=sn.tax_gross||0,net=sn.tax_net||0;
     var hasAnyTax=(sg+cg+ig)>0;
@@ -1010,7 +1059,7 @@ function _dash_charts(d, mode) {
     var bdr  = dark ? "#1a1a1a" : "#ffffff";
 
     var dOpts = {
-        responsive: false, maintainAspectRatio: false, cutout: "65%",
+        responsive: true, maintainAspectRatio: false, cutout: "65%",
         animation: { animateRotate: true, duration: 800 },
         plugins: {
             legend: { display: false },
