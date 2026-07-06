@@ -115,6 +115,8 @@ def get_kpi_detail(key):
 
 # ── KPIs ─────────────────────────────────────────────────────────
 # Unchanged from original — all field names preserved exactly
+# EXCEPT: stock_value now uses cost_price (was selling_price) so it
+# matches the Balance Sheet and Current Stock Report (inventory at cost).
 
 def _kpis(t, ms, me):
     d7  = str(add_days(t, 7))
@@ -139,8 +141,10 @@ def _kpis(t, ms, me):
             " WHERE is_active=1 AND min_stock_qty>0"
             " AND current_stock<=min_stock_qty"
         ),
+        # FIX: value inventory at COST (was selling_price) to match
+        # Balance Sheet / Current Stock Report / accounting basis.
         "stock_value": float(q(
-            "SELECT COALESCE(SUM(remaining_qty*selling_price),0)"
+            "SELECT COALESCE(SUM(remaining_qty*cost_price),0)"
             " FROM `tabPharmacy Batch` WHERE status='Active'"
         )),
         "exp_30": q(
@@ -237,10 +241,10 @@ def _charts(t, ms, me):
         "weekly_movement":    _weekly_movement(t),
         "daily_dispensing":   _daily_dispensing(t),
         "batch_status":       _batch_status(),
-        "category_value":     _category_value(),       # FIX: category_name via JOIN
+        "category_value":     _category_value(),       # FIX: category_name via JOIN + cost basis
         "writeoff_breakdown": _writeoff_breakdown(),
         "top_fast_moving":    _top_fast_moving(t),     # FIX: rolling 30 days
-        "top_stock_value":    _top_stock_value(),
+        "top_stock_value":    _top_stock_value(),      # FIX: cost basis
         "top_patients":       _top_patients(t),        # FIX: rolling 30 days
         "monthly_profit":     _monthly_profit(t),
         "supplier_purchase":  _supplier_purchase(t),
@@ -252,8 +256,6 @@ def _charts(t, ms, me):
 
 
 # ── Individual chart queries ──────────────────────────────────────
-# Only _category_value, _margin_category, _top_fast_moving,
-# _top_patients changed. All others unchanged from original.
 
 def _weekly_movement(t):
     rows_out = frappe.db.sql("""
@@ -322,11 +324,12 @@ def _batch_status():
 
 
 # FIX: JOIN tabItem Category to get human-readable category_name
-# instead of the auto-generated hash stored in pi.category
+# instead of the auto-generated hash stored in pi.category.
+# FIX: value at COST (was selling_price) to match accounting basis.
 def _category_value():
     rows = frappe.db.sql("""
         SELECT COALESCE(ic.category_name, pi.category, 'Uncategorized') AS cat,
-               COALESCE(SUM(pb.remaining_qty * pb.selling_price), 0)    AS val
+               COALESCE(SUM(pb.remaining_qty * pb.cost_price), 0)    AS val
         FROM `tabPharmacy Batch` pb
         JOIN `tabPharmacy Item` pi ON pi.name = pb.item
         LEFT JOIN `tabItem Category` ic ON ic.name = pi.category
@@ -357,8 +360,7 @@ def _writeoff_breakdown():
     }
 
 
-# FIX: was _top_fast_moving(ms, me) filtering by current calendar month
-# Changed to rolling 30-day window so data shows even mid-month
+# FIX: rolling 30-day window so data shows even mid-month
 def _top_fast_moving(t):
     rows = frappe.db.sql("""
         SELECT pi.item_name,
@@ -376,10 +378,11 @@ def _top_fast_moving(t):
     }
 
 
+# FIX: value at COST (was selling_price) to match accounting basis.
 def _top_stock_value():
     rows = frappe.db.sql("""
         SELECT pi.item_name,
-               COALESCE(SUM(pb.remaining_qty * pb.selling_price), 0) AS val
+               COALESCE(SUM(pb.remaining_qty * pb.cost_price), 0) AS val
         FROM `tabPharmacy Batch` pb
         JOIN `tabPharmacy Item` pi ON pi.name = pb.item
         WHERE pb.status = 'Active'
@@ -392,8 +395,7 @@ def _top_stock_value():
     }
 
 
-# FIX: was _top_patients(ms, me) filtering by current calendar month
-# Changed to rolling 30-day window so data shows even mid-month
+# FIX: rolling 30-day window so data shows even mid-month
 def _top_patients(t):
     rows = frappe.db.sql("""
         SELECT patient_name,
