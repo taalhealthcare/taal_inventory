@@ -1,6 +1,7 @@
 // ================================================================
 //  Inventory Dashboard — Taal Inventory
-//  v2 — Fixes: category names, rolling 30-day charts, KPI hover popup
+//  v3 — cost-basis stock value, sales-only activity, current-month
+//       scoping, Reorder Gap with medicine selector (ranked + per-item)
 // ================================================================
 
 frappe.pages["inventory-dashboard"].on_page_load = function (wrapper) {
@@ -27,6 +28,7 @@ class TaalInventoryDashboard {
         this._timer         = null;
         this._popup_cache   = {};    // keyed by popup key, cleared on refresh
         this._popup_timeout = null;  // delay before hiding popup
+        this._reorder_items_loaded = false;
         this._setup();
     }
 
@@ -62,6 +64,12 @@ class TaalInventoryDashboard {
         $(document)
             .on("mouseenter", "#ti-popup", () => clearTimeout(this._popup_timeout))
             .on("mouseleave", "#ti-popup", () => { this._hide_popup(); });
+
+        // ── Reorder Gap selector change handler (Point 6) ─────────
+        $(this.page.body).on("change", "#ti-reorder-select", (e) => {
+            const item = $(e.currentTarget).val();
+            this._load_reorder_gap(item);
+        });
 
         // Auto-refresh every 5 minutes
         this._timer = setInterval(() => this.refresh(), 300000);
@@ -247,12 +255,12 @@ class TaalInventoryDashboard {
                    "#1e8449","#d4ac0d","#7f8c8d","#e74c3c","#2ecc71"];
 
         const cfg = [
-            { id: "weekly_movement",    title: "Weekly Stock In vs Out",                type: "bar",      colors: ["#1e8449","#e74c3c"], height: 240, hbar: false },
+            { id: "weekly_movement",    title: "Weekly Stock In vs Out — This Month",   type: "bar",      colors: ["#1e8449","#e74c3c"], height: 240, hbar: false },
             { id: "daily_dispensing",   title: "Daily Dispensing — Last 30 Days",        type: "line",     colors: ["#2980b9"],           height: 240, hbar: false },
             { id: "batch_status",       title: "Batch Status Distribution",               type: "doughnut", colors: P,                     height: 240, hbar: false },
             { id: "category_value",     title: "Stock Value by Category",                type: "doughnut", colors: P,                     height: 240, hbar: false },
-            { id: "writeoff_breakdown", title: "Write-off Breakdown",                    type: "doughnut", colors: ["#c0392b","#e67e22","#7f8c8d","#e74c3c"], height: 240, hbar: false },
-            { id: "top_fast_moving",    title: "Top 10 Fast Moving Items — Last 30 Days",type: "bar",      colors: ["#2980b9"],           height: 400, hbar: true  },
+            { id: "writeoff_breakdown", title: "Write-off Breakdown — This Month",       type: "doughnut", colors: ["#c0392b","#e67e22","#7f8c8d","#e74c3c"], height: 240, hbar: false },
+            { id: "top_fast_moving",    title: "Top 10 Fast Moving Items — This Month",  type: "bar",      colors: ["#2980b9"],           height: 400, hbar: true  },
             { id: "top_stock_value",    title: "Top 10 Items by Stock Value",            type: "bar",      colors: ["#8e44ad"],           height: 400, hbar: true  },
             { id: "top_patients",       title: "Top 10 Patients by Qty — Last 30 Days",  type: "bar",      colors: ["#16a085"],           height: 400, hbar: true  },
             { id: "monthly_profit",     title: "Monthly Profit Trend",                   type: "line",     colors: ["#1e8449"],           height: 240, hbar: false },
@@ -260,12 +268,115 @@ class TaalInventoryDashboard {
             { id: "margin_category",    title: "Avg Profit Margin % by Category",        type: "bar",      colors: ["#16a085"],           height: 240, hbar: false },
             { id: "expiry_timeline",    title: "Expiry Timeline — Next 3 Months",        type: "bar",      colors: ["#e74c3c"],           height: 240, hbar: false },
             { id: "batch_age",          title: "Batch Age Distribution",                 type: "bar",      colors: ["#2980b9"],           height: 240, hbar: false },
-            { id: "reorder_gap",        title: "Reorder Gap — Current Stock vs Target",  type: "bar",      colors: ["#2980b9","#dce8f5"], height: 340, hbar: true  },
         ];
 
         cfg.forEach(c => {
             $(`#ti-t-${c.id}`).text(c.title);
             this._draw_chart(c.id, c.type, charts[c.id], c.colors, c.height, c.hbar);
+        });
+
+        // POINT 6: Reorder Gap is driven by a medicine selector, not the generic loop
+        this._render_reorder_gap_selector();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  POINT 6 — REORDER GAP with medicine selector
+    //  Default view: "All items (ranked)" — largest gap first.
+    //  Per-item: pick any medicine. If it has no max_stock_qty set,
+    //  show a prompt + a clickable link that opens the item's record.
+    // ═══════════════════════════════════════════════════════════════
+    _render_reorder_gap_selector() {
+        const $card = $("#ti-i-reorder_gap");
+        if (!$card.length) return;
+
+        $(`#ti-t-reorder_gap`).text("Reorder Gap — Current Stock vs Target");
+
+        $card.html(
+            `<div style="margin-bottom:14px;">
+                <select id="ti-reorder-select" class="ti-reorder-select">
+                    <option value="__ALL__">All items (ranked by largest gap)</option>
+                </select>
+             </div>
+             <div id="ti-reorder-result"></div>`
+        );
+
+        // Populate the dropdown with active items (once per refresh)
+        frappe.call({
+            method: "taal_inventory.utils.dashboard.get_pharmacy_items_for_reorder",
+            callback: (r) => {
+                const items = r.message || [];
+                const $sel  = $("#ti-reorder-select");
+                items.forEach(it => {
+                    $sel.append(
+                        `<option value="${it.name}">${(it.item_name || it.name)}</option>`
+                    );
+                });
+                // Default load the ranked view
+                this._load_reorder_gap("__ALL__");
+            }
+        });
+    }
+
+    _load_reorder_gap(selection) {
+        const $res = $("#ti-reorder-result");
+        $res.html('<div class="ti-nodata">Loading…</div>');
+
+        // ── Ranked view (all configured items, largest gap first) ──
+        if (!selection || selection === "__ALL__") {
+            frappe.call({
+                method: "taal_inventory.utils.dashboard.get_reorder_gap_ranked",
+                callback: (r) => {
+                    const data = r.message || { labels: [], datasets: [] };
+                    if (!data.labels || !data.labels.length) {
+                        $res.html(
+                            `<div class="ti-nodata">No items have a Max Stock `
+                            + `Quantity configured yet.</div>`
+                        );
+                        return;
+                    }
+                    $res.html(`<div id="ti-i-reorder_gap_chart"></div>`);
+                    this._draw_chart("reorder_gap_chart", "bar", data,
+                        ["#2980b9", "#dce8f5"], 340, true);
+                }
+            });
+            return;
+        }
+
+        // ── Single-item view ──────────────────────────────────────
+        frappe.call({
+            method: "taal_inventory.utils.dashboard.get_reorder_gap_for_item",
+            args:   { item: selection },
+            callback: (r) => {
+                const d = r.message || {};
+
+                // No max_stock_qty → prompt + link to the item record
+                if (!d.has_max) {
+                    const link = `/app/pharmacy-item/${encodeURIComponent(d.item || "")}`;
+                    $res.html(
+                        `<div class="ti-reorder-prompt">
+                            <div class="ti-reorder-prompt-msg">
+                                Please input the Max Stock Quantity of this Pharmacy Item
+                            </div>
+                            <a href="${link}" target="_blank" class="ti-reorder-prompt-link">
+                                ${d.item_name || d.item} → Open Record
+                            </a>
+                         </div>`
+                    );
+                    return;
+                }
+
+                // Has max → single-item gap chart
+                const chartData = {
+                    labels: [d.item_name],
+                    datasets: [
+                        { name: "Current Stock",  values: [d.current_stock] },
+                        { name: "Reorder Needed", values: [d.gap] }
+                    ]
+                };
+                $res.html(`<div id="ti-i-reorder_gap_chart"></div>`);
+                this._draw_chart("reorder_gap_chart", "bar", chartData,
+                    ["#2980b9", "#dce8f5"], 240, true);
+            }
         });
     }
 
@@ -407,64 +518,40 @@ class TaalInventoryDashboard {
 
     // ═══════════════════════════════════════════════════════════════
     //  HOVER POPUP
-    //  Shows a floating drill-down panel when hovering 7 KPI cards.
-    //  Stays visible while cursor is over the card OR the popup itself.
-    //  Results are cached per session; cleared on Refresh.
-    //
-    //  Cards with popups and what they show:
-    //    low_stock   → items at/below reorder level
-    //    critical    → items at/below minimum stock
-    //    exp_30      → batches expiring within 30 days
-    //    exp_7       → batches expiring within 7 days (urgent)
-    //    overstock   → items above maximum stock
-    //    never_sold  → items with zero sales history
-    //    slow_moving → items with no sales in 90 days
     // ═══════════════════════════════════════════════════════════════
 
     _show_popup(key, rect) {
         const $pop = $("#ti-popup");
         if (!$pop.length) return;
 
-        // Always show BELOW the hovered card. Never flip above.
-        // position:fixed so rect coords are viewport-relative — no scroll offset needed.
-        // Popup body max-height is calculated from available space below the card
-        // so the popup always fits and always appears directly below every row.
         let top  = rect.bottom + 10;
         let left = rect.left;
 
-        // Clamp to right viewport edge
         if (left + 290 > window.innerWidth) left = window.innerWidth - 298;
-        // Clamp to left viewport edge
         if (left < 8) left = 8;
 
-        // popup chrome = header(~44px) + footer(~30px) = 74px
-        // body gets the remaining available space, minimum 80px
         const availBelow = window.innerHeight - rect.bottom - 26;
         this._popup_body_h = Math.max(80, availBelow - 74);
 
         $pop.css({ top: top + "px", left: left + "px" }).show();
 
-        // ── Return cached data immediately ────────────────────────
         if (this._popup_cache[key]) {
             $pop.html(this._build_popup_html(key, this._popup_cache[key]));
             return;
         }
 
-        // ── Show loading header while fetching ────────────────────
         $pop.html(
             `<div class="ti-pop-head" style="border-top-color:${this._popup_accent(key)}">`
             + `<span class="ti-pop-title">${this._popup_title(key)}</span></div>`
             + `<div class="ti-pop-loading">Loading…</div>`
         );
 
-        // ── Fetch drill-down rows from Python ─────────────────────
         frappe.call({
             method:  "taal_inventory.utils.dashboard.get_kpi_detail",
             args:    { key: key },
             callback: (r) => {
                 const rows = r.message || [];
                 this._popup_cache[key] = rows;
-                // Only update if the popup is still visible
                 if ($("#ti-popup").is(":visible")) {
                     $("#ti-popup").html(this._build_popup_html(key, rows));
                 }
@@ -615,6 +702,16 @@ class TaalInventoryDashboard {
             + ".ti-ct{font-size:13px;font-weight:500;color:#111;margin-bottom:12px}"
             + ".ti-nodata{display:flex;align-items:center;justify-content:center;"
             +   "height:180px;color:#94a3b8;font-size:12px;font-style:italic}"
+            // ── Reorder gap selector + prompt (Point 6) ───────
+            + ".ti-reorder-select{width:100%;max-width:380px;padding:8px 10px;"
+            +   "border:1px solid #e2e8f0;border-radius:8px;font-size:13px;"
+            +   "background:#fff;color:#111;cursor:pointer}"
+            + ".ti-reorder-prompt{padding:22px 18px;border:1px dashed #e2e8f0;"
+            +   "border-radius:10px;background:#fffbf0;text-align:center}"
+            + ".ti-reorder-prompt-msg{font-size:13px;color:#e67e22;font-weight:600;"
+            +   "margin-bottom:10px}"
+            + ".ti-reorder-prompt-link{font-size:13px;color:#2980b9;font-weight:600;"
+            +   "text-decoration:underline;cursor:pointer}"
             // ── Hover popup ───────────────────────────────────
             + "#ti-popup{position:fixed;width:280px;background:#fff;"
             +   "border:0.5px solid #e2e8f0;border-radius:12px;"

@@ -14,14 +14,10 @@ def get_dashboard_data():
 
 
 # ── KPI Drill-down for Hover Popup ───────────────────────────────
-# Called from inventory_dashboard.js when user hovers a KPI card.
-# Returns up to 10 rows of detail data for the given KPI key.
-
 @frappe.whitelist()
 def get_kpi_detail(key):
     key = (key or "").strip()
 
-    # Low Stock — items at or below their reorder point
     if key == "low_stock":
         return frappe.db.sql("""
             SELECT item_name,
@@ -32,7 +28,6 @@ def get_kpi_detail(key):
             ORDER BY (reorder_value - current_stock) DESC LIMIT 10
         """, as_dict=True)
 
-    # Critical — items at or below minimum stock
     if key == "critical":
         return frappe.db.sql("""
             SELECT item_name,
@@ -43,7 +38,6 @@ def get_kpi_detail(key):
             ORDER BY (min_stock_qty - current_stock) DESC LIMIT 10
         """, as_dict=True)
 
-    # Expiring in 30 days
     if key == "exp_30":
         return frappe.db.sql("""
             SELECT pi.item_name,
@@ -57,7 +51,6 @@ def get_kpi_detail(key):
             ORDER BY pb.expiry_date ASC LIMIT 10
         """, as_dict=True)
 
-    # Expiring in 7 days — urgent
     if key == "exp_7":
         return frappe.db.sql("""
             SELECT pi.item_name,
@@ -71,7 +64,6 @@ def get_kpi_detail(key):
             ORDER BY pb.expiry_date ASC LIMIT 10
         """, as_dict=True)
 
-    # Overstock — items above maximum stock
     if key == "overstock":
         return frappe.db.sql("""
             SELECT item_name,
@@ -82,7 +74,6 @@ def get_kpi_detail(key):
             ORDER BY (current_stock - max_stock_qty) DESC LIMIT 10
         """, as_dict=True)
 
-    # Never sold — active items with no deduction history
     if key == "never_sold":
         return frappe.db.sql("""
             SELECT item_name,
@@ -95,7 +86,6 @@ def get_kpi_detail(key):
             LIMIT 10
         """, as_dict=True)
 
-    # Slow moving — no deductions in last 90 days
     if key == "slow_moving":
         d90 = str(add_days(today(), -90))
         return frappe.db.sql("""
@@ -113,11 +103,90 @@ def get_kpi_detail(key):
     return []
 
 
-# ── KPIs ─────────────────────────────────────────────────────────
-# Unchanged from original — all field names preserved exactly
-# EXCEPT: stock_value now uses cost_price (was selling_price) so it
-# matches the Balance Sheet and Current Stock Report (inventory at cost).
+# ── Item list for the Reorder Gap dropdown (Point 6) ─────────────
+@frappe.whitelist()
+def get_pharmacy_items_for_reorder():
+    """Return active pharmacy items for the reorder-gap dropdown."""
+    return frappe.db.sql("""
+        SELECT name, item_name
+        FROM `tabPharmacy Item`
+        WHERE is_active = 1
+        ORDER BY item_name ASC
+    """, as_dict=True)
 
+
+# ── Reorder Gap — ALL configured items, largest gap first (Point 6) ──
+@frappe.whitelist()
+def get_reorder_gap_ranked():
+    """
+    All active items that HAVE max_stock_qty configured and are below it,
+    ranked by largest gap first (descending). Powers the default
+    'All items (ranked)' view of the Reorder Gap chart.
+    """
+    rows = frappe.db.sql("""
+        SELECT item_name,
+               current_stock,
+               GREATEST(0, max_stock_qty - current_stock) AS gap
+        FROM `tabPharmacy Item`
+        WHERE is_active=1 AND max_stock_qty>0 AND current_stock < max_stock_qty
+        ORDER BY gap DESC LIMIT 10
+    """, as_dict=True)
+    return {
+        "labels": [r.item_name for r in rows],
+        "datasets": [
+            {"name": "Current Stock",
+             "values": [float(r.current_stock or 0) for r in rows]},
+            {"name": "Reorder Needed",
+             "values": [float(r.gap or 0) for r in rows]},
+        ]
+    }
+
+
+# ── Reorder Gap for ONE selected item (Point 6) ──────────────────
+@frappe.whitelist()
+def get_reorder_gap_for_item(item=None):
+    """
+    Reorder-gap detail for a single selected Pharmacy Item.
+
+    Returns a dict:
+      - has_max: 1/0 whether max_stock_qty is configured
+      - if has_max: item_name, current_stock, max_stock_qty, gap
+      - if not:     item_name, item (name) so the UI can link to the record
+                    and prompt the user to set the Max Stock Quantity.
+    """
+    if not item:
+        return {"has_max": 0, "item": None, "item_name": None}
+
+    row = frappe.db.get_value(
+        "Pharmacy Item", item,
+        ["name", "item_name", "current_stock", "max_stock_qty"],
+        as_dict=True
+    )
+    if not row:
+        return {"has_max": 0, "item": None, "item_name": None}
+
+    max_qty = float(row.max_stock_qty or 0)
+    cur     = float(row.current_stock or 0)
+
+    if max_qty <= 0:
+        # No max configured — UI will prompt user to set it (with a link).
+        return {
+            "has_max":   0,
+            "item":      row.name,
+            "item_name": row.item_name,
+        }
+
+    return {
+        "has_max":       1,
+        "item":          row.name,
+        "item_name":     row.item_name,
+        "current_stock": round(cur, 2),
+        "max_stock_qty": round(max_qty, 2),
+        "gap":           round(max(0, max_qty - cur), 2),
+    }
+
+
+# ── KPIs ─────────────────────────────────────────────────────────
 def _kpis(t, ms, me):
     d7  = str(add_days(t, 7))
     d30 = str(add_days(t, 30))
@@ -141,8 +210,7 @@ def _kpis(t, ms, me):
             " WHERE is_active=1 AND min_stock_qty>0"
             " AND current_stock<=min_stock_qty"
         ),
-        # FIX: value inventory at COST (was selling_price) to match
-        # Balance Sheet / Current Stock Report / accounting basis.
+        # Inventory valued at COST (matches Balance Sheet / Current Stock Report).
         "stock_value": float(q(
             "SELECT COALESCE(SUM(remaining_qty*cost_price),0)"
             " FROM `tabPharmacy Batch` WHERE status='Active'"
@@ -201,23 +269,27 @@ def _kpis(t, ms, me):
             " WHERE sr.docstatus=1 AND sr.receipt_date BETWEEN %s AND %s",
             [ms, me]
         )),
+        # POINT 4: Stock Out = SALES ONLY (reference_doctype = 'Sales Invoice').
         "stock_out": float(q(
             "SELECT COALESCE(SUM(qty_deducted),0)"
             " FROM `tabDeduction Log`"
-            " WHERE DATE(deduction_datetime) BETWEEN %s AND %s",
+            " WHERE reference_doctype='Sales Invoice'"
+            " AND DATE(deduction_datetime) BETWEEN %s AND %s",
             [ms, me]
         )),
         "unique_patients": q(
             "SELECT COUNT(DISTINCT patient_name)"
             " FROM `tabDeduction Log`"
-            " WHERE patient_name!='' AND DATE(deduction_datetime) BETWEEN %s AND %s",
+            " WHERE patient_name!='' AND reference_doctype='Sales Invoice'"
+            " AND DATE(deduction_datetime) BETWEEN %s AND %s",
             [ms, me]
         ),
         "total_profit": float(q(
             "SELECT COALESCE(SUM(dl.qty_deducted*(pb.selling_price-pb.cost_price)),0)"
             " FROM `tabDeduction Log` dl"
             " LEFT JOIN `tabPharmacy Batch` pb ON pb.name=dl.batch_id"
-            " WHERE DATE(dl.deduction_datetime) BETWEEN %s AND %s",
+            " WHERE dl.reference_doctype='Sales Invoice'"
+            " AND DATE(dl.deduction_datetime) BETWEEN %s AND %s",
             [ms, me]
         )),
         "avg_margin": round(float(q(
@@ -235,36 +307,38 @@ def _kpis(t, ms, me):
 
 
 # ── Charts ────────────────────────────────────────────────────────
-
 def _charts(t, ms, me):
     return {
-        "weekly_movement":    _weekly_movement(t),
+        "weekly_movement":    _weekly_movement(t, ms, me),   # POINT 3: current month
         "daily_dispensing":   _daily_dispensing(t),
-        "batch_status":       _batch_status(),
-        "category_value":     _category_value(),       # FIX: category_name via JOIN + cost basis
-        "writeoff_breakdown": _writeoff_breakdown(),
-        "top_fast_moving":    _top_fast_moving(t),     # FIX: rolling 30 days
-        "top_stock_value":    _top_stock_value(),      # FIX: cost basis
-        "top_patients":       _top_patients(t),        # FIX: rolling 30 days
-        "monthly_profit":     _monthly_profit(t),
+        "batch_status":       _batch_status(),               # live snapshot
+        "category_value":     _category_value(),             # live snapshot, cost basis
+        "writeoff_breakdown": _writeoff_breakdown(ms, me),   # POINT 3: current month
+        "top_fast_moving":    _top_fast_moving(ms, me),      # POINT 3: current month, sales only
+        "top_stock_value":    _top_stock_value(),            # cost basis
+        "top_patients":       _top_patients(t),
+        "monthly_profit":     _monthly_profit(t),            # last 6 months (unchanged)
         "supplier_purchase":  _supplier_purchase(t),
-        "margin_category":    _margin_category(),      # FIX: category_name via JOIN
+        "margin_category":    _margin_category(),
         "expiry_timeline":    _expiry_timeline(t),
         "batch_age":          _batch_age(t),
-        "reorder_gap":        _reorder_gap(),
+        # reorder_gap chart is now driven by the selected item via
+        # get_reorder_gap_for_item(); we send an empty stub here so the
+        # initial page load is fast and the JS populates it on selection.
+        "reorder_gap":        {"labels": [], "datasets": []},
     }
 
 
-# ── Individual chart queries ──────────────────────────────────────
-
-def _weekly_movement(t):
+# POINT 3: current-month weeks only
+def _weekly_movement(t, ms, me):
     rows_out = frappe.db.sql("""
         SELECT YEARWEEK(deduction_datetime,1) AS wk,
                SUM(qty_deducted) AS qty
         FROM `tabDeduction Log`
-        WHERE deduction_datetime >= DATE_SUB(%s, INTERVAL 8 WEEK)
+        WHERE reference_doctype='Sales Invoice'
+          AND DATE(deduction_datetime) BETWEEN %s AND %s
         GROUP BY wk ORDER BY wk
-    """, t, as_dict=True)
+    """, [ms, me], as_dict=True)
 
     rows_in = frappe.db.sql("""
         SELECT YEARWEEK(sr.receipt_date,1) AS wk,
@@ -272,9 +346,9 @@ def _weekly_movement(t):
         FROM `tabStock Receipt Item` sri
         JOIN `tabStock Receipt` sr ON sr.name=sri.parent
         WHERE sr.docstatus=1
-          AND sr.receipt_date >= DATE_SUB(%s, INTERVAL 8 WEEK)
+          AND sr.receipt_date BETWEEN %s AND %s
         GROUP BY wk ORDER BY wk
-    """, t, as_dict=True)
+    """, [ms, me], as_dict=True)
 
     wk_map = {}
     for r in rows_in:
@@ -300,7 +374,8 @@ def _daily_dispensing(t):
     rows = frappe.db.sql("""
         SELECT DATE(deduction_datetime) AS dt, SUM(qty_deducted) AS qty
         FROM `tabDeduction Log`
-        WHERE deduction_datetime >= DATE_SUB(%s, INTERVAL 30 DAY)
+        WHERE reference_doctype='Sales Invoice'
+          AND deduction_datetime >= DATE_SUB(%s, INTERVAL 30 DAY)
         GROUP BY dt ORDER BY dt
     """, t, as_dict=True)
     return {
@@ -323,9 +398,7 @@ def _batch_status():
     }
 
 
-# FIX: JOIN tabItem Category to get human-readable category_name
-# instead of the auto-generated hash stored in pi.category.
-# FIX: value at COST (was selling_price) to match accounting basis.
+# Live snapshot, cost basis
 def _category_value():
     rows = frappe.db.sql("""
         SELECT COALESCE(ic.category_name, pi.category, 'Uncategorized') AS cat,
@@ -346,13 +419,15 @@ def _category_value():
     }
 
 
-def _writeoff_breakdown():
+# POINT 3: current-month write-offs only
+def _writeoff_breakdown(ms, me):
     rows = frappe.db.sql("""
         SELECT adjustment_type, COUNT(*) AS cnt
         FROM `tabStock Adjustment`
         WHERE docstatus=1
+          AND adjustment_date BETWEEN %s AND %s
         GROUP BY adjustment_type
-    """, as_dict=True)
+    """, [ms, me], as_dict=True)
     return {
         "labels":   [r.adjustment_type for r in rows],
         "datasets": [{"name": "Write-offs",
@@ -360,17 +435,18 @@ def _writeoff_breakdown():
     }
 
 
-# FIX: rolling 30-day window so data shows even mid-month
-def _top_fast_moving(t):
+# POINT 3: current-month, sales only
+def _top_fast_moving(ms, me):
     rows = frappe.db.sql("""
         SELECT pi.item_name,
                COALESCE(SUM(dl.qty_deducted), 0) AS qty
         FROM `tabDeduction Log` dl
         JOIN `tabPharmacy Item` pi ON pi.name = dl.parent
-        WHERE dl.deduction_datetime >= DATE_SUB(%s, INTERVAL 30 DAY)
+        WHERE dl.reference_doctype='Sales Invoice'
+          AND DATE(dl.deduction_datetime) BETWEEN %s AND %s
         GROUP BY dl.parent
         ORDER BY qty DESC LIMIT 10
-    """, t, as_dict=True)
+    """, [ms, me], as_dict=True)
     return {
         "labels":   [r.item_name for r in rows],
         "datasets": [{"name": "Qty Sold",
@@ -378,7 +454,7 @@ def _top_fast_moving(t):
     }
 
 
-# FIX: value at COST (was selling_price) to match accounting basis.
+# Cost basis
 def _top_stock_value():
     rows = frappe.db.sql("""
         SELECT pi.item_name,
@@ -395,13 +471,13 @@ def _top_stock_value():
     }
 
 
-# FIX: rolling 30-day window so data shows even mid-month
 def _top_patients(t):
     rows = frappe.db.sql("""
         SELECT patient_name,
                COALESCE(SUM(qty_deducted), 0) AS qty
         FROM `tabDeduction Log`
         WHERE patient_name != ''
+          AND reference_doctype='Sales Invoice'
           AND deduction_datetime >= DATE_SUB(%s, INTERVAL 30 DAY)
         GROUP BY patient_name
         ORDER BY qty DESC LIMIT 10
@@ -420,7 +496,8 @@ def _monthly_profit(t):
                COALESCE(SUM(dl.qty_deducted*(pb.selling_price-pb.cost_price)),0) AS profit
         FROM `tabDeduction Log` dl
         LEFT JOIN `tabPharmacy Batch` pb ON pb.name=dl.batch_id
-        WHERE dl.deduction_datetime >= DATE_SUB(%s, INTERVAL 6 MONTH)
+        WHERE dl.reference_doctype='Sales Invoice'
+          AND dl.deduction_datetime >= DATE_SUB(%s, INTERVAL 6 MONTH)
         GROUP BY mo, sk ORDER BY sk
     """, t, as_dict=True)
     return {
@@ -446,7 +523,6 @@ def _supplier_purchase(t):
     }
 
 
-# FIX: JOIN tabItem Category to get human-readable category_name
 def _margin_category():
     rows = frappe.db.sql("""
         SELECT COALESCE(ic.category_name, pi.category, 'Uncategorized') AS cat,
@@ -508,24 +584,4 @@ def _batch_age(t):
         "labels":   order,
         "datasets": [{"name": "Active Batches",
                       "values": [row_map.get(o, 0) for o in order]}]
-    }
-
-
-def _reorder_gap():
-    rows = frappe.db.sql("""
-        SELECT item_name,
-               current_stock,
-               GREATEST(0, max_stock_qty - current_stock) AS gap
-        FROM `tabPharmacy Item`
-        WHERE is_active=1 AND max_stock_qty>0 AND current_stock < max_stock_qty
-        ORDER BY gap DESC LIMIT 10
-    """, as_dict=True)
-    return {
-        "labels": [r.item_name for r in rows],
-        "datasets": [
-            {"name": "Current Stock",
-             "values": [float(r.current_stock or 0) for r in rows]},
-            {"name": "Reorder Needed",
-             "values": [float(r.gap or 0) for r in rows]},
-        ]
     }
