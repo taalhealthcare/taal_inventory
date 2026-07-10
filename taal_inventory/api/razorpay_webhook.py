@@ -1,21 +1,12 @@
 """
-Razorpay Webhook Handler
+Razorpay Webhook Handler — DEFENSIVE VERSION
 
-Receives Razorpay webhook events (payment_link.paid / payment.failed /
-payment_link.cancelled), matches the payment to the most recent Pending
-Interakt Booking by phone number, and orchestrates the full post-payment flow:
+Handles ALL Razorpay payment success events (payment_link.paid,
+payment.captured, order.paid) with flexible payload extraction. Same payment
+firing multiple events is deduplicated via strong idempotency checks.
 
-  1. Update payment fields on Interakt Booking
-  2. Resolve assigned doctor (speciality-based, load-balanced per slot)
-  3. Create Patient Appointment
-  4. Create Payment Entry
-  5. Create Google Meet (Calendar event + Meet link)
-  6. Notify patient via Interakt WhatsApp
-  7. Notify doctor via Interakt WhatsApp (if assigned and toggle enabled)
-  8. Notify admin via Interakt WhatsApp + email (always, even if Meet failed)
-
-URL to configure in Razorpay Dashboard:
-  https://erp.taalhealthcare.com/api/method/taal_inventory.api.razorpay_webhook.handle_razorpay_payment
+Deploy location: taal_inventory/api/razorpay_webhook.py
+Webhook URL: https://<site>/api/method/taal_inventory.api.razorpay_webhook.handle_razorpay_payment
 """
 
 import json
@@ -32,90 +23,152 @@ from taal_inventory.services import admin_notifier
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# IMPORTANT: Razorpay Webhook Secret
-# Get from: Razorpay Dashboard → Settings → Webhooks → (your webhook) → Secret
-# This must MATCH the secret configured for your webhook in Razorpay.
+# Razorpay Webhook Secret (from Razorpay Dashboard → Settings → Webhooks)
 # ──────────────────────────────────────────────────────────────────────────────
 RAZORPAY_WEBHOOK_SECRET = "3a_JN39BAkMXYub"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Entry point
+# Event classification — Razorpay may fire MULTIPLE events for one payment.
+# All success events route to the same handler; idempotency prevents dupes.
+# ──────────────────────────────────────────────────────────────────────────────
+SUCCESS_EVENTS = (
+    "payment_link.paid",   # Payment link flow
+    "payment.captured",    # Standard checkout / any successful capture
+    "order.paid",          # Order-based flow
+)
+
+FAILURE_EVENTS = (
+    "payment.failed",
+    "payment_link.cancelled",
+    "payment_link.expired",
+    "order.cancelled",
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Flexible payload extraction — handles varying Razorpay event structures
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_payment_info(event):
+    """
+    Extract payment info from ANY Razorpay event, regardless of structure.
+
+    Different event types have different payload shapes:
+      • payment_link.paid: payload = {payment_link: {entity: ...}, payment: {entity: ...}}
+      • payment.captured:  payload = {payment: {entity: ...}}
+      • order.paid:        payload = {order: {entity: ...}, payment: {entity: ...}}
+
+    Returns dict with all extracted fields, or None if event is malformed.
+    Safe against missing keys throughout.
+    """
+    if not isinstance(event, dict):
+        return None
+
+    payload = event.get("payload") or {}
+    if not isinstance(payload, dict):
+        return None
+
+    payment_link_entity = ((payload.get("payment_link") or {}).get("entity")) or {}
+    payment_entity      = ((payload.get("payment") or {}).get("entity")) or {}
+    order_entity        = ((payload.get("order") or {}).get("entity")) or {}
+
+    # payment_id — unique per payment attempt
+    payment_id = payment_entity.get("id", "") or ""
+
+    # order_id — try multiple sources in priority order
+    order_id = (
+        payment_link_entity.get("id") or
+        payment_entity.get("order_id") or
+        order_entity.get("id") or
+        ""
+    )
+
+    # Contact phone — try multiple sources
+    contact = (
+        (payment_link_entity.get("customer") or {}).get("contact") or
+        payment_entity.get("contact") or
+        (payment_entity.get("notes") or {}).get("contact") or
+        (order_entity.get("notes") or {}).get("contact") or
+        ""
+    )
+
+    # Email — secondary matching key
+    email = (
+        (payment_link_entity.get("customer") or {}).get("email") or
+        payment_entity.get("email") or
+        ""
+    )
+
+    # Amount in paise
+    amount_paise = payment_entity.get("amount", 0) or 0
+
+    return {
+        "event_type":    event.get("event", ""),
+        "payment_id":    payment_id,
+        "order_id":      order_id,
+        "contact":       contact,
+        "email":         email,
+        "amount_paise":  amount_paise,
+        "amount_inr":    (amount_paise / 100) if amount_paise else 0,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point — routes ALL success events through the same handler
 # ──────────────────────────────────────────────────────────────────────────────
 
 @frappe.whitelist(allow_guest=True)
 def handle_razorpay_payment():
     """POST endpoint for Razorpay webhooks."""
+    event_type = "(unknown)"
+    raw_body = None
     try:
         raw_body = frappe.request.data
         signature = frappe.request.headers.get("X-Razorpay-Signature", "")
 
-        # --- Verify signature (skip only when placeholder secret) ---
         if RAZORPAY_WEBHOOK_SECRET != "REPLACE_THIS_LATER":
             if not _verify_razorpay_signature(raw_body, signature):
-                frappe.throw(
-                    "Invalid Razorpay signature",
-                    frappe.AuthenticationError
-                )
+                frappe.throw("Invalid Razorpay signature", frappe.AuthenticationError)
 
         event = json.loads(raw_body)
         event_type = event.get("event", "")
 
-        if event_type == "payment_link.paid":
+        if event_type in SUCCESS_EVENTS:
             _handle_payment_success(event)
-
-        elif event_type in ("payment.failed", "payment_link.cancelled"):
+        elif event_type in FAILURE_EVENTS:
             _handle_payment_failed(event)
-
         else:
             frappe.log_error(
-                f"Unhandled Razorpay event: {event_type}",
+                f"Unhandled Razorpay event: {event_type}\n\n"
+                f"Payload:\n{json.dumps(event, indent=2, default=str)[:3000]}",
                 "Razorpay Webhook: Unknown Event"
             )
 
         return {"status": "ok"}
 
     except Exception as e:
+        try:
+            body_snippet = raw_body.decode("utf-8", errors="replace")[:3000] if raw_body else "(no body)"
+        except Exception:
+            body_snippet = "(could not decode body)"
+
         frappe.log_error(
-            frappe.get_traceback(),
+            f"Event type: {event_type}\n\n"
+            f"Raw body:\n{body_snippet}\n\n"
+            f"Traceback:\n{frappe.get_traceback()}",
             "Razorpay Webhook Error"
         )
         return {"status": "error", "message": str(e)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Test-only wrapper — DELETE BEFORE PRODUCTION GO-LIVE
-# Allows triggering the full post-payment orchestration manually from
-# System Console without making an actual Razorpay payment. Builds a synthetic
-# Razorpay event from the booking and calls the real _handle_payment_success.
-#
-# Usage from System Console:
-#     result = frappe.call(
-#         "taal_inventory.api.razorpay_webhook.simulate_post_payment",
-#         booking_name="IB-20260602-00003",
-#     )
-#     print(result)
+# Test / Recovery utilities — WHITELISTED
 # ──────────────────────────────────────────────────────────────────────────────
 
 @frappe.whitelist()
-def simulate_post_payment(
-    booking_name=None,
-    real_payment_id=None,
-    real_order_id=None,
-):
-    """
-    Manually trigger the post-payment flow for an Interakt Booking, bypassing
-    Razorpay entirely. Useful for demo/QA and for manually completing bookings
-    where the real webhook failed (e.g. signature mismatch).
-
-    Parameters:
-      booking_name      — required, e.g. "IB-20260603-00004"
-      real_payment_id   — optional, the actual Razorpay payment_id (pay_xxxx)
-      real_order_id     — optional, the actual Razorpay order/plink_id
-
-    If real IDs are provided, they're stored on the booking instead of
-    placeholder MANUAL_TEST_* values.
-    """
+def simulate_post_payment(booking_name=None, real_payment_id=None, real_order_id=None):
+    """Trigger the post-payment flow manually. DELETE BEFORE PRODUCTION GO-LIVE."""
     if not booking_name:
         return {"error": "booking_name parameter required"}
 
@@ -128,23 +181,19 @@ def simulate_post_payment(
         return {
             "error": "Booking already Paid",
             "booking": booking_name,
-            "hint": "Run the reset script first, or test a different booking.",
+            "hint": "Use retry_post_payment_for_paid_booking to re-run Meet/notifications.",
         }
 
-    # Use real Razorpay IDs if provided, otherwise placeholder
-    order_id   = real_order_id   or ("plink_MANUAL_TEST_" + booking_name)
-    payment_id = real_payment_id or ("pay_MANUAL_TEST_"   + booking_name)
+    order_id = real_order_id or ("plink_MANUAL_TEST_" + booking_name)
+    payment_id = real_payment_id or ("pay_MANUAL_TEST_" + booking_name)
 
-    # Build a synthetic Razorpay payment_link.paid event
     fake_event = {
         "event": "payment_link.paid",
         "payload": {
             "payment_link": {
                 "entity": {
                     "id": order_id,
-                    "customer": {
-                        "contact": "+" + (booking.whatsapp_number or ""),
-                    },
+                    "customer": {"contact": "+" + (booking.whatsapp_number or "")},
                 },
             },
             "payment": {
@@ -157,10 +206,7 @@ def simulate_post_payment(
         },
     }
 
-    # Run the same handler the live webhook calls
     _handle_payment_success(fake_event)
-
-    # Reload and return the post-execution state (defensive — fields may not exist)
     booking.reload()
 
     def safe(field, default="(none)"):
@@ -187,26 +233,10 @@ def simulate_post_payment(
 
 
 @frappe.whitelist()
-def retry_post_payment_for_paid_booking(
-    booking_name=None,
-    real_payment_id=None,
-    real_order_id=None,
-):
+def retry_post_payment_for_paid_booking(booking_name=None, real_payment_id=None, real_order_id=None):
     """
-    Retry the FAILED steps of post-payment orchestration for a booking
-    that's already in "Paid" status — without re-creating Patient Appointment
-    or Payment Entry (those are protected against duplicates).
-
-    Use case: live webhook ran, Patient Appointment + Payment Entry succeeded,
-    but Google Meet / WhatsApp / Email failed due to code bugs that have
-    now been fixed.
-
-    Parameters:
-      booking_name      — required, e.g. "IB-20260603-00004"
-      real_payment_id   — optional, real Razorpay payment_id to replace placeholder
-      real_order_id     — optional, real Razorpay order_id to replace placeholder
-
-    Returns the same dict shape as simulate_post_payment.
+    Retry Meet + notifications for a Paid booking that partially failed.
+    USE BEFORE consultation happens. After consultation, use retry_silent_recovery.
     """
     if not booking_name:
         return {"error": "booking_name parameter required"}
@@ -216,12 +246,11 @@ def retry_post_payment_for_paid_booking(
 
     booking = frappe.get_doc("Interakt Booking", booking_name)
 
-    # 1. Update placeholder Razorpay IDs to real ones if provided
     updated_ids = []
-    if real_payment_id and booking.payment_id and "MANUAL_TEST" in booking.payment_id:
+    if real_payment_id and booking.payment_id and "MANUAL_TEST" in (booking.payment_id or ""):
         frappe.db.set_value("Interakt Booking", booking_name, "payment_id", real_payment_id)
         updated_ids.append("payment_id")
-    if real_order_id and booking.razorpay_order_id and "MANUAL_TEST" in booking.razorpay_order_id:
+    if real_order_id and booking.razorpay_order_id and "MANUAL_TEST" in (booking.razorpay_order_id or ""):
         frappe.db.set_value("Interakt Booking", booking_name, "razorpay_order_id", real_order_id)
         updated_ids.append("razorpay_order_id")
     if updated_ids:
@@ -229,11 +258,9 @@ def retry_post_payment_for_paid_booking(
 
     booking.reload()
 
-    # Resolve raw option_id time slot if still present (uses cache or static map)
     _resolve_raw_time_slot_if_needed(booking)
     booking.reload()
 
-    # 2. Determine doctor details (booking already has assigned_team_member)
     doctor_details = None
     if booking.assigned_team_member:
         doctor_details = doctor_assignment.get_doctor_details(booking.assigned_team_member)
@@ -249,7 +276,6 @@ def retry_post_payment_for_paid_booking(
         "errors": [],
     }
 
-    # ── Retry Google Meet creation ─────────────────────────────────────
     try:
         booking.meet_creation_status = "Pending"
         booking.save(ignore_permissions=True)
@@ -277,7 +303,6 @@ def retry_post_payment_for_paid_booking(
         step_results["errors"].append(f"Meet: {e}")
         frappe.log_error(frappe.get_traceback(), "Retry Meet Creation Error")
 
-    # ── Retry Patient WhatsApp (independent of Meet success) ───────────
     try:
         _send_patient_whatsapp(booking, doctor_details, speciality)
         booking.reload()
@@ -287,7 +312,6 @@ def retry_post_payment_for_paid_booking(
         step_results["errors"].append(f"Patient WhatsApp: {e}")
         frappe.log_error(frappe.get_traceback(), "Retry Patient WhatsApp Error")
 
-    # ── Retry Doctor WhatsApp (only if doctor assigned) ────────────────
     try:
         settings_doc = frappe.get_single("Booking API Settings")
         if (
@@ -305,7 +329,6 @@ def retry_post_payment_for_paid_booking(
         step_results["errors"].append(f"Doctor WhatsApp: {e}")
         frappe.log_error(frappe.get_traceback(), "Retry Doctor WhatsApp Error")
 
-    # ── Retry Admin notification ───────────────────────────────────────
     try:
         doctor_display = (
             doctor_details["display_name"]
@@ -326,13 +349,11 @@ def retry_post_payment_for_paid_booking(
 
         if admin_result.get("errors"):
             step_results["errors"].extend(admin_result["errors"])
-
     except Exception as e:
         step_results["admin"] = f"exception: {e}"
         step_results["errors"].append(f"Admin: {e}")
         frappe.log_error(frappe.get_traceback(), "Retry Admin Notification Error")
 
-    # ── Return full status ─────────────────────────────────────────────
     booking.reload()
 
     def safe(field, default="(none)"):
@@ -359,16 +380,105 @@ def retry_post_payment_for_paid_booking(
 
 
 @frappe.whitelist()
+def retry_silent_recovery(booking_name=None, real_payment_id=None, real_order_id=None):
+    """
+    SILENT RECOVERY — for bookings where consultation has ALREADY happened.
+
+    Restores ERPNext records (Payment Entry, Patient Appointment, doctor
+    assignment) WITHOUT sending any WhatsApp/email to patient/doctor/admin.
+
+    Use this when a patient paid but our webhook missed it, AND their
+    consultation time has already passed.
+    """
+    if not booking_name:
+        return {"error": "booking_name parameter required"}
+
+    if not frappe.db.exists("Interakt Booking", booking_name):
+        return {"error": f"Booking {booking_name} not found"}
+
+    booking = frappe.get_doc("Interakt Booking", booking_name)
+
+    updates = {}
+    if booking.payment_status != "Paid":
+        updates["payment_status"] = "Paid"
+        updates["booking_status"] = "Payment Confirmed"
+    if real_payment_id and not booking.payment_id:
+        updates["payment_id"] = real_payment_id
+    if real_order_id and not booking.razorpay_order_id:
+        updates["razorpay_order_id"] = real_order_id
+    if not booking.payment_received_at:
+        updates["payment_received_at"] = now_datetime()
+    if not booking.payment_amount_inr:
+        updates["payment_amount_inr"] = 499
+
+    if updates:
+        frappe.db.set_value("Interakt Booking", booking_name, updates)
+        frappe.db.commit()
+        booking.reload()
+
+    _resolve_raw_time_slot_if_needed(booking)
+    booking.reload()
+
+    results = {"ids_updated": list(updates.keys()), "errors": []}
+
+    try:
+        if not booking.assigned_team_member:
+            speciality = (getattr(booking, "speciality", None) or "Other").strip()
+            doctor_name = doctor_assignment.resolve_doctor(
+                speciality,
+                booking.preferred_date,
+                booking.preferred_time_slot
+            )
+            if doctor_name:
+                frappe.db.set_value("Interakt Booking", booking_name, "assigned_team_member", doctor_name)
+                frappe.db.commit()
+                booking.reload()
+                results["doctor_assigned"] = doctor_name
+            else:
+                results["doctor_assigned"] = "(none — fallback)"
+        else:
+            results["doctor_assigned"] = "(already assigned)"
+    except Exception as e:
+        results["errors"].append(f"Doctor assignment: {e}")
+
+    try:
+        if not booking.patient_appointment:
+            _create_patient_appointment(booking)
+            booking.reload()
+            results["patient_appointment"] = booking.patient_appointment or "(failed)"
+        else:
+            results["patient_appointment"] = "(already exists)"
+    except Exception as e:
+        results["errors"].append(f"Patient Appointment: {e}")
+
+    try:
+        if not booking.payment_entry:
+            amount = float(booking.payment_amount_inr or 499)
+            _create_payment_entry(booking, amount)
+            booking.reload()
+            results["payment_entry"] = booking.payment_entry or "(failed)"
+        else:
+            results["payment_entry"] = "(already exists)"
+    except Exception as e:
+        results["errors"].append(f"Payment Entry: {e}")
+
+    results["booking_state"] = {
+        "payment_status":       booking.payment_status,
+        "booking_status":       booking.booking_status,
+        "payment_id":           booking.payment_id,
+        "razorpay_order_id":    booking.razorpay_order_id,
+        "assigned_doctor":      booking.assigned_team_member,
+        "patient_appointment":  booking.patient_appointment,
+        "payment_entry":        booking.payment_entry,
+    }
+    results["note"] = "SILENT RECOVERY — no WhatsApp/email sent to patient/doctor/admin"
+
+    return results
+
+
+@frappe.whitelist()
 def create_missing_payment_entry(booking_name=None):
-    """
-    Whitelisted wrapper to manually create a missing Payment Entry for a
-    booking that's already marked Paid but has no payment_entry link.
-
-    Use case: an earlier live booking failed the Payment Entry creation step
-    (e.g. due to a PermissionError) and we need to retroactively create it.
-
-    Returns the Payment Entry name on success, or an error message.
-    """
+    """Create a missing Payment Entry for a Paid booking."""
     if not booking_name:
         return {"error": "booking_name parameter required"}
 
@@ -407,127 +517,22 @@ def create_missing_payment_entry(booking_name=None):
 
 
 @frappe.whitelist()
-def harvest_time_slot_option_ids(limit=500):
-    """
-    Mine the Error Log for past 'INTERAKT DEBUG: Incoming Webhook' entries
-    that captured InteractiveFlowReply events, and extract the
-    option_id → consultation_time mappings.
-
-    Each InteractiveFlowReply payload contains BOTH the raw option_id
-    (in the form's `preferred_appointment_time_PBvTYp` field) AND the
-    resolved consultation_time (in customer.traits). This function
-    correlates them and prints a ready-to-paste KNOWN_TIME_SLOT_OPTION_IDS
-    dictionary block you can drop into razorpay_webhook.py.
-
-    Parameters:
-      limit — how many recent Error Log entries to scan (default 500)
-
-    Returns:
-      dict with 'discovered_count', 'already_known_count', 'new_mappings',
-      'ready_to_paste' (string).
-    """
-    import re as re_mod
-
-    # Pattern to find the option_id under the preferred_appointment_time field.
-    # Robust to varying escaping levels (\, \\, \\\) in the raw log payload.
-    opt_pattern = re_mod.compile(
-        r'preferred_appointment_time_PBvTYp[\\\":\s]+(option_[a-z0-9_]+)'
-    )
-    # Pattern for the resolved consultation_time in customer.traits
-    time_pattern = re_mod.compile(
-        r'"consultation_time"\s*:\s*"([^"]+)"'
-    )
-
-    logs = frappe.get_all(
-        "Error Log",
-        filters={"method": "INTERAKT DEBUG: Incoming Webhook"},
-        fields=["error"],
-        order_by="creation desc",
-        limit=int(limit),
-    )
-
-    # Collect all unique option_id → time_value pairs
-    discovered = {}
-
-    for log in logs:
-        err = log.get("error", "")
-        if "InteractiveFlowReply" not in err:
-            continue
-
-        opt_match = opt_pattern.search(err)
-        time_match = time_pattern.search(err)
-        if not opt_match or not time_match:
-            continue
-
-        option_id = opt_match.group(1)
-        time_value = time_match.group(1).strip()
-
-        if not time_value or time_value.startswith("option_"):
-            continue
-
-        # Normalize weird spaces: "05: 30 PM" → "05:30 PM"
-        time_value = re_mod.sub(r":\s+", ":", time_value)
-        time_value = re_mod.sub(r"\s+", " ", time_value).strip()
-
-        # Keep the first-seen value per option_id
-        if option_id not in discovered:
-            discovered[option_id] = time_value
-
-    # Separate into already-known vs new
-    already_known = {}
-    new_mappings = {}
-    for opt, val in discovered.items():
-        if opt in KNOWN_TIME_SLOT_OPTION_IDS:
-            already_known[opt] = val
-        else:
-            new_mappings[opt] = val
-
-    # Build the ready-to-paste dict block
-    all_combined = dict(KNOWN_TIME_SLOT_OPTION_IDS)
-    all_combined.update(new_mappings)
-
-    lines = ["KNOWN_TIME_SLOT_OPTION_IDS = {"]
-    # Sort by the option_id (which has a timestamp embedded — gives rough chronological order)
-    for opt in sorted(all_combined.keys()):
-        lines.append(f'    "{opt}": "{all_combined[opt]}",')
-    lines.append("}")
-    ready_to_paste = "\n".join(lines)
-
-    return {
-        "logs_scanned": len(logs),
-        "discovered_count": len(discovered),
-        "already_known_count": len(already_known),
-        "new_mappings_count": len(new_mappings),
-        "new_mappings": new_mappings,
-        "ready_to_paste": ready_to_paste,
-    }
-
-
-@frappe.whitelist()
 def health_check_deployment():
-    """
-    Whitelisted health check — verifies the deployed code has the expected
-    fixes. Use this before running any live demo to be sure the deploy took.
-
-    Returns dict with pass/fail for each check.
-    """
+    """Verify deployment has expected fixes."""
     import inspect
 
     results = {}
 
-    # 1. Check Payment Entry function has Administrator elevation
     try:
         src = inspect.getsource(_create_payment_entry)
-        results["payment_entry_has_set_user"]        = "frappe.set_user" in src
-        results["payment_entry_has_original_user"]   = "original_user" in src
-        results["payment_entry_has_finally_block"]   = "finally:" in src
+        results["payment_entry_has_set_user"]      = "frappe.set_user" in src
+        results["payment_entry_has_original_user"] = "original_user" in src
+        results["payment_entry_has_finally_block"] = "finally:" in src
     except Exception as e:
         results["payment_entry_check_error"] = str(e)
 
-    # 2. Check Razorpay secret matches dashboard
     results["razorpay_secret_correct"] = (RAZORPAY_WEBHOOK_SECRET == "3a_JN39BAkMXYub")
 
-    # 3. Check interakt_webhook cache logic is present
     try:
         from taal_inventory.api import interakt_webhook as iw
         iw_src = inspect.getsource(iw)
@@ -536,15 +541,12 @@ def health_check_deployment():
     except Exception as e:
         results["interakt_check_error"] = str(e)
 
-    # 4. Check retry function exists
-    results["retry_function_exists"] = (
-        "retry_post_payment_for_paid_booking" in globals()
-    )
+    results["retry_function_exists"]     = ("retry_post_payment_for_paid_booking" in globals())
+    results["silent_recovery_exists"]    = ("retry_silent_recovery" in globals())
+    results["flexible_extraction_exists"] = ("_extract_payment_info" in globals())
+    results["multi_event_support"]       = len(SUCCESS_EVENTS) >= 3
 
-    all_passed = all(
-        v is True for v in results.values()
-        if isinstance(v, bool)
-    )
+    all_passed = all(v is True for v in results.values() if isinstance(v, bool))
     results["ALL_PASSED"] = all_passed
 
     return results
@@ -552,25 +554,13 @@ def health_check_deployment():
 
 @frappe.whitelist()
 def list_learned_time_slots():
-    """
-    Diagnostic — show all time slot option_id ↔ resolved label mappings
-    that the system has auto-learned from past bookings.
-
-    Combines:
-      • Static KNOWN_TIME_SLOT_OPTION_IDS (manually populated)
-      • Auto-learned mappings from frappe.cache() with 30-day TTL
-      • All option_ids ever seen in past Interakt Booking records
-
-    Use this to confirm coverage before a client demo.
-    """
+    """Diagnostic — show discovered time slot mappings."""
     result = {
         "static_map": dict(KNOWN_TIME_SLOT_OPTION_IDS),
         "auto_learned": {},
         "all_option_ids_seen_in_bookings": [],
     }
 
-    # 1. Look at every Interakt Booking ever created — find which option_ids
-    # have appeared and whether they've been resolved on subsequent bookings.
     all_bookings = frappe.get_all(
         "Interakt Booking",
         fields=["name", "preferred_time_slot"],
@@ -585,7 +575,6 @@ def list_learned_time_slots():
 
     result["all_option_ids_seen_in_bookings"] = sorted(seen_option_ids)
 
-    # 2. For each seen option_id, try to find its learned mapping
     for option_id in sorted(seen_option_ids):
         try:
             learned = frappe.cache().get_value(f"time_slot_resolved:{option_id}")
@@ -594,7 +583,6 @@ def list_learned_time_slots():
         except Exception:
             pass
 
-    # 3. Also dump anything in static map that's not been seen yet (sanity check)
     result["coverage_summary"] = {
         "in_static_map":       len(result["static_map"]),
         "auto_learned":        len(result["auto_learned"]),
@@ -609,7 +597,7 @@ def list_learned_time_slots():
 
 
 def _verify_razorpay_signature(raw_body, signature):
-    """HMAC-SHA256 verification using the webhook secret."""
+    """HMAC-SHA256 verification."""
     expected = hmac.new(
         RAZORPAY_WEBHOOK_SECRET.encode("utf-8"),
         raw_body,
@@ -619,53 +607,30 @@ def _verify_razorpay_signature(raw_body, signature):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Time slot resolver — handles race condition between Interakt webhook events
+# Time slot resolver
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Static fallback map: option_id → human-readable time label.
-# Populate from Interakt flow editor as you discover them.
-# Used as LAST-RESORT fallback if both cache lookup and trait normalization fail.
 KNOWN_TIME_SLOT_OPTION_IDS = {
     "option_1779967864173_lppvz7yvs": "12:30 PM - 01:00 PM",
     "option_1779967866725_8g7jao7ie": "02:00 PM - 02:30 PM",
     "option_1779967868993_mvtiazkdb": "03:30 PM - 04:00 PM",
     "option_1779968083706_4z0zpowea": "05:30 PM - 06:00 PM",
-    # ADD MORE AS DISCOVERED — get them from Interakt flow editor
 }
 
 
 def _normalize_time_slot_label(time_str):
-    """
-    Normalize human-typed time slot strings to canonical format.
-    Fixes weird spaces like '05: 30 PM - 06:00 PM' → '05:30 PM - 06:00 PM'.
-    """
+    """Fix weird spacing like '05: 30 PM' → '05:30 PM'."""
     if not time_str:
         return time_str
-    # Remove spaces immediately after a colon: "05: 30" → "05:30"
     cleaned = re.sub(r":\s+", ":", time_str)
-    # Collapse multiple spaces to single space
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip()
 
 
 def _resolve_raw_time_slot_if_needed(booking):
-    """
-    If a booking's preferred_time_slot is still a raw 'option_xxx' ID,
-    resolve it to a human-readable label using (in order):
-      1. frappe.cache() entry written by _handle_message_received
-      2. Static KNOWN_TIME_SLOT_OPTION_IDS fallback map
-      3. Leave unchanged + log warning
-
-    Mutates the booking object AND commits to DB. Safe to call even if the
-    slot is already resolved (no-op in that case).
-
-    This is the safety net for the race condition where two Interakt webhooks
-    arrive within milliseconds of each other and the workflow_response_update
-    handler reads cache BEFORE message_received writes to it.
-    """
+    """Resolve raw option_XXX time slots using cache → static map → log warning."""
     current_slot = booking.preferred_time_slot or ""
 
-    # Already resolved — also normalize weird spaces while we're at it
     if current_slot and not current_slot.startswith("option_"):
         normalized = _normalize_time_slot_label(current_slot)
         if normalized != current_slot:
@@ -675,16 +640,15 @@ def _resolve_raw_time_slot_if_needed(booking):
             )
             frappe.db.commit()
             booking.reload()
-        return  # Already resolved
+        return
 
     if not current_slot.startswith("option_"):
-        return  # Empty or already fine
+        return
 
     phone = booking.whatsapp_number or ""
     resolved = None
     source = None
 
-    # Method 1: frappe.cache() (populated by _handle_message_received, phone-keyed)
     try:
         cached_raw = frappe.cache().get_value(f"interakt_traits:{phone}")
         if cached_raw:
@@ -696,10 +660,6 @@ def _resolve_raw_time_slot_if_needed(booking):
     except Exception:
         pass
 
-    # Method 2: Learned mapping cache (option_id-keyed, 30-day TTL)
-    # Auto-populated by _handle_message_received every time a form is submitted.
-    # Survives long after the phone-keyed cache expires. Resolves any time slot
-    # that has been booked at least once in the last 30 days.
     if not resolved:
         try:
             learned = frappe.cache().get_value(f"time_slot_resolved:{current_slot}")
@@ -709,12 +669,10 @@ def _resolve_raw_time_slot_if_needed(booking):
         except Exception:
             pass
 
-    # Method 3: Static fallback map (manually populated)
     if not resolved and current_slot in KNOWN_TIME_SLOT_OPTION_IDS:
         resolved = KNOWN_TIME_SLOT_OPTION_IDS[current_slot]
         source = "static_map"
 
-    # Apply resolution
     if resolved:
         frappe.db.set_value(
             "Interakt Booking", booking.name,
@@ -730,100 +688,82 @@ def _resolve_raw_time_slot_if_needed(booking):
     else:
         frappe.log_error(
             f"COULD NOT RESOLVE raw time slot '{current_slot}' for booking {booking.name}, "
-            f"phone {phone}. Cache empty, not in static map. "
-            f"ADD THIS TO KNOWN_TIME_SLOT_OPTION_IDS in razorpay_webhook.py: "
-            f'"{current_slot}": "HH:MM AM/PM - HH:MM AM/PM"',
-            "Time Slot Resolution FAILED — manual fix needed"
+            f"phone {phone}.",
+            "Time Slot Resolution FAILED"
         )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Payment Success Handler — the main orchestration
+# Main Payment Success Handler — flexible extraction + strong idempotency
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _handle_payment_success(event):
-    """
-    Triggered on payment_link.paid.
-    Full orchestration of post-payment flow.
-
-    Designed so each step is isolated: a failure in (say) Google Meet creation
-    will NOT prevent Patient WhatsApp, Doctor WhatsApp, or Admin notification
-    from running.
-    """
+    """Handles any successful payment event with flexible extraction."""
     try:
-        # ── 1. Extract Razorpay IDs and customer phone ─────────────────
-        payment_link_entity = event["payload"]["payment_link"]["entity"]
-        payment_entity      = event["payload"]["payment"]["entity"]
-
-        rzp_order_id = payment_link_entity.get("id", "")
-        payment_id   = payment_entity.get("id", "")
-        amount_paise = payment_entity.get("amount", 0)
-        amount_inr   = amount_paise / 100
-
-        customer_phone_raw = (
-            payment_link_entity.get("customer", {}).get("contact")
-            or payment_entity.get("contact", "")
-            or ""
-        )
-        customer_phone = _normalize_phone(customer_phone_raw)
-
-        if not customer_phone:
+        info = _extract_payment_info(event)
+        if not info:
             frappe.log_error(
-                f"No customer phone in Razorpay event. Order: {rzp_order_id}",
-                "Razorpay Webhook: Missing Phone"
+                f"Could not extract payment info from event.\n"
+                f"Raw event:\n{json.dumps(event, indent=2, default=str)[:3000]}",
+                "Razorpay: Extraction Failed"
             )
             return
 
-        # ── 2. Idempotency check (Razorpay retries the same event) ────
-        already_processed = frappe.db.get_value(
-            "Interakt Booking",
-            filters={
-                "razorpay_order_id": rzp_order_id,
-                "payment_status": "Paid"
-            },
-            fieldname="name"
-        )
-        if already_processed:
-            return  # Already handled this exact payment_link.paid
+        payment_id   = info["payment_id"]
+        order_id     = info["order_id"]
+        contact_raw  = info["contact"]
+        amount_inr   = info["amount_inr"] or 499
+        event_type   = info["event_type"]
 
-        # ── 3. Phone-based booking lookup ──────────────────────────────
-        booking_name = frappe.db.get_value(
-            "Interakt Booking",
-            filters={
-                "whatsapp_number": customer_phone,
-                "payment_status": "Pending",
-                "booking_status": "Pending Payment"
-            },
-            fieldname="name",
-            order_by="creation DESC"
-        )
+        customer_phone = _normalize_phone(contact_raw)
+
+        # ── IDEMPOTENCY: skip if already processed under this payment_id or order_id ──
+        if payment_id:
+            already = frappe.db.get_value(
+                "Interakt Booking",
+                {"payment_id": payment_id, "payment_status": "Paid"},
+                "name"
+            )
+            if already:
+                return
+
+        if order_id:
+            already = frappe.db.get_value(
+                "Interakt Booking",
+                {"razorpay_order_id": order_id, "payment_status": "Paid"},
+                "name"
+            )
+            if already:
+                return
+
+        # ── Find matching booking via multiple strategies ──
+        booking_name = _find_matching_booking(payment_id, order_id, customer_phone)
 
         if not booking_name:
             frappe.log_error(
-                f"No pending booking for phone {customer_phone}, order {rzp_order_id}",
+                f"No pending booking match. event={event_type}, payment_id={payment_id}, "
+                f"order_id={order_id}, contact={contact_raw} (normalized: {customer_phone})",
                 "Razorpay Webhook: Booking Not Found"
             )
             return
 
         booking = frappe.get_doc("Interakt Booking", booking_name)
 
-        # ── 3a. RESOLVE raw option_id time slot from cache ─────────────
-        # By the time Razorpay's webhook fires (30+ seconds after booking
-        # creation), the message_received cache is GUARANTEED to be populated.
-        # This catches the race condition where _handle_workflow_completion
-        # stored a raw option_id because message_received hadn't cached yet.
+        # Resolve raw time slot BEFORE saving payment fields
         _resolve_raw_time_slot_if_needed(booking)
 
-        # ── 4. Update payment fields (CRITICAL — must succeed) ────────
-        booking.razorpay_order_id   = rzp_order_id
+        # Update payment fields
+        booking.razorpay_order_id   = order_id or booking.razorpay_order_id
         booking.payment_status      = "Paid"
-        booking.payment_id          = payment_id
+        booking.payment_id          = payment_id or booking.payment_id
         booking.payment_received_at = now_datetime()
         booking.booking_status      = "Payment Confirmed"
+        if not booking.payment_amount_inr:
+            booking.payment_amount_inr = amount_inr
         booking.save(ignore_permissions=True)
         frappe.db.commit()
 
-        # ── 5. Resolve assigned doctor (speciality + load-balancing) ──
+        # Resolve doctor
         speciality = (booking.speciality or "Other").strip()
         doctor_details = None
 
@@ -841,13 +781,13 @@ def _handle_payment_success(event):
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Doctor Assignment Error")
 
-        # ── 6. Create Patient Appointment ──────────────────────────────
+        # Patient Appointment
         try:
             _create_patient_appointment(booking)
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Patient Appointment Creation Error")
 
-        # ── 7. Create Payment Entry ────────────────────────────────────
+        # Payment Entry
         try:
             _create_payment_entry(booking, amount_inr)
         except Exception:
@@ -855,8 +795,7 @@ def _handle_payment_success(event):
 
         booking.reload()
 
-        # ── 8. Create Google Meet (failure does NOT block WhatsApp) ───
-        meet_succeeded = False
+        # Google Meet
         try:
             booking.meet_creation_status = "Pending"
             booking.save(ignore_permissions=True)
@@ -869,7 +808,6 @@ def _handle_payment_success(event):
                 booking.google_calendar_event_id = meet_result.get("event_id", "")
                 booking.meet_creation_status     = "Created"
                 booking.meet_creation_error      = ""
-                meet_succeeded = True
             else:
                 booking.meet_creation_status = "Failed"
                 booking.meet_creation_error  = (meet_result.get("error") or "Unknown")[:500]
@@ -880,13 +818,13 @@ def _handle_payment_success(event):
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Google Meet Creation Error")
 
-        # ── 9. Patient WhatsApp (always attempt; uses Meet link if available) ──
+        # Patient WhatsApp
         try:
             _send_patient_whatsapp(booking, doctor_details, speciality)
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Patient WhatsApp Error")
 
-        # ── 10. Doctor WhatsApp (only if doctor assigned + setting enabled) ─
+        # Doctor WhatsApp
         try:
             settings = frappe.get_single("Booking API Settings")
             if (
@@ -898,7 +836,7 @@ def _handle_payment_success(event):
         except Exception:
             frappe.log_error(frappe.get_traceback(), "Doctor WhatsApp Error")
 
-        # ── 11. Admin notification (always — WhatsApp + email) ────────
+        # Admin
         try:
             doctor_display = (
                 doctor_details["display_name"]
@@ -922,10 +860,53 @@ def _handle_payment_success(event):
             frappe.log_error(frappe.get_traceback(), "Admin Notification Error")
 
     except Exception:
+        # Log full event on any unhandled exception for post-mortem
+        try:
+            evt_snippet = json.dumps(event, indent=2, default=str)[:3000]
+        except Exception:
+            evt_snippet = str(event)[:3000]
+
         frappe.log_error(
-            frappe.get_traceback(),
+            f"Traceback:\n{frappe.get_traceback()}\n\nEvent:\n{evt_snippet}",
             "Razorpay Payment Success Handler Error"
         )
+
+
+def _find_matching_booking(payment_id, order_id, phone):
+    """Multi-strategy booking lookup."""
+    if payment_id:
+        matched = frappe.db.get_value(
+            "Interakt Booking",
+            {"payment_id": payment_id},
+            "name"
+        )
+        if matched:
+            return matched
+
+    if order_id:
+        matched = frappe.db.get_value(
+            "Interakt Booking",
+            {"razorpay_order_id": order_id},
+            "name"
+        )
+        if matched:
+            return matched
+
+    if phone:
+        matched = frappe.db.get_value(
+            "Interakt Booking",
+            filters={
+                "whatsapp_number": phone,
+                "payment_status": "Pending",
+                "booking_status": "Pending Payment"
+            },
+            fieldname="name",
+            order_by="creation DESC"
+        )
+        if matched:
+            return matched
+
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -933,7 +914,7 @@ def _handle_payment_success(event):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _send_patient_whatsapp(booking, doctor_details, speciality):
-    """Send `patient_consultation_confirmed` template to the patient."""
+    """Send patient_consultation_confirmed template."""
     settings = frappe.get_single("Booking API Settings")
 
     doctor_label = (
@@ -970,7 +951,7 @@ def _send_patient_whatsapp(booking, doctor_details, speciality):
 
 
 def _send_doctor_whatsapp(booking, doctor_details, speciality):
-    """Send `doctor_new_consultation_alert` template to the assigned doctor."""
+    """Send doctor_new_consultation_alert template."""
     settings = frappe.get_single("Booking API Settings")
 
     if not doctor_details.get("mobile_phone"):
@@ -1011,13 +992,12 @@ def _send_doctor_whatsapp(booking, doctor_details, speciality):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Patient Appointment + Payment Entry creators
+# Patient Appointment + Payment Entry
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _create_patient_appointment(booking):
-    """Auto-creates a Patient Appointment record and links it back to the booking."""
+    """Auto-create Patient Appointment."""
     try:
-        # Parse 24h time from preferred_time_slot like "04:00 PM - 04:30 PM" → "16:00:00"
         appt_time_24h = "09:00:00"
         try:
             slot = (booking.preferred_time_slot or "").strip()
@@ -1073,12 +1053,7 @@ def _create_patient_appointment(booking):
 
 
 def _get_default_company():
-    """
-    Resolve the company to use for accounting entries. Order of preference:
-      1. Booking API Settings → default_company (if configured)
-      2. Global default company (frappe.defaults)
-      3. First Company record in the system
-    """
+    """Resolve company for accounting entries."""
     try:
         company = frappe.db.get_single_value("Booking API Settings", "default_company")
         if company and frappe.db.exists("Company", company):
@@ -1095,10 +1070,7 @@ def _get_default_company():
 
 
 def _resolve_customer_from_patient(patient_name):
-    """
-    Find the Customer record linked to a Patient.
-    Falls back to using patient_name as a Customer if no link exists.
-    """
+    """Find Customer linked to Patient."""
     if not patient_name:
         return None
 
@@ -1113,28 +1085,15 @@ def _resolve_customer_from_patient(patient_name):
 
 
 def _create_payment_entry(booking, amount):
-    """
-    Auto-creates a Payment Entry for accounting reconciliation.
-    Uses the configured company's default accounts and cost center — works
-    on any environment (TCPL, TPC, or whatever the live abbreviation is).
-
-    IMPORTANT: Temporarily elevates session to Administrator. ERPNext's
-    Payment Entry validation internally calls `get_account_details` which
-    has its own `frappe.has_permission(throw=True)` check that is NOT
-    bypassed by `ignore_permissions=True` on the doc. When the webhook runs
-    as Guest, that permission check raises PermissionError.
-    """
-    # Elevate to Administrator for the full duration of Payment Entry creation
+    """Auto-create Payment Entry with Administrator elevation."""
     original_user = frappe.session.user
     frappe.set_user("Administrator")
 
     try:
-        # 1. Resolve company dynamically
         company = _get_default_company()
         if not company:
             raise Exception("No company configured in the system")
 
-        # 2. Pull company's default accounts + cost center
         company_doc = frappe.db.get_value(
             "Company", company,
             [
@@ -1168,7 +1127,6 @@ def _create_payment_entry(booking, amount):
                 f"Configure it at /app/company/{company}"
             )
 
-        # 3. Resolve Customer from Patient
         customer = _resolve_customer_from_patient(booking.patient)
         if not customer:
             raise Exception(
@@ -1176,7 +1134,6 @@ def _create_payment_entry(booking, amount):
                 f"Set Customer field on the Patient record."
             )
 
-        # 4. Create Payment Entry with all required fields
         pe = frappe.new_doc("Payment Entry")
         pe.company                       = company
         pe.posting_date                  = frappe.utils.nowdate()
@@ -1220,7 +1177,6 @@ def _create_payment_entry(booking, amount):
             "Auto Create Payment Entry Error"
         )
     finally:
-        # ALWAYS restore the original user, even if an exception occurred
         try:
             frappe.set_user(original_user)
         except Exception:
@@ -1232,18 +1188,13 @@ def _create_payment_entry(booking, amount):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _handle_payment_failed(event):
-    """
-    Triggered on payment.failed / payment_link.cancelled.
-    Marks the most recent pending booking for that phone as Cancelled.
-    """
+    """Triggered on payment failure/cancellation."""
     try:
-        payment_link_entity = event["payload"]["payment_link"]["entity"]
+        info = _extract_payment_info(event)
+        if not info:
+            return
 
-        customer_phone_raw = (
-            payment_link_entity.get("customer", {}).get("contact") or ""
-        )
-        customer_phone = _normalize_phone(customer_phone_raw)
-
+        customer_phone = _normalize_phone(info["contact"])
         if not customer_phone:
             return
 
@@ -1281,10 +1232,7 @@ def _handle_payment_failed(event):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _normalize_phone(phone):
-    """
-    Normalize phone to '91XXXXXXXXXX' (12 digits, no '+').
-    Accepts '+917679944473', '917679944473', '07679944473', '7679944473', etc.
-    """
+    """Normalize to '91XXXXXXXXXX' format."""
     if not phone:
         return ""
 
@@ -1301,4 +1249,4 @@ def _normalize_phone(phone):
     if len(s) == 12 and s.startswith("91"):
         return s
 
-    return s  # let downstream decide
+    return s
