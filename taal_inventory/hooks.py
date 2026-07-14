@@ -5,6 +5,8 @@ app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version = "1.0.0"
 app_license = "MIT"
 
+before_request = ["taal_inventory.utils.wc_status_patch.apply"]
+
 # ── DocType JS Files ─────────────────────────────────────────────
 doctype_js = {
     "Stock Receipt":  "public/js/stock_receipt.js",
