@@ -14,6 +14,7 @@ _ORDER_CATEGORY_MAP = {
     "art":  "ART",
     "pep":  "PEP",
     "prep": "PrEP",
+    "STI": "STI",
 }
 
 
