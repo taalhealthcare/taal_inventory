@@ -4,6 +4,7 @@
 # before any API method executes.
 
 import json
+import frappe
 
 _CUSTOM_WC_STATUSES = {
     "arranged": "Arranged",
@@ -14,7 +15,6 @@ _ORDER_CATEGORY_MAP = {
     "art":  "ART",
     "pep":  "PEP",
     "prep": "PrEP",
-    "STI": "STI",
 }
 
 
@@ -50,6 +50,9 @@ def _patch_update_sales_order():
         original_update = SynchroniseWooCommerceOrder.update_sales_order
 
         def patched_update(self, woocommerce_order, sales_order):
+
+            # ── Step 1: Extract category from WC meta_data ───────
+            extracted_category = ""
             try:
                 meta = woocommerce_order.meta_data
                 meta_list = (
@@ -57,22 +60,39 @@ def _patch_update_sales_order():
                     if isinstance(meta, str)
                     else (meta or [])
                 )
-
                 for item in meta_list:
                     if item.get("key") == "order_category":
-                        raw      = (item.get("value") or "").strip()
-                        category = _ORDER_CATEGORY_MAP.get(raw.lower(), "")
-
-                        # ── Only set if a valid mapped category found ──────
-                        # Empty WC value → leave SO field empty (no default)
-                        if category and hasattr(sales_order, "custom_order_category"):
-                            sales_order.custom_order_category = category
+                        raw = (item.get("value") or "").strip()
+                        extracted_category = _ORDER_CATEGORY_MAP.get(
+                            raw.lower(), ""
+                        )
                         break
-
             except Exception:
                 pass
 
+            # ── Step 2: Call original (handles status + save()) ──
             original_update(self, woocommerce_order, sales_order)
+
+            # ── Step 3: Write category AFTER save via db.set_value
+            # db.set_value bypasses allow_on_submit validation entirely
+            # This works whether the SO is draft OR submitted
+            try:
+                if extracted_category and sales_order.name:
+                    current = frappe.db.get_value(
+                        "Sales Order",
+                        sales_order.name,
+                        "custom_order_category"
+                    )
+                    if current != extracted_category:
+                        frappe.db.set_value(
+                            "Sales Order",
+                            sales_order.name,
+                            "custom_order_category",
+                            extracted_category,
+                            update_modified=False
+                        )
+            except Exception:
+                pass
 
         SynchroniseWooCommerceOrder.update_sales_order = patched_update
         SynchroniseWooCommerceOrder._taal_patched = True
