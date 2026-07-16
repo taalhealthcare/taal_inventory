@@ -6,6 +6,7 @@ app_version = "1.0.0"
 app_license = "MIT"
 
 before_request = ["taal_inventory.utils.wc_status_patch.apply"]
+before_job     = ["taal_inventory.utils.wc_status_patch.apply"]
 
 # ── DocType JS Files ─────────────────────────────────────────────
 doctype_js = {
