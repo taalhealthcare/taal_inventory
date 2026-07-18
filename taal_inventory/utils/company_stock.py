@@ -88,7 +88,6 @@ def recalculate_company_stock(pharmacy_item_name, company):
     pi_doc.current_stock = global_stock
 
     pi_doc.save(ignore_permissions=True)
-    frappe.db.commit()
 
     return company_stock_qty
 

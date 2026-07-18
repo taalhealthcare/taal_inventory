@@ -109,7 +109,6 @@ def append_stock_log(
         })
 
         pi_doc.save(ignore_permissions=True)
-        frappe.db.commit()
 
     except Exception as e:
         frappe.log_error(
