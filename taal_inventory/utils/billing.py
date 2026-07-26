@@ -30,8 +30,8 @@ def create_si_from_interakt_booking(booking_name):
 
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
-    si.posting_date = booking.get("preferred_date") or nowdate()
-    si.due_date = booking.get("preferred_date") or nowdate()
+    si.posting_date = nowdate()
+    si.due_date = nowdate()
     si.company = frappe.db.get_default("company")
     si.cost_center = "Main - TPC"
 
@@ -113,8 +113,8 @@ def create_si_from_doctor_consultation(doc_name):
 
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
-    si.posting_date = doc.get("appointment_date") or nowdate()
-    si.due_date = doc.get("appointment_date") or nowdate()
+    si.posting_date = nowdate()
+    si.due_date = nowdate()
     si.company = frappe.db.get_default("company")
     si.cost_center = "Main - TPC"
 
