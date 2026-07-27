@@ -39,6 +39,7 @@ doc_events = {
         "on_cancel": "taal_inventory.events.stock_receipt.on_adjustment_cancel",
     },
     "Pharmacy Item": {
+        "before_insert": "taal_inventory.events.pharmacy_item.before_insert",
         "after_insert": "taal_inventory.events.pharmacy_item.after_insert",
         "on_update":    "taal_inventory.events.pharmacy_item.on_update",
     },

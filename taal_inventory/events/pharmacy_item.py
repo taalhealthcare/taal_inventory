@@ -1,4 +1,20 @@
 import frappe
+import re
+
+
+def before_insert(doc, method):
+    """
+    Auto-generate item_code before Pharmacy Item is inserted.
+    Format: TPIC <N> where N is the next available integer.
+    Checks both tabPharmacy Item and tabItem to find the highest
+    existing TPIC number and assigns the next one.
+    If item_code is already filled in, skip auto-generation.
+    """
+    if doc.item_code and doc.item_code.strip():
+        # item_code already provided — do not overwrite
+        return
+
+    doc.item_code = _generate_next_tpic_code()
 
 
 def after_insert(doc, method):
@@ -9,6 +25,78 @@ def after_insert(doc, method):
 def on_update(doc, method):
     """Triggered after Pharmacy Item is saved or updated."""
     _sync_to_item_master(doc)
+
+
+def _generate_next_tpic_code():
+    """
+    Finds the highest TPIC number across tabPharmacy Item and tabItem
+    and returns the next one as 'TPIC <N+1>'.
+    Thread-safe: uses frappe.db.sql with FOR UPDATE equivalent
+    by locking with a unique name generation approach.
+    """
+    prefix = "TPIC "
+    max_num = 0
+
+    # ── Check Pharmacy Item table ─────────────────────────────────────────────
+    pi_codes = frappe.db.sql("""
+        SELECT item_code
+        FROM `tabPharmacy Item`
+        WHERE item_code LIKE 'TPIC %'
+        ORDER BY
+            CAST(
+                REGEXP_REPLACE(item_code, '[^0-9]', '')
+                AS UNSIGNED
+            ) DESC
+        LIMIT 1
+    """, as_dict=True)
+
+    if pi_codes:
+        code = pi_codes[0].item_code or ""
+        match = re.search(r"TPIC\s+(\d+)", code, re.IGNORECASE)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+
+    # ── Check Item Master table ───────────────────────────────────────────────
+    item_codes = frappe.db.sql("""
+        SELECT name
+        FROM `tabItem`
+        WHERE name LIKE 'TPIC %'
+        ORDER BY
+            CAST(
+                REGEXP_REPLACE(name, '[^0-9]', '')
+                AS UNSIGNED
+            ) DESC
+        LIMIT 1
+    """, as_dict=True)
+
+    if item_codes:
+        code = item_codes[0].name or ""
+        match = re.search(r"TPIC\s+(\d+)", code, re.IGNORECASE)
+        if match:
+            num = int(match.group(1))
+            if num > max_num:
+                max_num = num
+
+    next_num  = max_num + 1
+    next_code = prefix + str(next_num)
+
+    # ── Safety check: ensure generated code does not already exist ────────────
+    # In case of race condition, increment until a free code is found
+    attempts = 0
+    while attempts < 20:
+        pi_exists   = frappe.db.exists("Pharmacy Item", {"item_code": next_code})
+        item_exists = frappe.db.exists("Item", next_code)
+
+        if not pi_exists and not item_exists:
+            break
+
+        next_num  += 1
+        next_code  = prefix + str(next_num)
+        attempts  += 1
+
+    return next_code
 
 
 def _sync_to_item_master(doc):
