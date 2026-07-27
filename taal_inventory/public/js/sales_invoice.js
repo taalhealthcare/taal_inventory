@@ -1,7 +1,9 @@
 // ── Sales Invoice — FEFO Rate + Qty Validation ───────────────
-// Strategy: store FEFO rate in frm.__fefo_rates map
-// Hook into price_list_rate trigger to override ERPNext
-// every time it tries to reset rate from Item Price
+// taal_inventory/public/js/sales_invoice.js
+//
+// FEFO rate is fetched from Pharmacy Batch on item selection.
+// Rate is set ONCE — user can freely edit it to any value after.
+// Rate override triggers have been intentionally removed.
 
 frappe.ui.form.on("Sales Invoice", {
 
@@ -9,7 +11,6 @@ frappe.ui.form.on("Sales Invoice", {
         if (!frm.doc.docstatus) {
             frm.set_value("ignore_pricing_rule", 1);
         }
-        // Initialize FEFO rate storage map on form
         if (!frm.__fefo_rates) {
             frm.__fefo_rates = {};
         }
@@ -46,7 +47,6 @@ frappe.ui.form.on("Sales Invoice Item", {
         var row = locals[cdt][cdn];
         if (!row.item_code) return;
 
-        // Clear stored rate for this row when item changes
         if (frm.__fefo_rates) {
             delete frm.__fefo_rates[cdn];
         }
@@ -54,53 +54,30 @@ frappe.ui.form.on("Sales Invoice Item", {
         fetch_fefo_rate(frm, cdt, cdn, row.item_code);
     },
 
-    // ── THIS IS THE KEY FIX ──────────────────────────────────
-    // ERPNext calls set_value("price_list_rate") after
-    // get_item_details API returns. We intercept it here
-    // and immediately override with our stored FEFO rate.
+    // ── price_list_rate ──────────────────────────────────────
+    // Intercept ONLY on the first ERPNext sync — when rate still
+    // equals price_list_rate but neither matches our FEFO rate.
+    // After this one-time correction the user edits rate freely.
     price_list_rate: function(frm, cdt, cdn) {
-        var fefo_rate = frm.__fefo_rates
-            && frm.__fefo_rates[cdn];
+        var fefo_rate = frm.__fefo_rates && frm.__fefo_rates[cdn];
         if (!fefo_rate || fefo_rate <= 0) return;
 
         var row = locals[cdt][cdn];
-        // Only override if ERPNext is trying to set wrong rate
-        if (row.price_list_rate !== fefo_rate) {
-            frappe.model.set_value(
-                cdt, cdn, "price_list_rate", fefo_rate);
-            frappe.model.set_value(
-                cdt, cdn, "rate", fefo_rate);
+        if (row.rate === row.price_list_rate && row.rate !== fefo_rate) {
+            frappe.model.set_value(cdt, cdn, "price_list_rate", fefo_rate);
+            frappe.model.set_value(cdt, cdn, "rate", fefo_rate);
         }
     },
 
-    // Also intercept rate changes from ERPNext
-    rate: function(frm, cdt, cdn) {
-        var fefo_rate = frm.__fefo_rates
-            && frm.__fefo_rates[cdn];
-        if (!fefo_rate || fefo_rate <= 0) return;
+    // ── rate ─────────────────────────────────────────────────
+    // NOT intercepted — user can freely change rate to any value.
 
-        var row = locals[cdt][cdn];
-        if (row.rate !== fefo_rate) {
-            frappe.model.set_value(
-                cdt, cdn, "rate", fefo_rate);
-        }
-    },
-
+    // ── qty ──────────────────────────────────────────────────
+    // Only validates qty against available stock.
+    // Does NOT reset rate — user's edited rate is preserved.
     qty: function(frm, cdt, cdn) {
         var row = locals[cdt][cdn];
         if (!row.item_code || !row.qty) return;
-
-        // Re-apply stored FEFO rate — qty trigger
-        // causes ERPNext to recalculate pricing
-        var fefo_rate = frm.__fefo_rates
-            && frm.__fefo_rates[cdn];
-        if (fefo_rate && fefo_rate > 0) {
-            frappe.model.set_value(
-                cdt, cdn, "rate", fefo_rate);
-            frappe.model.set_value(
-                cdt, cdn, "price_list_rate", fefo_rate);
-        }
-
         validate_qty(frm, cdt, cdn, row);
     }
 });
@@ -120,8 +97,7 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
                         + "</b> are expired or exhausted.",
                     indicator: "red"
                 });
-                frappe.model.set_value(
-                    cdt, cdn, "item_code", "");
+                frappe.model.set_value(cdt, cdn, "item_code", "");
                 return;
             }
 
@@ -131,19 +107,14 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
             var expiry_date   = r.message.expiry_date   || "";
 
             if (rate > 0) {
-                // Store FEFO rate in form-level map
-                // keyed by row cdn (unique per row)
                 if (!frm.__fefo_rates) {
                     frm.__fefo_rates = {};
                 }
                 frm.__fefo_rates[cdn] = rate;
 
-                // Set rate — price_list_rate trigger above
-                // will defend this value if ERPNext overrides
-                frappe.model.set_value(
-                    cdt, cdn, "price_list_rate", rate);
-                frappe.model.set_value(
-                    cdt, cdn, "rate", rate);
+                // Set rate once — user can edit freely after this
+                frappe.model.set_value(cdt, cdn, "price_list_rate", rate);
+                frappe.model.set_value(cdt, cdn, "rate", rate);
                 frm.refresh_field("items");
             }
 
@@ -159,7 +130,6 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
 }
 
 function validate_qty(frm, cdt, cdn, row) {
-    // Fetch nearest expiry batch details (FEFO)
     frappe.call({
         method: "taal_inventory.events.sales_invoice.get_fifo_rate",
         args: { item_code: row.item_code },
@@ -171,21 +141,10 @@ function validate_qty(frm, cdt, cdn, row) {
             var expiry_date     = r.message.expiry_date   || "";
 
             if (row.qty > batch_remaining) {
-                // Cap qty at batch remaining
-                frappe.model.set_value(
-                    cdt, cdn, "qty", batch_remaining);
+                frappe.model.set_value(cdt, cdn, "qty", batch_remaining);
 
-                // Re-apply FEFO rate after qty correction
-                var fefo_rate = frm.__fefo_rates
-                    && frm.__fefo_rates[cdn];
-                if (fefo_rate && fefo_rate > 0) {
-                    frappe.model.set_value(
-                        cdt, cdn, "rate", fefo_rate);
-                    frappe.model.set_value(
-                        cdt, cdn, "price_list_rate", fefo_rate);
-                }
+                // Rate is NOT reset — user's edited rate is preserved
 
-                // Pop-Up Message of Stock Limit
                 frappe.msgprint({
                     title: "⚠&nbsp; Stock Alert — Quantity Adjusted",
                     indicator: "orange",
