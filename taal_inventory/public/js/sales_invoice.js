@@ -5,6 +5,7 @@
 // Rate is set ONCE — user can freely edit it to any value after.
 // Rate override triggers have been intentionally removed.
 // Item dropdown filtered to Pharmacy Items only.
+// On refresh: validates all items from Sales Order (WooCommerce).
 
 frappe.ui.form.on("Sales Invoice", {
 
@@ -28,6 +29,7 @@ frappe.ui.form.on("Sales Invoice", {
         if (!frm.__fefo_rates) {
             frm.__fefo_rates = {};
         }
+
         if (!frm.doc.docstatus) {
             frm.add_custom_button("Scan Barcode", function() {
                 frappe.prompt(
@@ -45,6 +47,18 @@ frappe.ui.form.on("Sales Invoice", {
                     "Add Item"
                 );
             }, "Actions");
+        }
+
+        // ── Validate all existing items on form load ──────────────────
+        // Handles Sales Invoice created from Sales Order (WooCommerce)
+        // where item_code trigger never fired during item population.
+        // Only runs on draft invoices that have items already populated.
+        if (
+            frm.doc.docstatus === 0 &&
+            frm.doc.items &&
+            frm.doc.items.length > 0
+        ) {
+            validate_all_items_on_load(frm);
         }
     }
 
@@ -93,6 +107,83 @@ frappe.ui.form.on("Sales Invoice Item", {
     }
 
 });
+
+
+// ── Validate all items when form loads from Sales Order ───────────────────────
+// Called from refresh trigger for SO-based and WooCommerce invoices.
+// Shows a consolidated red warning if any item has no active stock.
+function validate_all_items_on_load(frm) {
+    // Use a short delay to allow form to fully render before API calls
+    setTimeout(function() {
+        var blocked_items = [];
+        var checked       = 0;
+        var total         = (frm.doc.items || []).filter(function(r) {
+            return !!r.item_code;
+        }).length;
+
+        if (total === 0) return;
+
+        (frm.doc.items || []).forEach(function(row) {
+            if (!row.item_code) return;
+
+            frappe.call({
+                method: "taal_inventory.events.sales_invoice.get_fifo_rate",
+                args: { item_code: row.item_code },
+                callback: function(r) {
+                    checked++;
+
+                    if (r.message && r.message.blocked) {
+                        blocked_items.push(
+                            "<b>" + row.item_code + "</b>" +
+                            (row.item_name ? " — " + row.item_name : "")
+                        );
+                    } else if (r.message && r.message.rate > 0) {
+                        if (!frm.__fefo_rates) frm.__fefo_rates = {};
+                        frm.__fefo_rates[row.name] = r.message.rate;
+                    }
+
+                    // All items checked — show consolidated warning
+                    if (checked === total && blocked_items.length > 0) {
+                        frappe.msgprint({
+                            title: "⚠ Stock Warning — Items Have No Available Stock",
+                            indicator: "red",
+                            message:
+                                "<div style='" +
+                                "font-family:Arial,sans-serif;" +
+                                "background:#fff5f5;" +
+                                "border-left:4px solid #e74c3c;" +
+                                "border-radius:8px;" +
+                                "padding:16px 20px;" +
+                                "'>" +
+                                "<p style='margin:0 0 10px 0;color:#c0392b;font-weight:700;'>" +
+                                "The following items have no active stock " +
+                                "(all batches expired or exhausted):" +
+                                "</p>" +
+                                "<ul style='margin:0;padding-left:20px;color:#2c3e50;'>" +
+                                blocked_items.map(function(item) {
+                                    return "<li style='padding:4px 0;'>" + item + "</li>";
+                                }).join("") +
+                                "</ul>" +
+                                "<p style='margin:12px 0 0 0;color:#7f8c8d;font-size:12px;'>" +
+                                "This invoice was created from a Sales Order. " +
+                                "Please ensure stock is available before submitting." +
+                                "</p>" +
+                                "</div>"
+                        });
+
+                        frm.dashboard.clear_comment();
+                        frm.dashboard.add_comment(
+                            "STOCK WARNING: " +
+                            blocked_items.join(", ") +
+                            " — No active batch. Do NOT submit without restocking.",
+                            "red"
+                        );
+                    }
+                }
+            });
+        });
+    }, 800);
+}
 
 
 function fetch_fefo_rate(frm, cdt, cdn, item_code) {
