@@ -598,3 +598,37 @@ def _sync_item_price(item_code, selling_price, expiry_date):
             f"Item Price sync failed for {item_code}: {str(e)}",
             "Item Price Sync Error"
         )
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def get_pharmacy_items_for_purchase(doctype, txt, searchfield, start, page_len, filters):
+    """
+    Search filter for item_code field in Purchase Invoice Item.
+    Returns only Item Master records that have a matching
+    Pharmacy Item — active or inactive (both can receive new stock).
+    Searches by item_code, item_name, or pharmacy item_name.
+    """
+    return frappe.db.sql("""
+        SELECT
+            i.name,
+            i.item_name,
+            i.description
+        FROM `tabItem` i
+        INNER JOIN `tabPharmacy Item` pi
+            ON pi.item_code = i.name
+        WHERE
+            i.disabled          = 0
+            AND i.is_purchase_item  = 1
+            AND (
+                i.name       LIKE %(txt)s
+                OR i.item_name   LIKE %(txt)s
+                OR pi.item_name  LIKE %(txt)s
+            )
+        ORDER BY
+            i.item_name ASC
+        LIMIT %(page_len)s OFFSET %(start)s
+    """, {
+        "txt":      "%" + (txt or "") + "%",
+        "start":    start,
+        "page_len": page_len
+    })        
