@@ -4,6 +4,7 @@
 // FEFO rate is fetched from Pharmacy Batch on item selection.
 // Rate is set ONCE — user can freely edit it to any value after.
 // Rate override triggers have been intentionally removed.
+// Item dropdown filtered to Pharmacy Items only.
 
 frappe.ui.form.on("Sales Invoice", {
 
@@ -14,6 +15,13 @@ frappe.ui.form.on("Sales Invoice", {
         if (!frm.__fefo_rates) {
             frm.__fefo_rates = {};
         }
+
+        // ── Filter item_code dropdown to Pharmacy Items only ──────────
+        frm.set_query("item_code", "items", function() {
+            return {
+                query: "taal_inventory.events.sales_invoice.get_pharmacy_items_for_invoice"
+            };
+        });
     },
 
     refresh: function(frm) {
@@ -39,7 +47,9 @@ frappe.ui.form.on("Sales Invoice", {
             }, "Actions");
         }
     }
+
 });
+
 
 frappe.ui.form.on("Sales Invoice Item", {
 
@@ -55,8 +65,9 @@ frappe.ui.form.on("Sales Invoice Item", {
     },
 
     // ── price_list_rate ──────────────────────────────────────
-    // Intercept ONLY on the first ERPNext sync — when rate still
-    // equals price_list_rate but neither matches our FEFO rate.
+    // ERPNext fires this after get_item_details API returns.
+    // Intercept ONLY on the first sync — when rate still equals
+    // price_list_rate but neither matches our FEFO rate yet.
     // After this one-time correction the user edits rate freely.
     price_list_rate: function(frm, cdt, cdn) {
         var fefo_rate = frm.__fefo_rates && frm.__fefo_rates[cdn];
@@ -80,7 +91,9 @@ frappe.ui.form.on("Sales Invoice Item", {
         if (!row.item_code || !row.qty) return;
         validate_qty(frm, cdt, cdn, row);
     }
+
 });
+
 
 function fetch_fefo_rate(frm, cdt, cdn, item_code) {
     frappe.call({
@@ -129,6 +142,7 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
     });
 }
 
+
 function validate_qty(frm, cdt, cdn, row) {
     frappe.call({
         method: "taal_inventory.events.sales_invoice.get_fifo_rate",
@@ -142,8 +156,6 @@ function validate_qty(frm, cdt, cdn, row) {
 
             if (row.qty > batch_remaining) {
                 frappe.model.set_value(cdt, cdn, "qty", batch_remaining);
-
-                // Rate is NOT reset — user's edited rate is preserved
 
                 frappe.msgprint({
                     title: "⚠&nbsp; Stock Alert — Quantity Adjusted",
@@ -210,6 +222,7 @@ function validate_qty(frm, cdt, cdn, row) {
         }
     });
 }
+
 
 function scan_and_add_item(frm, barcode) {
     if (!barcode) return;

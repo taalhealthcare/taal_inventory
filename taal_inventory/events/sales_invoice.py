@@ -485,3 +485,46 @@ def _check_notify(pi_name, new_stock):
         send_stock_alert(pi, new_stock, "ALERT")
     elif new_stock <= float(pi.reorder_value or 0):
         send_stock_alert(pi, new_stock, "REORDER")
+
+
+@frappe.whitelist()
+@frappe.validate_and_sanitize_search_inputs
+def get_pharmacy_items_for_invoice(doctype, txt, searchfield, start, page_len, filters):
+    """
+    Search filter for item_code field in Sales Invoice Item.
+    Called by frm.set_query in sales_invoice.js.
+
+    Returns only Item Master records that have a matching
+    active Pharmacy Item — so the dropdown never shows
+    non-pharmacy items (lab tests, services, consumables etc.)
+
+    Searches across:
+      - Item.name       (TPIC 38)
+      - Item.item_name  (Taffic Tablet)
+      - PI.item_name    (alternate pharmacy name)
+    """
+    return frappe.db.sql("""
+        SELECT
+            i.name,
+            i.item_name,
+            i.description
+        FROM `tabItem` i
+        INNER JOIN `tabPharmacy Item` pi
+            ON  pi.item_code = i.name
+            AND pi.is_active = 1
+        WHERE
+            i.disabled      = 0
+            AND i.is_sales_item = 1
+            AND (
+                i.name       LIKE %(txt)s
+                OR i.item_name   LIKE %(txt)s
+                OR pi.item_name  LIKE %(txt)s
+            )
+        ORDER BY
+            i.item_name ASC
+        LIMIT %(page_len)s OFFSET %(start)s
+    """, {
+        "txt":      "%" + (txt or "") + "%",
+        "start":    start,
+        "page_len": page_len
+    })        
