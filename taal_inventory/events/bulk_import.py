@@ -1,7 +1,7 @@
 """
 taal_inventory/events/bulk_import.py
 Bulk Sales Invoice import from Excel.
-Called once from ERPNext System Console.
+Called from ERPNext System Console via frappe.call()
 """
 
 import frappe
@@ -65,39 +65,19 @@ def to_f(val):
         return 0.0
 
 
-@frappe.whitelist()
-def run_import(dry_run=True):
-    """
-    Main entry point. Call from System Console:
-    frappe.call("taal_inventory.events.bulk_import.run_import", dry_run=True)
-    """
-    dry_run = frappe.utils.cint(dry_run)
-
-    result = {
-        "dry_run":             bool(dry_run),
-        "total_rows":          0,
-        "total_invoices":      0,
-        "created":             [],
-        "skipped":             [],
-        "errors":              [],
-        "missing_customers":   [],
-        "unmapped_items":      [],
-    }
-
-    # ── Find uploaded Excel file ──────────────────────────────
+def get_file_path():
+    """Returns full disk path of the uploaded Excel file."""
     file_doc = frappe.db.get_value(
         "File",
         {"file_name": "Sales_Apr_Jun_2026_FIXED_Import.xlsx"},
         ["name", "file_url", "is_private"],
         as_dict=True
     )
-
     if not file_doc:
         frappe.throw(
             "Excel file not found in Frappe Files. "
             "Upload Sales_Apr_Jun_2026_FIXED_Import.xlsx first."
         )
-
     if file_doc.is_private:
         full_path = frappe.get_site_path() + "/private" + file_doc.file_url
     else:
@@ -106,19 +86,27 @@ def run_import(dry_run=True):
     if not os.path.exists(full_path):
         frappe.throw("File not found on disk: " + full_path)
 
-    # ── Read Excel ────────────────────────────────────────────
-    wb   = openpyxl.load_workbook(full_path, data_only=True)
-    ws   = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    data = rows[1:]
+    return full_path
 
-    result["total_rows"] = len(data)
 
-    # ── Group rows into invoices ──────────────────────────────
-    invoices = {}
+def read_invoices(state_filter=None):
+    """
+    Reads Excel and groups rows into invoice dicts.
+    state_filter: if set to 'inter-state', only returns inter-state invoices.
+    """
+    full_path = get_file_path()
+    wb        = openpyxl.load_workbook(full_path, data_only=True)
+    ws        = wb.active
+    rows      = list(ws.iter_rows(values_only=True))
+    data      = rows[1:]
+
+    invoices     = {}
+    unmapped     = []
+    skipped_rows = 0
 
     for i, row in enumerate(data):
         if not row or not row[0]:
+            skipped_rows += 1
             continue
 
         posting_date   = str(row[1])[:10] if row[1] else ""
@@ -133,13 +121,16 @@ def run_import(dry_run=True):
         rate           = to_f(row[19])
 
         if not customer or not posting_date or not item_name:
+            skipped_rows += 1
+            continue
+
+        # Apply state filter if set
+        if state_filter and state_type.strip().lower() != state_filter.lower():
             continue
 
         item_code = ITEM_MAP.get(item_name)
         if not item_code:
-            result["unmapped_items"].append(
-                "Row " + str(i + 2) + ": " + item_name
-            )
+            unmapped.append("Row " + str(i + 2) + ": " + item_name)
             continue
 
         inv_key = (
@@ -168,67 +159,110 @@ def run_import(dry_run=True):
             "rate":      rate,
         })
 
-    result["total_invoices"] = len(invoices)
+    return invoices, unmapped, skipped_rows
 
-    # ── Check customers ───────────────────────────────────────
-    all_customers = list(set(
-        v["customer"] for v in invoices.values()
-    ))
+
+def create_invoice(inv_data, place_of_supply):
+    """Creates a single Sales Invoice doc and inserts it."""
+    si = frappe.get_doc({
+        "doctype":                         "Sales Invoice",
+        "naming_series":                   "SINV-.YY.-",
+        "posting_date":                    inv_data["posting_date"],
+        "due_date":                        inv_data["due_date"],
+        "customer":                        inv_data["customer"],
+        "company":                         "Taalplus CHC Private Limited",
+        "currency":                        "INR",
+        "selling_price_list":              "Standard Selling",
+        "ignore_pricing_rule":             1,
+        "set_posting_time":                1,
+        "place_of_supply":                 place_of_supply,
+        "custom_online__offline":          inv_data["online_offline"],
+        "custom_state_type":               inv_data["state_type"],
+        "custom_location":                 inv_data["location"],
+        "custom_courier_charges_required": inv_data["courier_req"],
+        "custom_courier_manually_edited":  1,
+        "items": [
+            {
+                "item_code": item["item_code"],
+                "item_name": item["item_name"],
+                "qty":       item["qty"],
+                "rate":      item["rate"],
+                "uom":       "Nos",
+            }
+            for item in inv_data["items"]
+        ]
+    })
+    si.flags.ignore_permissions = True
+    si.flags.ignore_mandatory   = True
+    si.insert()
+    return si.name
+
+
+def get_place_of_supply(state_type):
+    """Returns correct place_of_supply based on state_type."""
+    st = state_type.strip().lower()
+    if st == "intra-state":
+        return "27-Maharashtra"
+    elif st == "inter-state":
+        return "07-Delhi"
+    elif st == "international":
+        return "96-Other Countries"
+    return "27-Maharashtra"
+
+
+@frappe.whitelist()
+def run_import(dry_run=True):
+    """
+    Main import entry point.
+    Call from System Console:
+      frappe.call("taal_inventory.events.bulk_import.run_import", dry_run=True)
+    """
+    dry_run = frappe.utils.cint(dry_run)
+
+    invoices, unmapped, skipped_rows = read_invoices()
+
+    result = {
+        "dry_run":            bool(dry_run),
+        "total_rows":         0,
+        "total_invoices":     len(invoices),
+        "created":            [],
+        "skipped":            [],
+        "errors":             [],
+        "missing_customers":  [],
+        "unmapped_items":     unmapped,
+    }
+
+    # Check customers
+    all_customers = list(set(v["customer"] for v in invoices.values()))
     for cust in all_customers:
         if not frappe.db.exists("Customer", cust):
             result["missing_customers"].append(cust)
 
-    # ── Create invoices ───────────────────────────────────────
     for inv_key, inv_data in invoices.items():
 
         if inv_data["customer"] in result["missing_customers"]:
             result["skipped"].append({
                 "customer": inv_data["customer"],
                 "date":     inv_data["posting_date"],
-                "reason":   "Customer not in ERPNext"
+                "reason":   "Customer not found"
             })
             continue
+
+        pos = get_place_of_supply(inv_data["state_type"])
 
         if dry_run:
             result["created"].append(
                 inv_data["posting_date"] +
                 " | " + inv_data["customer"] +
-                " | " + str(len(inv_data["items"])) + " item(s)"
+                " | " + str(len(inv_data["items"])) + " item(s)" +
+                " | " + inv_data["state_type"] +
+                " | POS: " + pos
             )
             continue
 
         try:
-            si = frappe.get_doc({
-                "doctype":                         "Sales Invoice",
-                "naming_series":                   "SINV-.YY.-",
-                "posting_date":                    inv_data["posting_date"],
-                "due_date":                        inv_data["due_date"],
-                "customer":                        inv_data["customer"],
-                "company":                         "Taalplus CHC Private Limited",
-                "currency":                        "INR",
-                "selling_price_list":              "Standard Selling",
-                "ignore_pricing_rule":             1,
-                "set_posting_time":                1,
-                "custom_online__offline":          inv_data["online_offline"],
-                "custom_state_type":               inv_data["state_type"],
-                "custom_location":                 inv_data["location"],
-                "custom_courier_charges_required": inv_data["courier_req"],
-                "custom_courier_manually_edited":  1,
-                "items": [
-                    {
-                        "item_code": item["item_code"],
-                        "item_name": item["item_name"],
-                        "qty":       item["qty"],
-                        "rate":      item["rate"],
-                        "uom":       "Nos",
-                    }
-                    for item in inv_data["items"]
-                ]
-            })
-            si.flags.ignore_permissions = True
-            si.flags.ignore_mandatory   = True
-            si.insert()
-            result["created"].append(si.name)
+            si_name = create_invoice(inv_data, pos)
+            result["created"].append(si_name)
 
             if len(result["created"]) % 50 == 0:
                 frappe.db.commit()
@@ -242,4 +276,58 @@ def run_import(dry_run=True):
     if not dry_run:
         frappe.db.commit()
 
+    return result
+
+
+@frappe.whitelist()
+def retry_interstate():
+    """
+    Retries only Inter-State invoices that failed.
+    Sets place_of_supply = 07-Delhi to bypass SS_11 validation.
+    Call from System Console:
+      frappe.call("taal_inventory.events.bulk_import.retry_interstate")
+    """
+    invoices, unmapped, _ = read_invoices(state_filter="inter-state")
+
+    result = {
+        "total_interstate": len(invoices),
+        "already_created":  0,
+        "created":          [],
+        "errors":           []
+    }
+
+    for inv_key, inv_data in invoices.items():
+
+        # Check if already created successfully
+        existing = frappe.db.sql("""
+            SELECT name FROM `tabSales Invoice`
+            WHERE customer          = %s
+              AND posting_date      = %s
+              AND custom_state_type = %s
+              AND docstatus         != 2
+            LIMIT 1
+        """, (
+            inv_data["customer"],
+            inv_data["posting_date"],
+            inv_data["state_type"]
+        ), as_dict=True)
+
+        if existing:
+            result["already_created"] += 1
+            continue
+
+        try:
+            si_name = create_invoice(inv_data, "07-Delhi")
+            result["created"].append(si_name)
+
+            if len(result["created"]) % 20 == 0:
+                frappe.db.commit()
+
+        except Exception as e:
+            result["errors"].append({
+                "key":   inv_key[:80],
+                "error": str(e)[:300]
+            })
+
+    frappe.db.commit()
     return result
