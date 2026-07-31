@@ -5,7 +5,10 @@ app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version     = "1.0.0"
 app_license     = "MIT"
 
-before_request = ["taal_inventory.utils.wc_status_patch.apply"]
+before_request = [
+    "taal_inventory.utils.wc_status_patch.apply",
+    "taal_inventory.utils.erpnext_patches.apply",
+]
 before_job     = ["taal_inventory.utils.wc_status_patch.apply"]
 
 doctype_js = {
