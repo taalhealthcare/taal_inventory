@@ -1,0 +1,124 @@
+{
+ "actions": [],
+ "creation": "2026-08-02 10:00:00.000000",
+ "doctype": "DocType",
+ "document_type": "Document",
+ "engine": "InnoDB",
+ "is_single": 1,
+ "issingle": 1,
+ "field_order": [
+  "section_status",
+  "refill_reminder_enabled",
+  "column_break_status",
+  "refill_reminder_days_before",
+  "section_template",
+  "refill_reminder_template_name",
+  "column_break_template",
+  "refill_reminder_template_language",
+  "section_webhook",
+  "webhook_verify_token",
+  "column_break_webhook",
+  "webhook_info",
+  "section_notes",
+  "settings_note"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_status",
+   "fieldtype": "Section Break",
+   "label": "Scheduler Control"
+  },
+  {
+   "fieldname": "refill_reminder_enabled",
+   "fieldtype": "Check",
+   "label": "Refill Reminder Enabled",
+   "default": "0",
+   "description": "Enable this ONLY after full end-to-end testing is complete. Master on/off switch — scheduler checks this first."
+  },
+  {
+   "fieldname": "column_break_status",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "refill_reminder_days_before",
+   "fieldtype": "Int",
+   "label": "Remind N Days Before Refill Date",
+   "default": "2",
+   "description": "Send the WhatsApp reminder this many days before next_refill_date. Default: 2 days."
+  },
+  {
+   "fieldname": "section_template",
+   "fieldtype": "Section Break",
+   "label": "WhatsApp Template"
+  },
+  {
+   "fieldname": "refill_reminder_template_name",
+   "fieldtype": "Data",
+   "label": "Template Name",
+   "reqd": 0,
+   "description": "Exact template name from Meta Business Manager (case-sensitive). E.g. refill_reminder_patient"
+  },
+  {
+   "fieldname": "column_break_template",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "refill_reminder_template_language",
+   "fieldtype": "Data",
+   "label": "Template Language Code",
+   "default": "en_US",
+   "description": "Language code as approved in Meta Business Manager. Usually en_US or en."
+  },
+  {
+   "fieldname": "section_webhook",
+   "fieldtype": "Section Break",
+   "label": "Webhook Security"
+  },
+  {
+   "fieldname": "webhook_verify_token",
+   "fieldtype": "Password",
+   "label": "Webhook Verify Token",
+   "description": "Any secret string you choose. Must match exactly what you set in Meta Business Manager → Webhooks."
+  },
+  {
+   "fieldname": "column_break_webhook",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "webhook_info",
+   "fieldtype": "HTML",
+   "label": "Webhook URL",
+   "options": "<div style='padding:8px 0;font-size:13px;color:#6c757d;'><strong>Webhook URL to register in Meta:</strong><br><code style='background:#f4f4f4;padding:4px 8px;border-radius:4px;font-size:12px;'>https://erp.taalhealthcare.com/api/method/taal_inventory.api.refill_webhook.handle</code></div>"
+  },
+  {
+   "fieldname": "section_notes",
+   "fieldtype": "Section Break",
+   "label": "Notes"
+  },
+  {
+   "fieldname": "settings_note",
+   "fieldtype": "HTML",
+   "label": "API Credentials Note",
+   "options": "<div style='padding:8px 0;font-size:13px;color:#6c757d;'><strong>WhatsApp API credentials</strong> (phone_number_id, access_token) are shared with Doctor Consultation and are read from <em>Doctor Consultation Meet Settings</em> — no need to re-enter them here.</div>"
+  }
+ ],
+ "links": [],
+ "modified": "2026-08-02 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Taal Inventory",
+ "name": "Refill Reminder Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 1
+}

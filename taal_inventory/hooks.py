@@ -25,6 +25,11 @@ scheduler_events = {
     "daily": [
         "taal_inventory.tasks.check_expiry_alerts",
         "taal_inventory.tasks.check_low_stock_daily",
+        # ── Refill Reminder ────────────────────────────────────────────────────
+        # Runs once every morning. Sends WhatsApp reminders to WC customers
+        # whose next_refill_date is within N days. Controlled by the master
+        # switch in Refill Reminder Settings → refill_reminder_enabled.
+        "taal_inventory.utils.refill_reminder.run_refill_reminder_check",
     ],
 }
 
@@ -43,8 +48,8 @@ doc_events = {
     },
     "Pharmacy Item": {
         "before_insert": "taal_inventory.events.pharmacy_item.before_insert",
-        "after_insert": "taal_inventory.events.pharmacy_item.after_insert",
-        "on_update":    "taal_inventory.events.pharmacy_item.on_update",
+        "after_insert":  "taal_inventory.events.pharmacy_item.after_insert",
+        "on_update":     "taal_inventory.events.pharmacy_item.on_update",
     },
     "Purchase Invoice": {
         "on_submit": "taal_inventory.events.purchase_invoice.on_submit",

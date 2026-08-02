@@ -1,0 +1,230 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "RRL-.YYYY.-.#####",
+ "creation": "2026-07-29 10:00:00.000000",
+ "doctype": "DocType",
+ "document_type": "Document",
+ "engine": "InnoDB",
+ "field_order": [
+  "customer",
+  "sales_order",
+  "reminder_reference",
+  "section_dates",
+  "reminder_date",
+  "next_refill_date",
+  "days_remaining",
+  "column_break_dates",
+  "whatsapp_number",
+  "meta_message_id",
+  "reminder_status",
+  "section_response",
+  "button_clicked",
+  "order_created",
+  "linked_sales_order",
+  "column_break_response",
+  "customer_replied",
+  "reply_text",
+  "retry_flag",
+  "failure_reason",
+  "section_product",
+  "product_name",
+  "qty_supplied",
+  "column_break_product",
+  "reminder_count",
+  "reminder_cycle_key"
+ ],
+ "fields": [
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Customer",
+   "options": "Customer",
+   "reqd": 1
+  },
+  {
+   "fieldname": "sales_order",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Source Sales Order",
+   "options": "Sales Order"
+  },
+  {
+   "fieldname": "reminder_reference",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Reminder Reference",
+   "unique": 1,
+   "reqd": 1,
+   "description": "Auto-generated dedup key: RFL-{customer}-{YYYYMMDD}. Prevents duplicate reminders per day."
+  },
+  {
+   "fieldname": "section_dates",
+   "fieldtype": "Section Break",
+   "label": "Dates"
+  },
+  {
+   "fieldname": "reminder_date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Reminder Sent Date",
+   "reqd": 1
+  },
+  {
+   "fieldname": "next_refill_date",
+   "fieldtype": "Date",
+   "label": "Patient's Next Refill Date"
+  },
+  {
+   "fieldname": "days_remaining",
+   "fieldtype": "Int",
+   "label": "Days Remaining at Send Time"
+  },
+  {
+   "fieldname": "column_break_dates",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "whatsapp_number",
+   "fieldtype": "Data",
+   "label": "WhatsApp Number Sent To",
+   "description": "Full number with country code, no +. E.g. 919876543210"
+  },
+  {
+   "fieldname": "meta_message_id",
+   "fieldtype": "Data",
+   "label": "Meta Message ID",
+   "description": "wamid.xxx returned by Meta WhatsApp Cloud API. Used to match webhook status updates."
+  },
+  {
+   "fieldname": "reminder_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "\nSent\nDelivered\nRead\nFailed\nButton Clicked\nReplied\nOrder Created",
+   "default": "Sent"
+  },
+  {
+   "fieldname": "section_response",
+   "fieldtype": "Section Break",
+   "label": "Customer Response"
+  },
+  {
+   "fieldname": "button_clicked",
+   "fieldtype": "Check",
+   "label": "Request Refill Button Clicked"
+  },
+  {
+   "fieldname": "order_created",
+   "fieldtype": "Check",
+   "label": "Sales Order Auto-Created"
+  },
+  {
+   "fieldname": "linked_sales_order",
+   "fieldtype": "Link",
+   "label": "Linked Refill Sales Order",
+   "options": "Sales Order",
+   "description": "The new Sales Order created when customer clicked Request Refill."
+  },
+  {
+   "fieldname": "column_break_response",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "customer_replied",
+   "fieldtype": "Check",
+   "label": "Customer Sent a Reply"
+  },
+  {
+   "fieldname": "reply_text",
+   "fieldtype": "Small Text",
+   "label": "Customer Reply Text"
+  },
+  {
+   "fieldname": "retry_flag",
+   "fieldtype": "Check",
+   "label": "Retry Pending",
+   "description": "Set to 1 on failure. Next scheduler run will retry once."
+  },
+  {
+   "fieldname": "failure_reason",
+   "fieldtype": "Small Text",
+   "label": "Failure Reason"
+  },
+  {
+   "fieldname": "section_product",
+   "fieldtype": "Section Break",
+   "label": "Product Context"
+  },
+  {
+   "fieldname": "product_name",
+   "fieldtype": "Data",
+   "label": "Product / Medicine Name",
+   "description": "First eligible item from the source Sales Order."
+  },
+  {
+   "fieldname": "qty_supplied",
+   "fieldtype": "Float",
+   "label": "Qty Supplied (= Days Supply)"
+  },
+  {
+   "fieldname": "column_break_product",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "reminder_count",
+   "fieldtype": "Int",
+   "label": "Reminder Count This Cycle",
+   "default": "1"
+  },
+  {
+   "fieldname": "reminder_cycle_key",
+   "fieldtype": "Data",
+   "label": "Cycle Key",
+   "description": "RFL-{customer}-{SO_name}. Groups all reminders for one refill cycle."
+  }
+ ],
+ "in_create": 0,
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-29 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Taal Inventory",
+ "name": "Refill Reminder Log",
+ "naming_rule": "Expression (old style)",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 0,
+   "delete": 0,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Sales User",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "search_fields": "customer,reminder_reference,reminder_status",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
