@@ -2,8 +2,10 @@
 taal_inventory/events/tally_import.py
 
 Imports 836 Sales Invoices directly from the Tally Sales Register.
-Every value — item lines, rates, GST, courier, rounding — is written
-verbatim from Tally. Nothing is recalculated by ERPNext.
+Every value — item lines, rates, courier, rounding — is written
+verbatim from Tally. Product GST uses On Net Total (required by
+India Compliance app) with exact 2.5%/2.5%/5% rates.
+Courier GST uses Actual rows with Tally values verbatim.
 
 Whitelisted methods:
   run_import(dry_run=True)   — full import
@@ -15,7 +17,7 @@ import openpyxl
 import os
 
 
-# ── CONFIRMED ITEM MAP (Phase 1 verified) ─────────────────────
+# ── CONFIRMED ITEM MAP (Phase 1 verified, Abec/AbecL confirmed) ─
 ITEM_MAP = {
     "A-Bec 60 Tab":   "TPIC 82",
     "Abalam":         "TPIC 01",
@@ -67,14 +69,14 @@ ITEM_MAP = {
     "Zidolam-N":      "TPIC 61",
 }
 
-COMPANY          = "Taalplus CHC Private Limited"
-SGST_ACCOUNT     = "Output Tax SGST - TPC"
-CGST_ACCOUNT     = "Output Tax CGST - TPC"
-IGST_ACCOUNT     = "Output Tax IGST - TPC"
-COURIER_ACCOUNT  = "Courier Charges Recovery - TPC"
-COURIER_SGST     = "Courier SGST Payable - TPC"
-COURIER_CGST     = "Courier CGST Payable - TPC"
-COURIER_IGST     = "Courier IGST Payable - TPC"
+COMPANY         = "Taalplus CHC Private Limited"
+SGST_ACCOUNT    = "Output Tax SGST - TPC"
+CGST_ACCOUNT    = "Output Tax CGST - TPC"
+IGST_ACCOUNT    = "Output Tax IGST - TPC"
+COURIER_ACCOUNT = "Courier Charges Recovery - TPC"
+COURIER_SGST    = "Courier SGST Payable - TPC"
+COURIER_CGST    = "Courier CGST Payable - TPC"
+COURIER_IGST    = "Courier IGST Payable - TPC"
 
 
 def f(x):
@@ -85,23 +87,58 @@ def f(x):
 
 
 def get_file_path():
+    """
+    Finds the Tally register Excel on disk.
+    Tries multiple search strategies to handle filename variations.
+    """
+    # Strategy 1: exact filename as uploaded after rename
     file_doc = frappe.db.get_value(
         "File",
         {"file_name": "Sales__April_to_June_2026_For_Upload__1_.xlsx"},
         ["name", "file_url", "is_private"],
         as_dict=True
     )
+
+    # Strategy 2: search by partial filename
+    if not file_doc:
+        results = frappe.db.sql("""
+            SELECT name, file_url, is_private
+            FROM `tabFile`
+            WHERE file_name LIKE '%April%June%2026%'
+               OR file_name LIKE '%April_to_June_2026%'
+               OR file_name LIKE '%For_Upload%'
+            ORDER BY creation DESC
+            LIMIT 1
+        """, as_dict=True)
+        file_doc = results[0] if results else None
+
+    # Strategy 3: search by file URL pattern
+    if not file_doc:
+        results = frappe.db.sql("""
+            SELECT name, file_url, is_private
+            FROM `tabFile`
+            WHERE file_url LIKE '%April%2026%'
+              AND file_url LIKE '%.xlsx'
+            ORDER BY creation DESC
+            LIMIT 1
+        """, as_dict=True)
+        file_doc = results[0] if results else None
+
     if not file_doc:
         frappe.throw(
-            "Tally register not found in Frappe Files. "
-            "Upload Sales__April_to_June_2026_For_Upload__1_.xlsx first."
+            "Tally register Excel not found in Frappe Files. "
+            "Please upload the file (Sales__April_to_June_2026_For_Upload__1_.xlsx) "
+            "and try again."
         )
+
     if file_doc.is_private:
         full_path = frappe.get_site_path() + "/private" + file_doc.file_url
     else:
         full_path = frappe.get_site_path() + "/public" + file_doc.file_url
+
     if not os.path.exists(full_path):
-        frappe.throw("File not found on disk: " + full_path)
+        frappe.throw("File not found on disk at: " + full_path)
+
     return full_path
 
 
@@ -110,34 +147,34 @@ def parse_tally_register():
     Parse the Tally Sales Register Excel.
 
     Column layout (0-indexed):
-      0  = Date (header row only)
-      1  = Customer / Item Name
+      0  = Date object (header rows only)
+      1  = Customer name (header) / Item name (detail)
       3  = Voucher No
       4  = Qty
-      6  = Rate
-      7  = Value (line amount = qty x rate)
-      8  = Gross Total (header row)
-      9  = Sales Intrastate 5% taxable
-     10  = CGST 2.5%
-     11  = SGST 2.5%
-     12  = Sales Interstate 5% taxable
-     13  = IGST 5%
-     14  = Courier Charges Intrastate (GST-exclusive)
+      6  = Rate per unit
+      7  = Line amount (qty x rate)
+      8  = Gross Total (header only)
+      9  = Sales Intrastate taxable value
+     10  = CGST 2.5% amount
+     11  = SGST 2.5% amount
+     12  = Sales Interstate taxable value
+     13  = IGST 5% amount
+     14  = Courier Intrastate (GST-EXCLUSIVE base)
      15  = Courier CGST 9%
      16  = Courier SGST 9%
-     17  = Courier Charges Interstate (GST-exclusive)
+     17  = Courier Interstate (GST-EXCLUSIVE base)
      18  = Courier IGST 18%
      19  = Round Off
-     20  = Online Sale column
+     20  = Online Sale value
 
-    Returns list of invoice dicts, each with full item lines and all tax values.
+    Returns list of invoice dicts with full item lines and tax values.
     """
     full_path = get_file_path()
     wb   = openpyxl.load_workbook(full_path, data_only=True)
     ws   = wb.active
     rows = list(ws.iter_rows(values_only=True))
 
-    # Find Grand Total row to stop parsing
+    # Stop at Grand Total row
     gt_idx = None
     for idx, r in enumerate(rows):
         if r[1] and str(r[1]).strip() == "Grand Total":
@@ -151,31 +188,31 @@ def parse_tally_register():
     while i < len(rows):
         r = rows[i]
 
-        # Header row: col 0 has a date object
+        # Header row identified by date object in column 0
         if r[0] is not None and hasattr(r[0], "year"):
 
-            # Determine state type from which taxable column is populated
-            si_tax   = f(r[9])   # intrastate taxable
-            inter_tax = f(r[12]) # interstate taxable
-            online_v  = f(r[20]) # online sale value
+            si_tax    = f(r[9])   # intrastate taxable
+            inter_tax = f(r[12])  # interstate taxable
+            igst_amt  = f(r[13])  # IGST 5%
+            online_v  = f(r[20])  # online sale value
 
-            if inter_tax > 0:
-                state_type    = "Inter-State"
-                place_of_supply = "07-Delhi"   # set during import; user corrects later
-                taxable_val   = inter_tax
+            # State type: inter-state if interstate column OR IGST column is set
+            if inter_tax > 0 or igst_amt > 0:
+                state_type      = "Inter-State"
+                place_of_supply = "07-Delhi"
+                taxable_val     = inter_tax if inter_tax > 0 else online_v
             elif si_tax > 0:
-                state_type    = "Intra-State"
+                state_type      = "Intra-State"
                 place_of_supply = "27-Maharashtra"
-                taxable_val   = si_tax
+                taxable_val     = si_tax
             elif online_v > 0:
-                # online column — treat as intra-state unless inter markers present
-                state_type    = "Intra-State"
+                state_type      = "Intra-State"
                 place_of_supply = "27-Maharashtra"
-                taxable_val   = online_v
+                taxable_val     = online_v
             else:
-                state_type    = "Intra-State"
+                state_type      = "Intra-State"
                 place_of_supply = "27-Maharashtra"
-                taxable_val   = 0.0
+                taxable_val     = 0.0
 
             inv = {
                 "date":            r[0].strftime("%Y-%m-%d"),
@@ -185,11 +222,11 @@ def parse_tally_register():
                 "state_type":      state_type,
                 "place_of_supply": place_of_supply,
                 "taxable_val":     taxable_val,
-                # Product GST (verbatim from Tally)
+                # Product GST amounts from Tally (used for verification only)
                 "cgst_25":         f(r[10]),
                 "sgst_25":         f(r[11]),
-                "igst_5":          f(r[13]),
-                # Courier (verbatim from Tally — GST-exclusive base)
+                "igst_5":          igst_amt,
+                # Courier — verbatim GST-exclusive base + GST amounts
                 "courier_intra":   f(r[14]),
                 "courier_cgst":    f(r[15]),
                 "courier_sgst":    f(r[16]),
@@ -226,43 +263,49 @@ def parse_tally_register():
 
 def build_taxes(inv):
     """
-    Build the taxes table rows using verbatim Tally values.
-    All rows are 'Actual' type — ERPNext will NOT recalculate.
+    Build the taxes table.
+
+    Product GST: On Net Total with exact rate (2.5% / 5%)
+      - Required by India Compliance app
+      - ERPNext computes identical amounts since rates are exact
+      - SGST first, then CGST (India Compliance ordering)
+
+    Courier GST: Actual rows with verbatim Tally amounts
+      - India Compliance allows Actual for non-GST recovery accounts
     """
     taxes = []
 
-    # ── Product GST ───────────────────────────────────────────
+    # ── Product GST — On Net Total (India Compliance requirement) ──
+    # Intra-State: SGST 2.5% + CGST 2.5%
     if inv["sgst_25"] > 0:
         taxes.append({
-            "charge_type":            "Actual",
+            "charge_type":            "On Net Total",
             "account_head":           SGST_ACCOUNT,
             "description":            "SGST on Products",
-            "tax_amount":             inv["sgst_25"],
-            "rate":                   0,
+            "rate":                   2.5,
             "included_in_print_rate": 0,
         })
 
     if inv["cgst_25"] > 0:
         taxes.append({
-            "charge_type":            "Actual",
+            "charge_type":            "On Net Total",
             "account_head":           CGST_ACCOUNT,
             "description":            "CGST on Products",
-            "tax_amount":             inv["cgst_25"],
-            "rate":                   0,
+            "rate":                   2.5,
             "included_in_print_rate": 0,
         })
 
+    # Inter-State: IGST 5%
     if inv["igst_5"] > 0:
         taxes.append({
-            "charge_type":            "Actual",
+            "charge_type":            "On Net Total",
             "account_head":           IGST_ACCOUNT,
             "description":            "IGST on Products",
-            "tax_amount":             inv["igst_5"],
-            "rate":                   0,
+            "rate":                   5.0,
             "included_in_print_rate": 0,
         })
 
-    # ── Courier base ──────────────────────────────────────────
+    # ── Courier base — Actual, verbatim Tally value ───────────────
     courier_base = inv["courier_intra"] + inv["courier_inter"]
     if courier_base > 0:
         taxes.append({
@@ -274,7 +317,7 @@ def build_taxes(inv):
             "included_in_print_rate": 0,
         })
     else:
-        # Always include a zero courier row so the account head is present
+        # Zero courier row — keeps account head present for reporting
         taxes.append({
             "charge_type":            "Actual",
             "account_head":           COURIER_ACCOUNT,
@@ -284,7 +327,7 @@ def build_taxes(inv):
             "included_in_print_rate": 0,
         })
 
-    # ── Courier GST ───────────────────────────────────────────
+    # ── Courier GST — Actual, verbatim Tally values ───────────────
     if inv["courier_sgst"] > 0:
         taxes.append({
             "charge_type":            "Actual",
@@ -319,13 +362,13 @@ def build_taxes(inv):
 
 
 def create_invoice(inv):
-    """Create a single Sales Invoice from a parsed Tally invoice dict."""
+    """Create and insert a single Sales Invoice from a Tally invoice dict."""
 
     items = []
     for it in inv["items"]:
         code = ITEM_MAP.get(it["name"])
         if not code:
-            frappe.throw("Unmapped item: " + it["name"])
+            frappe.throw("Unmapped item in Tally register: " + it["name"])
         items.append({
             "item_code": code,
             "item_name": it["name"],
@@ -349,8 +392,8 @@ def create_invoice(inv):
         "set_posting_time":                1,
         "place_of_supply":                 inv["place_of_supply"],
         "custom_state_type":               inv["state_type"],
+        # Lock all values — SS_11 must not recalculate courier or taxes
         "custom_courier_manually_edited":  1,
-        # rounding — use Tally's round off value
         "disable_rounded_total":           0,
         "items":                           items,
         "taxes":                           taxes,
@@ -367,31 +410,39 @@ def create_invoice(inv):
 def run_import(dry_run=True):
     """
     Main import entry point.
-    Call: frappe.call("taal_inventory.events.tally_import.run_import", dry_run=True)
+
+    Call from System Console:
+      result = frappe.call(
+          "taal_inventory.events.tally_import.run_import",
+          dry_run=True
+      )
     """
     dry_run  = frappe.utils.cint(dry_run)
     invoices = parse_tally_register()
 
     result = {
-        "total":    len(invoices),
-        "created":  [],
-        "skipped":  [],
-        "errors":   [],
+        "total":   len(invoices),
+        "created": [],
+        "skipped": [],
+        "errors":  [],
     }
 
     for inv in invoices:
+
+        # Skip if customer does not exist in ERPNext
         if not frappe.db.exists("Customer", inv["customer"]):
             result["skipped"].append({
                 "vno":      inv["vno"],
                 "customer": inv["customer"],
-                "reason":   "Customer not found",
+                "reason":   "Customer not found in ERPNext",
             })
             continue
 
         if dry_run:
             result["created"].append(
-                inv["date"] + " | " + inv["customer"] +
-                " | " + str(len(inv["items"])) + " items" +
+                inv["date"] +
+                " | " + inv["customer"] +
+                " | " + str(len(inv["items"])) + " item(s)" +
                 " | " + inv["state_type"] +
                 " | gross=" + str(inv["gross"])
             )
@@ -401,13 +452,14 @@ def run_import(dry_run=True):
             si_name = create_invoice(inv)
             result["created"].append(si_name)
 
+            # Commit every 50 to avoid timeout
             if len(result["created"]) % 50 == 0:
                 frappe.db.commit()
 
         except Exception as e:
             result["errors"].append({
                 "vno":   inv["vno"],
-                "cust":  inv["customer"],
+                "cust":  inv["customer"][:30],
                 "error": str(e)[:300],
             })
 
@@ -420,21 +472,33 @@ def run_import(dry_run=True):
 @frappe.whitelist()
 def retry_interstate():
     """
-    Retries Inter-State invoices only — sets place_of_supply = 07-Delhi.
-    Call: frappe.call("taal_inventory.events.tally_import.retry_interstate")
+    Retries only Inter-State invoices that failed in run_import.
+    Safe to call multiple times — skips already-created invoices.
+
+    Call from System Console:
+      result = frappe.call(
+          "taal_inventory.events.tally_import.retry_interstate"
+      )
     """
     invoices = parse_tally_register()
     inter    = [x for x in invoices if x["state_type"] == "Inter-State"]
 
-    result = {"total": len(inter), "already": 0, "created": [], "errors": []}
+    result = {
+        "total":   len(inter),
+        "already": 0,
+        "created": [],
+        "errors":  [],
+    }
 
     for inv in inter:
+
+        # Check if already created successfully
         existing = frappe.db.sql("""
             SELECT name FROM `tabSales Invoice`
-            WHERE customer         = %s
-              AND posting_date     = %s
+            WHERE customer          = %s
+              AND posting_date      = %s
               AND custom_state_type = %s
-              AND docstatus        != 2
+              AND docstatus         != 2
             LIMIT 1
         """, (inv["customer"], inv["date"], inv["state_type"]), as_dict=True)
 
@@ -445,11 +509,14 @@ def retry_interstate():
         try:
             si_name = create_invoice(inv)
             result["created"].append(si_name)
+
             if len(result["created"]) % 20 == 0:
                 frappe.db.commit()
+
         except Exception as e:
             result["errors"].append({
                 "vno":   inv["vno"],
+                "cust":  inv["customer"][:30],
                 "error": str(e)[:300],
             })
 
