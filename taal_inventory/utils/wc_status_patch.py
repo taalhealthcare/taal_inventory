@@ -4,6 +4,7 @@ CUSTOM_WC_STATUSES = {
     "arranged": "Arranged",
     "returned": "Returned",
     "cod-return": "COD Return",
+    "cancel-request": "Cancel Request",
 }
 
 
