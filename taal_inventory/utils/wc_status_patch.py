@@ -24,28 +24,16 @@ def _patch_wc_mapping():
     try:
         from woocommerce_fusion.tasks import sync_sales_orders as ss
 
-        patched_keys = []
         for wc_key, erp_label in CUSTOM_WC_STATUSES.items():
             if wc_key not in ss.WC_ORDER_STATUS_MAPPING_REVERSE:
                 ss.WC_ORDER_STATUS_MAPPING_REVERSE[wc_key] = erp_label
-                patched_keys.append(wc_key)
             if hasattr(ss, "WC_ORDER_STATUS_MAPPING"):
                 if erp_label not in ss.WC_ORDER_STATUS_MAPPING:
                     ss.WC_ORDER_STATUS_MAPPING[erp_label] = wc_key
 
-        if patched_keys:
-            frappe.log_error(
-                title="TAAL WC Patch — Applied",
-                message=(
-                    "Newly patched keys: " + str(patched_keys) + "\n"
-                    "All keys now in reverse map: " +
-                    str(list(CUSTOM_WC_STATUSES.keys()))
-                )
-            )
-
     except Exception:
         frappe.log_error(
-            title="TAAL WC Patch — FAILED",
+            title="TAAL WC Patch — Mapping Failed",
             message=frappe.get_traceback(),
         )
 
@@ -66,6 +54,6 @@ def _patch_sales_order_meta():
 
     except Exception:
         frappe.log_error(
-            title="TAAL WC Patch — Meta Patch FAILED",
+            title="TAAL WC Patch — Meta Failed",
             message=frappe.get_traceback(),
         )
