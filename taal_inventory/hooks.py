@@ -21,6 +21,14 @@ scheduler_events = {
         "*/5 * * * *": [
             "taal_inventory.api.woocommerce_category.reconcile_recent_order_categories"
         ],
+        # ── GST Sales Dashboard ────────────────────────────────────────────────
+        # 07:00 on the 1st of every month. Emails the previous month's GST
+        # matrix (inline HTML table + .xlsx attachment) to the Accounts team.
+        # Recipients: _EMAIL_RECIPIENTS in utils/gst_sales_dashboard.py, or
+        # every enabled user holding the Accounts Manager role if that is empty.
+        "0 7 1 * *": [
+            "taal_inventory.utils.gst_sales_dashboard.send_monthly_gst_email"
+        ],
     },
     "daily": [
         "taal_inventory.tasks.check_expiry_alerts",
