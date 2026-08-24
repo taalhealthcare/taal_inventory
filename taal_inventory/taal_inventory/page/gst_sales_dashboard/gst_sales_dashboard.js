@@ -147,6 +147,30 @@ window._gd_set_drafts = function (checked) {
     _gd_load();
 };
 
+// Custom date range. Typing in either box switches the period label to
+// "Custom", which makes every section tag show the actual range instead.
+window._gd_set_custom_date = function (which, value) {
+    if (!value) return;
+
+    var from = which === "from" ? value : window._gd_from;
+    var to   = which === "to"   ? value : window._gd_to;
+
+    if (from > to) {
+        frappe.msgprint({
+            title: __("Check the dates"),
+            message: __("From Date cannot be later than To Date."),
+            indicator: "orange"
+        });
+        return;
+    }
+
+    window._gd_from  = from;
+    window._gd_to    = to;
+    window._gd_label = "Custom";
+    window._gd_update_datebar("Custom", from, to);
+    _gd_load();
+};
+
 window._gd_set_matrix_view = function (v) {
     window._gd_matrix_view = v;
     if (window._gd_data) _gd_render(window._gd_data);
@@ -235,6 +259,7 @@ function _gd_render(d) {
     var page = window._gd_page;
     $(page.main).find(".gd,.gd-loading").remove();
     $(page.main).append(_gd_html(d));
+    _gd_bind_hover();
     setTimeout(function () { _gd_animate(d); },  110);
     setTimeout(function () { _gd_charts(d);  },  330);
     setTimeout(function () { _gd_fill_bars(); }, 520);
@@ -308,6 +333,12 @@ function _gd_html(d) {
        + '<label class="gd-chk"><input type="checkbox" '
        + (m.include_drafts ? "checked " : "")
        + 'onchange="window._gd_set_drafts(this.checked)"> Include drafts</label>'
+       + '<label class="gd-sel gd-date"><span>From</span>'
+       + '<input type="date" value="' + _gd_esc(m.from_date) + '" '
+       + "onchange=\"window._gd_set_custom_date('from', this.value)\"></label>"
+       + '<label class="gd-sel gd-date"><span>To</span>'
+       + '<input type="date" value="' + _gd_esc(m.to_date) + '" '
+       + "onchange=\"window._gd_set_custom_date('to', this.value)\"></label>"
        + '<span class="gd-chip gd-chip-g">' + _gd_INR(k.grand_total ? k.grand_total.value : 0) + " gross</span>"
        + '<span class="gd-chip gd-chip-b">' + _gd_num(k.inv_count ? k.inv_count.value : 0) + " invoices</span>"
        + "</div></div>";
@@ -348,17 +379,18 @@ function _gd_html(d) {
 
     // ── Section 3 — Rate-wise ────────────────────────────────────
     H += _gd_sechd("Section 3 \u2014 Rate-wise taxable value", m.period_label);
-    H += _gd_rate_table(d.rate_wise || []);
+    H += _gd_rate_cards(d.rate_wise || []);
 
     // ── Section 4 — Document mix & status ────────────────────────
     H += _gd_sechd("Section 4 \u2014 Document mix &amp; status", m.period_label);
     H += '<div class="gd-g2">';
     H += '<div class="gd-card"><div class="gd-ct">Document type</div>'
        + '<div class="gd-cs">Sales Invoice variants in this period</div>'
-       + '<div style="display:flex;gap:18px;align-items:center">'
-       + '<canvas id="gd-ch-doc" style="flex-shrink:0;width:132px;height:132px" '
-       + 'role="img" aria-label="Document type breakdown"></canvas>'
-       + '<div style="flex:1">' + _gd_legend(d.doc_mix || []) + "</div></div></div>";
+       + '<div style="display:flex;gap:20px;align-items:center">'
+       + '<div style="width:140px;height:140px;flex:0 0 140px;position:relative">'
+       + '<canvas id="gd-ch-doc" role="img" aria-label="Document type breakdown"></canvas>'
+       + "</div>"
+       + '<div style="flex:1;min-width:0">' + _gd_legend(d.doc_mix || []) + "</div></div></div>";
     H += '<div class="gd-card"><div class="gd-ct">Status by month</div>'
        + '<div class="gd-cs">Invoice count per status</div>'
        + '<div style="position:relative;height:212px">'
@@ -406,8 +438,13 @@ function _gd_html(d) {
 
 
 function _gd_sechd(label, period) {
-    var tag = (period && period !== "Custom")
-        ? ' <span class="gd-ptag">' + _gd_esc(period) + "</span>" : "";
+    // A preset shows its name ("This Month"). A custom range shows the range
+    // itself, so the accountant always knows what a section is filtered to.
+    var text = period || "";
+    if (text === "Custom") {
+        text = window._gd_range_display(window._gd_from, window._gd_to);
+    }
+    var tag = text ? ' <span class="gd-ptag">' + _gd_esc(text) + "</span>" : "";
     return '<div class="gd-sh"><span class="gd-sl">' + label + tag
          + '</span><div class="gd-sline"></div></div>';
 }
@@ -603,40 +640,63 @@ function _gd_matrix(d) {
 
 
 // ================================================================
-//  RATE-WISE
+//  RATE-WISE  —  number cards + chart, matching the rest of the page
 // ================================================================
-function _gd_rate_table(rows) {
+var _GD_RATE_COLORS = ["#639922", "#378ADD", "#7F77DD", "#BA7517",
+                       "#1D9E75", "#D85A30", "#888780"];
+
+function _gd_rate_cards(rows) {
     if (!rows.length) {
-        return '<div class="gd-card"><div class="gd-empty">No taxable lines in this period</div></div>';
+        return '<div class="gd-card"><div class="gd-empty">'
+             + "No taxable lines in this period</div></div>";
     }
-    var H = '<div class="gd-card">'
-        + '<div class="gd-ct">Taxable value grouped by GST rate</div>'
-        + '<div class="gd-cs">The shape GSTR-1 asks for \u00b7 courier service is listed '
-        + "separately because it lives in its own child table</div>"
-        + '<div class="gd-scroll"><table class="gd-mx"><thead><tr>'
-        + '<th class="gd-l">Rate</th><th>Taxable value</th><th>CGST</th><th>SGST</th>'
-        + "<th>IGST</th><th>Total tax</th><th>Invoices</th><th>Total</th></tr></thead><tbody>";
 
-    var t = { taxable: 0, cgst: 0, sgst: 0, igst: 0, tax: 0, total: 0 };
-    rows.forEach(function (r) {
-        H += '<tr class="gd-r"><td class="gd-l">' + _gd_esc(r.label)
-           + (r.is_service ? ' <span class="gd-mini">service</span>' : "") + "</td>"
-           + "<td>" + _gd_plain(r.taxable) + "</td>"
-           + "<td>" + _gd_plain(r.cgst) + "</td>"
-           + "<td>" + _gd_plain(r.sgst) + "</td>"
-           + "<td>" + _gd_plain(r.igst) + "</td>"
-           + "<td>" + _gd_plain(r.tax) + "</td>"
-           + "<td>" + _gd_num(r.inv_count) + "</td>"
-           + "<td>" + _gd_plain(r.total) + "</td></tr>";
-        t.taxable += r.taxable; t.cgst += r.cgst; t.sgst += r.sgst;
-        t.igst += r.igst; t.tax += r.tax; t.total += r.total;
+    var totTaxable = 0, totTax = 0;
+    rows.forEach(function (r) { totTaxable += r.taxable; totTax += r.tax; });
+
+    var H = '<div class="gd-g4">';
+    rows.forEach(function (r, i) {
+        var c = _GD_RATE_COLORS[i % _GD_RATE_COLORS.length];
+        var share = totTaxable ? Math.round(r.taxable / totTaxable * 100) : 0;
+
+        H += '<div class="gd-kpi gd-nolink" style="--gd-a:' + c + '">'
+           + '<div class="gd-kl">' + _gd_esc(r.label)
+           + (r.is_service ? ' <span class="gd-mini">service</span>' : "")
+           + "</div>"
+           + '<div class="gd-kv" style="color:' + c + '">' + _gd_INR(r.taxable) + "</div>"
+           + '<div class="gd-knote">' + _gd_num(r.inv_count) + " invoices \u00b7 "
+           + share + "% of taxable value</div>"
+           + '<div class="gd-bar"><div class="gd-barf" style="background:' + c
+           + '" data-w="' + share + '"></div></div>'
+           + '<div class="gd-pop">'
+           + '<div class="gd-pr"><span class="gd-pl">Taxable value</span>'
+           + '<span class="gd-pv">' + _gd_INR2(r.taxable) + "</span></div>"
+           + '<div class="gd-pr"><span class="gd-pl">CGST</span>'
+           + '<span class="gd-pv">' + _gd_INR2(r.cgst) + "</span></div>"
+           + '<div class="gd-pr"><span class="gd-pl">SGST</span>'
+           + '<span class="gd-pv">' + _gd_INR2(r.sgst) + "</span></div>"
+           + '<div class="gd-pr"><span class="gd-pl">IGST</span>'
+           + '<span class="gd-pv">' + _gd_INR2(r.igst) + "</span></div>"
+           + '<div class="gd-pr"><span class="gd-pl">Total tax</span>'
+           + '<span class="gd-pv">' + _gd_INR2(r.tax) + "</span></div>"
+           + '<div class="gd-pr"><span class="gd-pl">Invoice value</span>'
+           + '<span class="gd-pv">' + _gd_INR2(r.total) + "</span></div>"
+           + "</div></div>";
     });
+    H += "</div>";
 
-    H += '<tr class="gd-sub"><td class="gd-l">Total</td>'
-       + "<td>" + _gd_plain(t.taxable) + "</td><td>" + _gd_plain(t.cgst) + "</td>"
-       + "<td>" + _gd_plain(t.sgst) + "</td><td>" + _gd_plain(t.igst) + "</td>"
-       + "<td>" + _gd_plain(t.tax) + "</td><td></td><td>" + _gd_plain(t.total) + "</td></tr>";
-    H += "</tbody></table></div></div>";
+    H += '<div class="gd-card"><div class="gd-card-hd"><div>'
+       + '<div class="gd-ct">Taxable value and tax by GST rate</div>'
+       + '<div class="gd-cs" style="margin:0">The shape GSTR-1 asks for \u00b7 '
+       + "courier service is listed separately because it lives in its own "
+       + "child table</div></div>"
+       + '<span class="gd-chip gd-chip-g">' + _gd_INR(totTaxable)
+       + " taxable \u00b7 " + _gd_INR(totTax) + " tax</span></div>"
+       + '<div style="position:relative;height:'
+       + Math.max(190, rows.length * 58) + 'px">'
+       + '<canvas id="gd-ch-rate" role="img" '
+       + 'aria-label="Taxable value and tax by GST rate"></canvas></div></div>';
+
     return H;
 }
 
@@ -674,7 +734,11 @@ function _gd_notes(d) {
            + '<div class="gd-mtrack"><div class="gd-mfill" style="background:#E24B4A" '
            + 'data-w="' + w + '"></div></div>'
            + '<span class="gd-mval">' + (mo.cn_value ? "\u2212 " + _gd_INR(mo.cn_value) : "\u2014")
-           + "</span></div>";
+           + "</span>"
+           + _gd_tip([["Month", _gd_esc(mo.label)],
+                      ["Credit note value", _gd_INR2(mo.cn_value)],
+                      ["Notes issued", _gd_num(mo.cn_count)]])
+           + "</div>";
     });
 
     var rn = d.recent_notes || [];
@@ -736,8 +800,8 @@ function _gd_courier(c) {
     }
     var maxM = 1;
     monthly.forEach(function (m) { if (m.charges + m.gst > maxM) maxM = m.charges + m.gst; });
-    var maxL = 1;
-    loc.forEach(function (l) { if (l.value > maxL) maxL = l.value; });
+    var maxL = 1, totLoc = 0;
+    loc.forEach(function (l) { if (l.value > maxL) maxL = l.value; totLoc += l.value; });
 
     var H = '<div class="gd-g2">'
         + '<div class="gd-card"><div class="gd-ct">Courier by month</div>'
@@ -749,7 +813,12 @@ function _gd_courier(c) {
            + Math.round(m.charges / maxM * 100) + '"></div>'
            + '<div class="gd-mfill" style="background:#f0b9a4" data-w="'
            + Math.round(m.gst / maxM * 100) + '"></div></div>'
-           + '<span class="gd-mval">' + _gd_INR(m.charges + m.gst) + "</span></div>";
+           + '<span class="gd-mval">' + _gd_INR(m.charges + m.gst) + "</span>"
+           + _gd_tip([["Month", _gd_esc(m.label)],
+                      ["Base charges", _gd_INR2(m.charges)],
+                      ["Courier GST", _gd_INR2(m.gst)],
+                      ["Total", _gd_INR2(m.charges + m.gst)]])
+           + "</div>";
     });
     H += '<div class="gd-legend">'
        + '<span><span class="gd-dot" style="background:#D85A30"></span>Charges</span>'
@@ -758,10 +827,16 @@ function _gd_courier(c) {
     H += '<div class="gd-card"><div class="gd-ct">Courier by location</div>'
        + '<div class="gd-cs">From the Courier Charge Entry location field</div>';
     loc.forEach(function (l) {
+        var lShare = totLoc ? Math.round(l.value / totLoc * 100) : 0;
         H += '<div class="gd-mbar"><b style="width:96px">' + _gd_esc(l.label) + "</b>"
            + '<div class="gd-mtrack"><div class="gd-mfill" style="background:#BA7517" '
            + 'data-w="' + Math.round(l.value / maxL * 100) + '"></div></div>'
-           + '<span class="gd-mval">' + _gd_INR(l.value) + "</span></div>";
+           + '<span class="gd-mval">' + _gd_INR(l.value) + "</span>"
+           + _gd_tip([["Location", _gd_esc(l.label)],
+                      ["Courier charges", _gd_INR2(l.value)],
+                      ["Invoices", _gd_num(l.count)],
+                      ["Share", lShare + "%"]])
+           + "</div>";
     });
     H += "</div></div>";
     return H;
@@ -779,10 +854,15 @@ function _gd_aging(rows) {
     var H = '<div class="gd-card"><div class="gd-ct">Outstanding by age</div>'
         + '<div class="gd-cs">Aged on due date \u00b7 total ' + _gd_INR2(total) + "</div>";
     rows.forEach(function (r, i) {
+        var aShare = total ? Math.round(r.value / total * 100) : 0;
         H += '<div class="gd-mbar"><b style="width:84px">' + _gd_esc(r.label) + "</b>"
            + '<div class="gd-mtrack"><div class="gd-mfill" style="background:'
            + colors[i % colors.length] + '" data-w="' + Math.round(r.value / max * 100)
-           + '"></div></div><span class="gd-mval">' + _gd_INR(r.value) + "</span></div>";
+           + '"></div></div><span class="gd-mval">' + _gd_INR(r.value) + "</span>"
+           + _gd_tip([["Bucket", _gd_esc(r.label)],
+                      ["Outstanding", _gd_INR2(r.value)],
+                      ["Share of total", aShare + "%"]])
+           + "</div>";
     });
     H += "</div>";
     return H;
@@ -827,6 +907,40 @@ function _gd_feed(feed) {
 
     H += "</div>";
     return H;
+}
+
+
+// ================================================================
+//  BAR TOOLTIP  —  the CSS bars are plain divs, so they get their own
+//  hover card rather than a Chart.js tooltip.
+// ================================================================
+function _gd_tip(rows) {
+    var H = '<div class="gd-tip">';
+    rows.forEach(function (r) {
+        H += '<div class="gd-tip-r"><span>' + r[0] + "</span><b>" + r[1] + "</b></div>";
+    });
+    return H + "</div>";
+}
+
+
+// A hovered KPI card must paint above the grid row that follows it, otherwise
+// its popover slides underneath the next row of cards.
+function _gd_bind_hover() {
+    document.querySelectorAll(".gd .gd-kpi").forEach(function (card) {
+        card.addEventListener("mouseenter", function () {
+            card.style.zIndex = "300";
+            if (card.parentNode && card.parentNode.style) {
+                card.parentNode.style.position = "relative";
+                card.parentNode.style.zIndex = "300";
+            }
+        });
+        card.addEventListener("mouseleave", function () {
+            card.style.zIndex = "";
+            if (card.parentNode && card.parentNode.style) {
+                card.parentNode.style.zIndex = "";
+            }
+        });
+    });
 }
 
 
@@ -989,6 +1103,60 @@ function _gd_charts(d) {
                     y1: { position: "right", beginAtZero: true, grid: { display: false },
                           ticks: { color: tick, font: { size: 10 },
                                    callback: function (v) { return _gd_INR(v); } } }
+                }
+            }
+        });
+    }
+
+    // Taxable value and tax by GST rate
+    var c5 = document.getElementById("gd-ch-rate");
+    if (c5) {
+        destroy(c5);
+        var rw = d.rate_wise || [];
+        new Chart(c5, {
+            type: "bar",
+            data: {
+                labels: rw.map(function (r) { return r.label; }),
+                datasets: [
+                    { label: "Taxable value",
+                      data: rw.map(function (r) { return r.taxable; }),
+                      backgroundColor: rw.map(function (_, i) {
+                          return _GD_RATE_COLORS[i % _GD_RATE_COLORS.length];
+                      }),
+                      borderRadius: 6, borderSkipped: false },
+                    { label: "Total tax",
+                      data: rw.map(function (r) { return r.tax; }),
+                      backgroundColor: "#cbd5e1",
+                      borderRadius: 6, borderSkipped: false }
+                ]
+            },
+            options: {
+                indexAxis: "y",
+                responsive: true, maintainAspectRatio: false,
+                animation: { duration: 800 },
+                interaction: { mode: "index", intersect: false },
+                plugins: {
+                    legend: { position: "bottom",
+                              labels: { font: { size: 10 }, usePointStyle: true, padding: 10 } },
+                    tooltip: { callbacks: {
+                        label: function (ctx) {
+                            return " " + ctx.dataset.label + ": " + _gd_INR2(ctx.parsed.x);
+                        },
+                        afterBody: function (items) {
+                            var r = rw[items[0].dataIndex];
+                            if (!r) return "";
+                            return ["CGST: " + _gd_INR2(r.cgst),
+                                    "SGST: " + _gd_INR2(r.sgst),
+                                    "IGST: " + _gd_INR2(r.igst),
+                                    "Invoices: " + _gd_num(r.inv_count)];
+                        }
+                    } }
+                },
+                scales: {
+                    x: { beginAtZero: true, grid: { color: grid },
+                         ticks: { color: tick, font: { size: 10 },
+                                  callback: function (v) { return _gd_INR(v); } } },
+                    y: { grid: { display: false }, ticks: { color: tick, font: { size: 11 } } }
                 }
             }
         });
@@ -1168,7 +1336,8 @@ function _gd_styles() {
     +   "letter-spacing:.06em;color:#94a3b8;margin:16px 0 6px;padding-top:12px;"
     +   "border-top:0.5px solid #e2e8f0}"
 
-    + ".gd-g4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:10px}"
+    + ".gd-g4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;"
+    +   "margin-bottom:10px;position:relative}"
     + ".gd-g3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}"
     + ".gd-g2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:12px}"
 
@@ -1180,6 +1349,12 @@ function _gd_styles() {
     + ".gd-kpi:hover{transform:translateY(-3px);box-shadow:0 8px 22px rgba(0,0,0,.10);"
     +   "border-color:#cbd5e1}"
     + ".gd-kpi:focus-visible{outline:2px solid var(--gd-a,#378ADD);outline-offset:2px}"
+    + ".gd-kpi:hover{z-index:300}"
+    + ".gd-nolink{cursor:default}"
+    + ".gd-nolink:hover{transform:translateY(-3px)}"
+    + ".gd-sel.gd-date input{border:none;background:transparent;font-size:12px;"
+    +   "font-weight:500;color:#111;outline:none;font-family:inherit;"
+    +   "padding:0;max-width:132px}"
     + ".gd-kl{font-size:11px;font-weight:500;color:#64748b;margin-bottom:4px}"
     + ".gd-kv{font-size:25px;font-weight:500;line-height:1;margin-bottom:5px;"
     +   "font-variant-numeric:tabular-nums}"
@@ -1243,7 +1418,18 @@ function _gd_styles() {
     +   "font-variant-numeric:tabular-nums}"
     + ".gd-sts{font-size:10px;color:#94a3b8}"
 
-    + ".gd-mbar{display:flex;align-items:center;gap:8px;margin-bottom:7px}"
+    + ".gd-mbar{display:flex;align-items:center;gap:8px;margin-bottom:7px;position:relative}"
+    + ".gd-tip{position:absolute;left:56px;bottom:calc(100% + 5px);z-index:120;"
+    +   "background:#1f2937;color:#fff;border-radius:8px;padding:8px 11px;"
+    +   "font-size:10.5px;white-space:nowrap;opacity:0;visibility:hidden;"
+    +   "transform:translateY(3px);pointer-events:none;"
+    +   "box-shadow:0 6px 20px rgba(0,0,0,.24);"
+    +   "transition:opacity .13s ease,transform .13s ease,visibility .13s}"
+    + ".gd-mbar:hover .gd-tip{opacity:1;visibility:visible;transform:translateY(0)}"
+    + ".gd-mbar:hover .gd-mfill{filter:brightness(1.08)}"
+    + ".gd-tip-r{display:flex;justify-content:space-between;gap:16px;padding:2px 0}"
+    + ".gd-tip-r span{color:#cbd5e1}"
+    + ".gd-tip-r b{font-weight:600;font-variant-numeric:tabular-nums}"
     + ".gd-mbar b{font-size:10px;color:#94a3b8;width:56px;font-weight:400;"
     +   "overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
     + ".gd-mtrack{flex:1;height:14px;border-radius:4px;background:#f1f5f9;"

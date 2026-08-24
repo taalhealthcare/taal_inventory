@@ -456,29 +456,39 @@ def _rate_wise(company, from_date, to_date, include_drafts):
     where, params = _base_conditions(company, from_date, to_date, include_drafts)
     where += _gross_only()
 
+    # NOTE: the alias must NOT be called `rate`.  `tabSales Invoice Item` has its
+    # own `rate` column (the item price), and MySQL resolves an unqualified
+    # GROUP BY against the table column first — which silently groups by price
+    # and produces one row per distinct item rate instead of one row per GST
+    # slab.  The GROUP BY below repeats the full expression so it cannot bind
+    # to anything else.
+    rate_expr = ("ROUND(COALESCE(sii.cgst_rate, 0) + COALESCE(sii.sgst_rate, 0)"
+                 " + COALESCE(sii.igst_rate, 0), 2)")
+
     rows = frappe.db.sql("""
         SELECT
-            (COALESCE(sii.cgst_rate, 0) + COALESCE(sii.sgst_rate, 0)
-             + COALESCE(sii.igst_rate, 0))              AS rate,
+            {rate_expr}                                 AS gst_rate,
             COALESCE(SUM(sii.net_amount),   0)          AS taxable,
             COALESCE(SUM(sii.cgst_amount),  0)          AS cgst,
             COALESCE(SUM(sii.sgst_amount),  0)          AS sgst,
             COALESCE(SUM(sii.igst_amount),  0)          AS igst,
-            COUNT(DISTINCT sii.parent)                  AS inv_count
+            COUNT(DISTINCT sii.parent)                  AS inv_count,
+            COUNT(*)                                    AS line_count
         FROM `tabSales Invoice Item` sii
         JOIN `tabSales Invoice` si ON si.name = sii.parent
         WHERE {where}
-        GROUP BY rate
-        ORDER BY rate
-    """.format(where=where), params, as_dict=True)
+        GROUP BY {rate_expr}
+        ORDER BY {rate_expr}
+    """.format(where=where, rate_expr=rate_expr), params, as_dict=True)
 
     out = []
     for r in rows:
         tax = _f(r.cgst) + _f(r.sgst) + _f(r.igst)
         out.append({
-            "rate":      _f(r.rate),
-            "label":     ("Exempt / nil" if _f(r.rate) == 0
-                          else ("%g%%" % _f(r.rate))),
+            "rate":      _f(r.gst_rate),
+            "label":     ("Exempt / nil" if _f(r.gst_rate) == 0
+                          else ("%g%%" % _f(r.gst_rate))),
+            "lines":     _i(r.line_count),
             "taxable":   _f(r.taxable),
             "cgst":      _f(r.cgst),
             "sgst":      _f(r.sgst),
