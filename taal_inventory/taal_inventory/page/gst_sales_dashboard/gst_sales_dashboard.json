@@ -1,0 +1,19 @@
+{
+ "creation": "2026-08-24 00:00:00.000000",
+ "doctype": "Page",
+ "icon": "file-text",
+ "module": "Taal Inventory",
+ "modified": "2026-08-24 00:00:00.000000",
+ "modified_by": "Administrator",
+ "name": "gst-sales-dashboard",
+ "owner": "Administrator",
+ "page_name": "gst-sales-dashboard",
+ "restrict_to_domain": "",
+ "roles": [
+  {"role": "Accounts Manager"},
+  {"role": "Accounts User"},
+  {"role": "System Manager"}
+ ],
+ "standard": "Yes",
+ "title": "Sales & GST Dashboard"
+}
