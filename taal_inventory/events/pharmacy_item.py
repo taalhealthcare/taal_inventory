@@ -276,7 +276,8 @@ def _sync_to_item_master(doc):
 #
 #  When is_service_item = 1:
 #    • Overrides Item Master: is_stock_item=0, has_batch_no=0,
-#      has_serial_no=0, maintain_stock=0, item_group=Services
+#      has_serial_no=0, item_group=Services (falls back to Products if
+#      the "Services" Item Group does not exist in this ERPNext instance)
 #    • Creates/updates Item Price (Standard Selling) from
 #      service_selling_price field on the Pharmacy Item record
 #    • Creates the Item Master from scratch if _sync_to_item_master
@@ -301,6 +302,15 @@ def sync_service_item_to_master(doc, method=None):
     if not item_code:
         return
 
+    # ── Resolve item_group safely ─────────────────────────────────────────────
+    # "Services" is the standard ERPNext Item Group name for non-stock
+    # service items. Fall back to "Products" if it has not been created
+    # in this instance yet, so the sync never crashes.
+    service_item_group = (
+        "Services" if frappe.db.exists("Item Group", "Services")
+        else "Products"
+    )
+
     # ── Ensure Item Master exists ─────────────────────────────────────────────
     # Handles the case where _sync_to_item_master returned early
     # (e.g. HSN blank) and never created the Item Master.
@@ -314,7 +324,7 @@ def sync_service_item_to_master(doc, method=None):
         new_item.has_serial_no    = 0
         new_item.is_sales_item    = 1
         new_item.is_purchase_item = 0
-        new_item.item_group       = "Services"
+        new_item.item_group       = service_item_group
         new_item.disabled         = 0
         new_item.description      = doc.item_name or item_code
         if doc.get("hsn_sac_code"):
@@ -326,11 +336,12 @@ def sync_service_item_to_master(doc, method=None):
         # ── Override flags set by _sync_to_item_master ────────────────────────
         # _sync_to_item_master ran first and set is_stock_item=1.
         # This direct DB write corrects the final state for service items.
+        # maintain_stock does not exist in ERPNext v15 tabItem — omitted.
         frappe.db.set_value("Item", item_code, {
             "is_stock_item":    0,
             "has_batch_no":     0,
             "has_serial_no":    0,
-            "item_group":       "Services",
+            "item_group":       service_item_group,
             "is_sales_item":    1,
             "is_purchase_item": 0,
         })
@@ -381,7 +392,7 @@ def sync_service_item_to_master(doc, method=None):
     frappe.msgprint(
         "Service Item synced — {}: "
         "is_stock_item=0, has_batch_no=0, "
-        "item_group=Services{}.".format(item_code, rate_note),
+        "item_group={}{}.".format(item_code, service_item_group, rate_note),
         alert=True,
         indicator="green",
     )
