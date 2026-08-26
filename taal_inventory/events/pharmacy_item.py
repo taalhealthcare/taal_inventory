@@ -266,3 +266,124 @@ def _sync_to_item_master(doc):
             title="Sync Error",
             indicator="red"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  SERVICE ITEM SYNC  (addition — existing functions above are untouched)
+#
+#  Registered in hooks.py as the second entry in the on_update list for
+#  Pharmacy Item, so it always runs AFTER _sync_to_item_master.
+#
+#  When is_service_item = 1:
+#    • Overrides Item Master: is_stock_item=0, has_batch_no=0,
+#      has_serial_no=0, maintain_stock=0, item_group=Services
+#    • Creates/updates Item Price (Standard Selling) from
+#      service_selling_price field on the Pharmacy Item record
+#    • Creates the Item Master from scratch if _sync_to_item_master
+#      was skipped (e.g. HSN was blank for the service item)
+#
+#  When is_service_item = 0 or field does not exist yet:
+#    • Completely silent no-op — existing FEFO workflow is unaffected
+# ──────────────────────────────────────────────────────────────────────────────
+
+def sync_service_item_to_master(doc, method=None):
+    """
+    Called as the second on_update handler for Pharmacy Item.
+    Handles service items (is_service_item = 1) that must NOT track
+    inventory or batches. Always runs after _sync_to_item_master so
+    the service-item flag always wins over the default is_stock_item=1.
+    """
+    # If the field does not exist yet or is unchecked → silent no-op
+    if not doc.get("is_service_item"):
+        return
+
+    item_code = doc.item_code
+    if not item_code:
+        return
+
+    # ── Ensure Item Master exists ─────────────────────────────────────────────
+    # Handles the case where _sync_to_item_master returned early
+    # (e.g. HSN blank) and never created the Item Master.
+    if not frappe.db.exists("Item", item_code):
+        new_item                  = frappe.new_doc("Item")
+        new_item.item_code        = item_code
+        new_item.item_name        = doc.item_name or item_code
+        new_item.stock_uom        = "Nos"
+        new_item.is_stock_item    = 0
+        new_item.has_batch_no     = 0
+        new_item.has_serial_no    = 0
+        new_item.maintain_stock   = 0
+        new_item.is_sales_item    = 1
+        new_item.is_purchase_item = 0
+        new_item.item_group       = "Services"
+        new_item.disabled         = 0
+        new_item.description      = doc.item_name or item_code
+        if doc.get("hsn_sac_code"):
+            new_item.gst_hsn_code = doc.hsn_sac_code
+        new_item.flags.ignore_permissions = True
+        new_item.flags.ignore_mandatory   = True
+        new_item.insert()
+    else:
+        # ── Override flags set by _sync_to_item_master ────────────────────────
+        # _sync_to_item_master ran first and set is_stock_item=1.
+        # This direct DB write corrects the final state for service items.
+        frappe.db.set_value("Item", item_code, {
+            "is_stock_item":   0,
+            "has_batch_no":    0,
+            "has_serial_no":   0,
+            "maintain_stock":  0,
+            "item_group":      "Services",
+            "is_sales_item":   1,
+            "is_purchase_item": 0,
+        })
+
+    # ── Upsert Item Price from service_selling_price ──────────────────────────
+    service_rate = float(doc.get("service_selling_price") or 0)
+
+    if service_rate > 0:
+        existing_ip = frappe.db.get_value(
+            "Item Price",
+            {
+                "item_code":  item_code,
+                "selling":    1,
+                "price_list": "Standard Selling",
+            },
+            ["name", "price_list_rate"],
+            as_dict=True,
+        )
+
+        if existing_ip:
+            current_rate = float(existing_ip.price_list_rate or 0)
+            if abs(current_rate - service_rate) > 0.01:
+                frappe.db.set_value(
+                    "Item Price",
+                    existing_ip.name,
+                    "price_list_rate",
+                    service_rate,
+                )
+        else:
+            new_ip = frappe.get_doc({
+                "doctype":         "Item Price",
+                "item_code":       item_code,
+                "price_list":      "Standard Selling",
+                "price_list_rate": service_rate,
+                "selling":         1,
+                "currency":        "INR",
+            })
+            new_ip.flags.ignore_permissions = True
+            new_ip.insert()
+
+    frappe.db.commit()
+
+    rate_note = (
+        ", Item Price ₹{} set".format(int(service_rate))
+        if service_rate > 0
+        else " (set Service Selling Price to create Item Price)"
+    )
+    frappe.msgprint(
+        "Service Item synced — {}: "
+        "is_stock_item=0, has_batch_no=0, "
+        "item_group=Services{}.".format(item_code, rate_note),
+        alert=True,
+        indicator="green",
+    )

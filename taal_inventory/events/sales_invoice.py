@@ -40,6 +40,37 @@ def get_fifo_rate(item_code):
     Finds the batch with NEAREST EXPIRY DATE (FEFO) that is active
     and has stock. Returns selling price, remaining qty, expiry date.
     """
+    # ── Service item guard ────────────────────────────────────────────────────
+    # If the Pharmacy Item has is_service_item=1, bypass all FEFO batch
+    # logic entirely and return the fixed Item Price rate. No batch lookup,
+    # no stock check, no FEFO. batch_id="SERVICE" signals the JS to show
+    # a clean "Service Item" alert instead of the batch detail alert.
+    is_service = frappe.db.get_value(
+        "Pharmacy Item",
+        {"item_code": item_code},
+        "is_service_item",
+    )
+    if is_service:
+        rate = float(
+            frappe.db.get_value(
+                "Item Price",
+                {
+                    "item_code":  item_code,
+                    "selling":    1,
+                    "price_list": "Standard Selling",
+                },
+                "price_list_rate",
+            ) or 0
+        )
+        return {
+            "blocked":       False,
+            "rate":          rate,
+            "batch_id":      "SERVICE",
+            "remaining_qty": 999999,
+            "expiry_date":   "",
+        }
+    # ── End service item guard ────────────────────────────────────────────────
+
     pharmacy_items = frappe.get_all(
         "Pharmacy Item",
         filters={"item_code": item_code},
@@ -137,6 +168,15 @@ def on_submit(doc, method):
     company_cogs_totals = {}
 
     for row in doc.items:
+        # ── Service item guard: skip FEFO deduction ───────────────────────────
+        # Service items (is_service_item=1 on Pharmacy Item) carry no
+        # physical inventory. No batch deduction, no COGS JE for these rows.
+        if frappe.db.get_value(
+            "Pharmacy Item", {"item_code": row.item_code}, "is_service_item"
+        ):
+            continue
+        # ── End service item guard ────────────────────────────────────────────
+
         pharmacy_items = frappe.get_all(
             "Pharmacy Item",
             filters={"item_code": row.item_code},
@@ -192,6 +232,15 @@ def on_cancel(doc, method):
     _reverse_cogs_journal_entry(doc)
 
     for row in doc.items:
+        # ── Service item guard: skip FEFO reversal ────────────────────────────
+        # Service items carry no inventory deduction at submit, so there
+        # is nothing to reverse at cancel. Skip silently.
+        if frappe.db.get_value(
+            "Pharmacy Item", {"item_code": row.item_code}, "is_service_item"
+        ):
+            continue
+        # ── End service item guard ────────────────────────────────────────────
+
         pharmacy_items = frappe.get_all(
             "Pharmacy Item",
             filters={"item_code": row.item_code},
@@ -527,4 +576,4 @@ def get_pharmacy_items_for_invoice(doctype, txt, searchfield, start, page_len, f
         "txt":      "%" + (txt or "") + "%",
         "start":    start,
         "page_len": page_len
-    })        
+    })
