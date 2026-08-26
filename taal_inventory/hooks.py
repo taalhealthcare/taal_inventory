@@ -21,11 +21,6 @@ scheduler_events = {
         "*/5 * * * *": [
             "taal_inventory.api.woocommerce_category.reconcile_recent_order_categories"
         ],
-        # ── GST Sales Dashboard ────────────────────────────────────────────────
-        # 07:00 on the 1st of every month. Emails the previous month's GST
-        # matrix (inline HTML table + .xlsx attachment) to the Accounts team.
-        # Recipients: _EMAIL_RECIPIENTS in utils/gst_sales_dashboard.py, or
-        # every enabled user holding the Accounts Manager role if that is empty.
         "0 7 1 * *": [
             "taal_inventory.utils.gst_sales_dashboard.send_monthly_gst_email"
         ],
@@ -33,10 +28,6 @@ scheduler_events = {
     "daily": [
         "taal_inventory.tasks.check_expiry_alerts",
         "taal_inventory.tasks.check_low_stock_daily",
-        # ── Refill Reminder ────────────────────────────────────────────────────
-        # Runs once every morning. Sends WhatsApp reminders to WC customers
-        # whose next_refill_date is within N days. Controlled by the master
-        # switch in Refill Reminder Settings → refill_reminder_enabled.
         "taal_inventory.utils.refill_reminder.run_refill_reminder_check",
     ],
 }
@@ -57,7 +48,16 @@ doc_events = {
     "Pharmacy Item": {
         "before_insert": "taal_inventory.events.pharmacy_item.before_insert",
         "after_insert":  "taal_inventory.events.pharmacy_item.after_insert",
-        "on_update":     "taal_inventory.events.pharmacy_item.on_update",
+        # on_update is a list so sync_service_item_to_master always runs
+        # AFTER the existing on_update → _sync_to_item_master call.
+        # For service items, sync_service_item_to_master then overrides
+        # is_stock_item=0, has_batch_no=0, item_group=Services, and sets
+        # the Item Price from service_selling_price. For all other items
+        # it is a silent no-op — existing FEFO logic is completely unchanged.
+        "on_update": [
+            "taal_inventory.events.pharmacy_item.on_update",
+            "taal_inventory.events.pharmacy_item.sync_service_item_to_master",
+        ],
     },
     "Purchase Invoice": {
         "on_submit": "taal_inventory.events.purchase_invoice.on_submit",
