@@ -312,7 +312,6 @@ def sync_service_item_to_master(doc, method=None):
         new_item.is_stock_item    = 0
         new_item.has_batch_no     = 0
         new_item.has_serial_no    = 0
-        new_item.maintain_stock   = 0
         new_item.is_sales_item    = 1
         new_item.is_purchase_item = 0
         new_item.item_group       = "Services"
@@ -328,12 +327,11 @@ def sync_service_item_to_master(doc, method=None):
         # _sync_to_item_master ran first and set is_stock_item=1.
         # This direct DB write corrects the final state for service items.
         frappe.db.set_value("Item", item_code, {
-            "is_stock_item":   0,
-            "has_batch_no":    0,
-            "has_serial_no":   0,
-            "maintain_stock":  0,
-            "item_group":      "Services",
-            "is_sales_item":   1,
+            "is_stock_item":    0,
+            "has_batch_no":     0,
+            "has_serial_no":    0,
+            "item_group":       "Services",
+            "is_sales_item":    1,
             "is_purchase_item": 0,
         })
 
