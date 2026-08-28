@@ -14,6 +14,8 @@
 //  v3 changes:
 //    - Custom From Date / To Date inputs beside the date bar
 //    - Preset clicks and Clear keep those inputs in sync
+//    - Doughnut canvases wrapped in fixed-size boxes so Chart.js
+//      stops resizing them over the legend
 // ================================================================
 
 frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
@@ -397,7 +399,8 @@ function _dash_styles() {
         +   "background:#EAF3DE;border-radius:6px;padding:8px 10px;margin-top:8px}"
         + ".dw-leg-row{display:flex;align-items:center;gap:6px;margin-bottom:6px}"
         + ".dw-leg-dot{width:9px;height:9px;border-radius:2px;flex-shrink:0}"
-        + ".dw-leg-lbl{font-size:11px;color:#64748b;flex:1}"
+        + ".dw-leg-lbl{font-size:11px;color:#64748b;flex:1;min-width:0;"
+        +   "overflow-wrap:anywhere;line-height:1.35}"
         + ".dw-leg-val{font-size:11px;font-weight:500;color:#111}"
         + ".dw-hbar-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}"
         + ".dw-hbar-lbl{font-size:10px;color:#94a3b8;width:100px;flex-shrink:0;"
@@ -814,15 +817,19 @@ function _online_html(d, fd, td, periodLabel) {
     var stLeg="";for(var i=0;i<wsl.length;i++){stLeg+='<div class="dw-leg-row"><span class="dw-leg-dot" style="background:'+(stC[wsl[i]]||"#888")+'"></span><span class="dw-leg-lbl">'+wsl[i]+'</span><span class="dw-leg-val">'+(wsv[i]||0)+'</span></div>';}
     H += '<div class="dw-card"><div class="dw-ct">WooCommerce order status ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Online orders · woocommerce_status", periodLabel) + "</div>"
-       + '<div style="display:flex;gap:16px;align-items:center"><canvas id="dw-ch1" role="img" aria-label="Status doughnut" style="flex-shrink:0;width:140px;height:140px">Status</canvas>'
-       + '<div style="flex:1">'+stLeg+'</div></div></div>';
+       + '<div style="display:flex;gap:16px;align-items:center">'
+       + '<div style="width:140px;height:140px;flex:0 0 140px;position:relative">'
+       + '<canvas id="dw-ch1" role="img" aria-label="Status doughnut">Status</canvas></div>'
+       + '<div style="flex:1;min-width:0">'+stLeg+'</div></div></div>';
     var pm=ch.payment||{},pml=pm.labels||[],pmv=(pm.datasets&&pm.datasets[0]&&pm.datasets[0].values)||[];
     var pmC=["#378ADD","#7F77DD","#D85A30","#888780","#639922","#D4537E"];
     var pmLeg="";for(var j=0;j<pml.length;j++){pmLeg+='<div class="dw-leg-row"><span class="dw-leg-dot" style="background:'+pmC[j%pmC.length]+'"></span><span class="dw-leg-lbl">'+pml[j]+'</span><span class="dw-leg-val">'+(pmv[j]||0)+'</span></div>';}
     H += '<div class="dw-card"><div class="dw-ct">Payment method ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing · woocommerce_payment_method", periodLabel) + "</div>"
-       + '<div style="display:flex;gap:16px;align-items:center"><canvas id="dw-ch2" role="img" aria-label="Payment doughnut" style="flex-shrink:0;width:140px;height:140px">Payment</canvas>'
-       + '<div style="flex:1">'+pmLeg+'</div></div></div>';
+       + '<div style="display:flex;gap:16px;align-items:center">'
+       + '<div style="width:140px;height:140px;flex:0 0 140px;position:relative">'
+       + '<canvas id="dw-ch2" role="img" aria-label="Payment doughnut">Payment</canvas></div>'
+       + '<div style="flex:1;min-width:0">'+pmLeg+'</div></div></div>';
     H += "</div>";
 
     // S4 — Order value + Top states
@@ -970,7 +977,10 @@ function _offline_html(d, fd, td, periodLabel) {
     var stLeg2="";for(var k=0;k<stl.length;k++){stLeg2+='<div class="dw-leg-row"><span class="dw-leg-dot" style="background:'+(offStC[stl[k]]||"#888")+'"></span><span class="dw-leg-lbl">'+stl[k]+'</span><span class="dw-leg-val">'+(stv[k]||0)+'</span></div>';}
     H += '<div class="dw-card"><div class="dw-ct">Order status distribution ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Offline orders · ERPNext status field", periodLabel) + "</div>"
-       + '<div style="display:flex;gap:16px;align-items:center"><canvas id="dw-ch1" role="img" aria-label="Status doughnut" style="flex-shrink:0;width:140px;height:140px">Status</canvas><div style="flex:1">'+stLeg2+'</div></div></div>';
+       + '<div style="display:flex;gap:16px;align-items:center">'
+       + '<div style="width:140px;height:140px;flex:0 0 140px;position:relative">'
+       + '<canvas id="dw-ch1" role="img" aria-label="Status doughnut">Status</canvas></div>'
+       + '<div style="flex:1;min-width:0">'+stLeg2+'</div></div></div>';
     var taxMonths=ch.tax_monthly||[];var taxMax=0;
     for(var tm=0;tm<taxMonths.length;tm++){var tg=(taxMonths[tm].sgst||0)+(taxMonths[tm].cgst||0)+(taxMonths[tm].igst||0);if(tg>taxMax)taxMax=tg;}
     var taxRows="";
