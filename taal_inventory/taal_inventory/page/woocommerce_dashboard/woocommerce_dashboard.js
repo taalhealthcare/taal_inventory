@@ -10,6 +10,10 @@
 //    - _monthsAgo anchors to 1st of start month
 //    - Period bar shows correct note for Online vs Offline
 //    - Top customer tie-aware (handled in Python, displayed here)
+//
+//  v3 changes:
+//    - Custom From Date / To Date inputs beside the date bar
+//    - Preset clicks and Clear keep those inputs in sync
 // ================================================================
 
 frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
@@ -102,6 +106,64 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
         }
     };
 
+    // ── Custom date range beside the date bar ────────────────
+    var $customRange = $(
+        '<div id="dw-custom-range" style="'
+        + 'display:inline-flex;align-items:center;gap:5px;'
+        + 'background:#fff;border:1.5px solid #e2e8f0;'
+        + 'border-radius:8px;padding:4px 10px;'
+        + 'font-size:12px;color:#64748b;'
+        + 'margin-right:6px;white-space:nowrap;'
+        + 'transition:border-color .2s,background .2s'
+        + '">'
+        + '<span style="font-size:11px">From</span>'
+        + '<input type="date" id="dw-from-date" style="border:none;'
+        + 'background:transparent;font-size:12px;font-weight:600;color:#374151;'
+        + 'outline:none;font-family:inherit;padding:0;max-width:126px">'
+        + '<span style="font-size:11px;margin-left:5px">To</span>'
+        + '<input type="date" id="dw-to-date" style="border:none;'
+        + 'background:transparent;font-size:12px;font-weight:600;color:#374151;'
+        + 'outline:none;font-family:inherit;padding:0;max-width:126px">'
+        + '</div>'
+    );
+    $dateBar.after($customRange);
+
+    // Keeps the two inputs showing whatever period is currently active,
+    // so switching from a preset back to custom starts from the right dates.
+    window._woo_sync_range_inputs = function (fd, td) {
+        $('#dw-from-date').val(fd || '');
+        $('#dw-to-date').val(td || '');
+        $('#dw-custom-range').css({
+            'border-color': (window._woo_period_label === 'Custom') ? '#F59E0B' : '#e2e8f0',
+            'background':   (window._woo_period_label === 'Custom') ? '#FFFBEB' : '#fff'
+        });
+    };
+
+    window._woo_apply_custom_range = function () {
+        var fd = $('#dw-from-date').val();
+        var td = $('#dw-to-date').val();
+
+        if (!fd || !td) return;
+
+        if (fd > td) {
+            frappe.msgprint("From Date cannot be later than To Date.");
+            return;
+        }
+
+        window._woo_from_date    = fd;
+        window._woo_to_date      = td;
+        window._woo_period_label = "Custom";
+        window._woo_period_range = _rangeDisplay(fd, td);
+
+        window._update_datebar("Custom", fd, td);
+        window._woo_sync_range_inputs(fd, td);
+        _dash_load(window._woo_mode, fd, td, "Custom");
+    };
+
+    $customRange.find('input').on('change', function () {
+        window._woo_apply_custom_range();
+    });
+
     // ── Refresh button ────────────────────────────────────────
     page.add_inner_button(__("Refresh"), function () {
         _dash_load(window._woo_mode, window._woo_from_date,
@@ -139,6 +201,7 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
             window._woo_period_range = _rangeDisplay(fd, td);
 
             window._update_datebar(preset.label, fd, td);
+            window._woo_sync_range_inputs(fd, td);
             _dash_load(window._woo_mode, fd, td, preset.label);
         }, __("Date Presets"));
     });
@@ -149,6 +212,7 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
         window._woo_period_label = "All Time";
         window._woo_period_range = "";
         window._update_datebar("All Time", null, null);
+        window._woo_sync_range_inputs(null, null);
         _dash_load(window._woo_mode, null, null, "All Time");
     }, __("Date Presets"));
 
@@ -166,6 +230,7 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
     window._woo_period_range = _rangeDisplay(_defaultFd, _defaultTd);
 
     window._update_datebar(_defaultLbl, _defaultFd, _defaultTd);
+    window._woo_sync_range_inputs(_defaultFd, _defaultTd);
     _dash_load("online", _defaultFd, _defaultTd, _defaultLbl);
 };
 
