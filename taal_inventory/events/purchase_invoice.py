@@ -36,7 +36,7 @@ import frappe
 from frappe.utils import now_datetime, getdate, flt
 
 
-DEFAULT_WAREHOUSE = "Finished Goods - TM"
+DEFAULT_WAREHOUSE = "Finished Goods - TPC"
 
 _ACTION_CREATE = "create"
 _ACTION_TOPUP  = "topup"
