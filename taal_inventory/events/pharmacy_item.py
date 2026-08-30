@@ -19,11 +19,19 @@ def before_insert(doc, method):
 
 def after_insert(doc, method):
     """Triggered after new Pharmacy Item is created."""
+    if doc.flags.get("ignore_taal_item_sync"):
+        return
     _sync_to_item_master(doc)
 
 
 def on_update(doc, method):
     """Triggered after Pharmacy Item is saved or updated."""
+    # A stock rebuild saves this document purely to refresh current_stock
+    # and the company_stock child table. It must NOT re-run the Item Master
+    # / Item Price sync, or every batch movement would fire a full item
+    # sync plus a msgprint.
+    if doc.flags.get("ignore_taal_item_sync"):
+        return
     _sync_to_item_master(doc)
 
 
@@ -31,10 +39,8 @@ def _generate_next_tpic_code():
     """
     Finds the highest TPIC number across tabPharmacy Item and tabItem
     and returns the next one as 'TPIC <N+1>'.
-    Thread-safe: uses frappe.db.sql with FOR UPDATE equivalent
-    by locking with a unique name generation approach.
     """
-    prefix = "TPIC "
+    prefix  = "TPIC "
     max_num = 0
 
     # ── Check Pharmacy Item table ─────────────────────────────────────────────
@@ -51,7 +57,7 @@ def _generate_next_tpic_code():
     """, as_dict=True)
 
     if pi_codes:
-        code = pi_codes[0].item_code or ""
+        code  = pi_codes[0].item_code or ""
         match = re.search(r"TPIC\s+(\d+)", code, re.IGNORECASE)
         if match:
             num = int(match.group(1))
@@ -72,7 +78,7 @@ def _generate_next_tpic_code():
     """, as_dict=True)
 
     if item_codes:
-        code = item_codes[0].name or ""
+        code  = item_codes[0].name or ""
         match = re.search(r"TPIC\s+(\d+)", code, re.IGNORECASE)
         if match:
             num = int(match.group(1))
@@ -83,7 +89,6 @@ def _generate_next_tpic_code():
     next_code = prefix + str(next_num)
 
     # ── Safety check: ensure generated code does not already exist ────────────
-    # In case of race condition, increment until a free code is found
     attempts = 0
     while attempts < 20:
         pi_exists   = frappe.db.exists("Pharmacy Item", {"item_code": next_code})
@@ -112,6 +117,10 @@ def _sync_to_item_master(doc):
 
     Barcode sync: skipped — no barcode workflow implemented yet
     WC link: read-only check — shows warning if not linked, no writes
+
+    NOTE: no frappe.db.commit() anywhere in this function. Frappe commits
+    at the end of the request. Committing mid-hook would leave partial
+    writes behind if a later step in the same transaction fails.
     """
     item_code = doc.item_code
     if not item_code:
@@ -174,8 +183,6 @@ def _sync_to_item_master(doc):
         native_item.flags.ignore_mandatory   = True
         native_item.save()
 
-        frappe.db.commit()
-
         # ── Sync Item Price (Standard Selling) from FEFO batch ────────────────
         today = frappe.utils.today()
 
@@ -216,7 +223,6 @@ def _sync_to_item_master(doc):
                             "price_list_rate",
                             selling_price
                         )
-                        frappe.db.commit()
                 else:
                     new_ip = frappe.get_doc({
                         "doctype":         "Item Price",
@@ -228,7 +234,6 @@ def _sync_to_item_master(doc):
                     })
                     new_ip.flags.ignore_permissions = True
                     new_ip.insert()
-                    frappe.db.commit()
 
         # ── WC Link check — READ ONLY, no writes ──────────────────────────────
         wc_linked = frappe.db.get_value(
@@ -269,7 +274,7 @@ def _sync_to_item_master(doc):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  SERVICE ITEM SYNC  (addition — existing functions above are untouched)
+#  SERVICE ITEM SYNC
 #
 #  Registered in hooks.py as the second entry in the on_update list for
 #  Pharmacy Item, so it always runs AFTER _sync_to_item_master.
@@ -294,6 +299,10 @@ def sync_service_item_to_master(doc, method=None):
     inventory or batches. Always runs after _sync_to_item_master so
     the service-item flag always wins over the default is_stock_item=1.
     """
+    # A stock rebuild must never re-run this sync
+    if doc.flags.get("ignore_taal_item_sync"):
+        return
+
     # If the field does not exist yet or is unchecked → silent no-op
     if not doc.get("is_service_item"):
         return
@@ -303,17 +312,12 @@ def sync_service_item_to_master(doc, method=None):
         return
 
     # ── Resolve item_group safely ─────────────────────────────────────────────
-    # "Services" is the standard ERPNext Item Group name for non-stock
-    # service items. Fall back to "Products" if it has not been created
-    # in this instance yet, so the sync never crashes.
     service_item_group = (
         "Services" if frappe.db.exists("Item Group", "Services")
         else "Products"
     )
 
     # ── Ensure Item Master exists ─────────────────────────────────────────────
-    # Handles the case where _sync_to_item_master returned early
-    # (e.g. HSN blank) and never created the Item Master.
     if not frappe.db.exists("Item", item_code):
         new_item                  = frappe.new_doc("Item")
         new_item.item_code        = item_code
@@ -334,9 +338,6 @@ def sync_service_item_to_master(doc, method=None):
         new_item.insert()
     else:
         # ── Override flags set by _sync_to_item_master ────────────────────────
-        # _sync_to_item_master ran first and set is_stock_item=1.
-        # This direct DB write corrects the final state for service items.
-        # maintain_stock does not exist in ERPNext v15 tabItem — omitted.
         frappe.db.set_value("Item", item_code, {
             "is_stock_item":    0,
             "has_batch_no":     0,
@@ -381,8 +382,6 @@ def sync_service_item_to_master(doc, method=None):
             })
             new_ip.flags.ignore_permissions = True
             new_ip.insert()
-
-    frappe.db.commit()
 
     rate_note = (
         ", Item Price ₹{} set".format(int(service_rate))

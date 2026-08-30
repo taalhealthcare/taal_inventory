@@ -1,9 +1,10 @@
 // ── Sales Invoice — FEFO Rate + Qty Validation ───────────────
 // taal_inventory/public/js/sales_invoice.js
 //
-// FEFO rate is fetched from Pharmacy Batch on item selection.
+// FEFO rate is fetched from Pharmacy Batch on item selection,
+// SCOPED TO frm.doc.company — the rate and availability shown must
+// come from the company actually raising the invoice.
 // Rate is set ONCE — user can freely edit it to any value after.
-// Rate override triggers have been intentionally removed.
 // Item dropdown filtered to Pharmacy Items only.
 // On refresh: validates all items from Sales Order (WooCommerce).
 
@@ -52,7 +53,6 @@ frappe.ui.form.on("Sales Invoice", {
         // ── Validate all existing items on form load ──────────────────
         // Handles Sales Invoice created from Sales Order (WooCommerce)
         // where item_code trigger never fired during item population.
-        // Only runs on draft invoices that have items already populated.
         if (
             frm.doc.docstatus === 0 &&
             frm.doc.items &&
@@ -60,6 +60,12 @@ frappe.ui.form.on("Sales Invoice", {
         ) {
             validate_all_items_on_load(frm);
         }
+    },
+
+    // Company drives which batches FEFO can see — clear cached rates
+    // so the next interaction re-fetches against the new company.
+    company: function(frm) {
+        frm.__fefo_rates = {};
     }
 
 });
@@ -82,7 +88,6 @@ frappe.ui.form.on("Sales Invoice Item", {
     // ERPNext fires this after get_item_details API returns.
     // Intercept ONLY on the first sync — when rate still equals
     // price_list_rate but neither matches our FEFO rate yet.
-    // After this one-time correction the user edits rate freely.
     price_list_rate: function(frm, cdt, cdn) {
         var fefo_rate = frm.__fefo_rates && frm.__fefo_rates[cdn];
         if (!fefo_rate || fefo_rate <= 0) return;
@@ -98,8 +103,6 @@ frappe.ui.form.on("Sales Invoice Item", {
     // NOT intercepted — user can freely change rate to any value.
 
     // ── qty ──────────────────────────────────────────────────
-    // Only validates qty against available stock.
-    // Does NOT reset rate — user's edited rate is preserved.
     qty: function(frm, cdt, cdn) {
         var row = locals[cdt][cdn];
         if (!row.item_code || !row.qty) return;
@@ -109,11 +112,7 @@ frappe.ui.form.on("Sales Invoice Item", {
 });
 
 
-// ── Validate all items when form loads from Sales Order ───────────────────────
-// Called from refresh trigger for SO-based and WooCommerce invoices.
-// Shows a consolidated red warning if any item has no active stock.
 function validate_all_items_on_load(frm) {
-    // Use a short delay to allow form to fully render before API calls
     setTimeout(function() {
         var blocked_items = [];
         var checked       = 0;
@@ -128,7 +127,7 @@ function validate_all_items_on_load(frm) {
 
             frappe.call({
                 method: "taal_inventory.events.sales_invoice.get_fifo_rate",
-                args: { item_code: row.item_code },
+                args: { item_code: row.item_code, company: frm.doc.company },
                 callback: function(r) {
                     checked++;
 
@@ -142,7 +141,6 @@ function validate_all_items_on_load(frm) {
                         frm.__fefo_rates[row.name] = r.message.rate;
                     }
 
-                    // All items checked — show consolidated warning
                     if (checked === total && blocked_items.length > 0) {
                         frappe.msgprint({
                             title: "⚠ Stock Warning — Items Have No Available Stock",
@@ -156,8 +154,9 @@ function validate_all_items_on_load(frm) {
                                 "padding:16px 20px;" +
                                 "'>" +
                                 "<p style='margin:0 0 10px 0;color:#c0392b;font-weight:700;'>" +
-                                "The following items have no active stock " +
-                                "(all batches expired or exhausted):" +
+                                "The following items have no active stock in " +
+                                (frm.doc.company || "this company") +
+                                " (all batches expired or exhausted):" +
                                 "</p>" +
                                 "<ul style='margin:0;padding-left:20px;color:#2c3e50;'>" +
                                 blocked_items.map(function(item) {
@@ -189,7 +188,7 @@ function validate_all_items_on_load(frm) {
 function fetch_fefo_rate(frm, cdt, cdn, item_code) {
     frappe.call({
         method: "taal_inventory.events.sales_invoice.get_fifo_rate",
-        args: { item_code: item_code },
+        args: { item_code: item_code, company: frm.doc.company },
         callback: function(r) {
             if (!r.message) return;
 
@@ -198,6 +197,7 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
                     title: "No Stock Available",
                     message: "All batches for <b>"
                         + item_code
+                        + "</b> in <b>" + (frm.doc.company || "this company")
                         + "</b> are expired or exhausted.",
                     indicator: "red"
                 });
@@ -216,7 +216,6 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
                 }
                 frm.__fefo_rates[cdn] = rate;
 
-                // Set rate once — user can edit freely after this
                 frappe.model.set_value(cdt, cdn, "price_list_rate", rate);
                 frappe.model.set_value(cdt, cdn, "rate", rate);
                 frm.refresh_field("items");
@@ -237,7 +236,7 @@ function fetch_fefo_rate(frm, cdt, cdn, item_code) {
 function validate_qty(frm, cdt, cdn, row) {
     frappe.call({
         method: "taal_inventory.events.sales_invoice.get_fifo_rate",
-        args: { item_code: row.item_code },
+        args: { item_code: row.item_code, company: frm.doc.company },
         callback: function(r) {
             if (!r.message || r.message.blocked) return;
 
@@ -357,13 +356,14 @@ function scan_and_add_item(frm, barcode) {
             if (!existing) {
                 frappe.call({
                     method: "taal_inventory.events.sales_invoice.get_fifo_rate",
-                    args: { item_code: item_code },
+                    args: { item_code: item_code, company: frm.doc.company },
                     callback: function(ir) {
                         if (ir.message && ir.message.blocked) {
                             frappe.msgprint({
                                 title: "No Stock",
                                 message: "No valid stock for "
-                                    + item_code,
+                                    + item_code + " in "
+                                    + (frm.doc.company || "this company"),
                                 indicator: "red"
                             });
                             return;

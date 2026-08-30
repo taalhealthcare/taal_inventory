@@ -12,8 +12,9 @@ before_request = [
 before_job     = ["taal_inventory.utils.wc_status_patch.apply"]
 
 doctype_js = {
-    "Stock Receipt": "public/js/stock_receipt.js",
-    "Sales Invoice": "public/js/sales_invoice.js",
+    "Stock Receipt":  "public/js/stock_receipt.js",
+    "Sales Invoice":  "public/js/sales_invoice.js",
+    "Pharmacy Item":  "public/js/pharmacy_item.js",
 }
 
 scheduler_events = {
@@ -29,13 +30,24 @@ scheduler_events = {
         "taal_inventory.tasks.check_expiry_alerts",
         "taal_inventory.tasks.check_low_stock_daily",
         "taal_inventory.utils.refill_reminder.run_refill_reminder_check",
+        # Flips past-expiry Active batches to Expired, then self-heals any
+        # Pharmacy Item whose Total Stock has drifted from its Stock by
+        # Company rows or from the live Active-batch total.
+        "taal_inventory.utils.company_stock.daily_stock_maintenance",
     ],
 }
 
 doc_events = {
+    # ── Transactions ─────────────────────────────────────────────────────────
+    # Each of these already calls recalculate_company_stock() internally,
+    # which now routes through the full rebuild in utils/company_stock.py.
     "Sales Invoice": {
         "on_submit": "taal_inventory.events.sales_invoice.on_submit",
         "on_cancel": "taal_inventory.events.sales_invoice.on_cancel",
+    },
+    "Purchase Invoice": {
+        "on_submit": "taal_inventory.events.purchase_invoice.on_submit",
+        "on_cancel": "taal_inventory.events.purchase_invoice.on_cancel",
     },
     "Stock Receipt": {
         "on_submit": "taal_inventory.events.stock_receipt.on_submit",
@@ -45,26 +57,31 @@ doc_events = {
         "on_submit": "taal_inventory.events.stock_receipt.on_adjustment_submit",
         "on_cancel": "taal_inventory.events.stock_receipt.on_adjustment_cancel",
     },
+    "Pharmacy Stock Transfer": {
+        "on_submit": "taal_inventory.events.pharmacy_stock_transfer.on_submit",
+        "on_cancel": "taal_inventory.events.pharmacy_stock_transfer.on_cancel",
+    },
+
+    # ── Pharmacy Batch: the source of truth for all stock ─────────────────────
+    # Safety net for MANUAL batch edits in the UI. on_update also fires on
+    # insert, so a separate after_insert entry would only duplicate work.
+    "Pharmacy Batch": {
+        "validate":  "taal_inventory.utils.company_stock.validate_batch",
+        "on_update": "taal_inventory.utils.company_stock.on_batch_change",
+        "on_trash":  "taal_inventory.utils.company_stock.on_batch_trash",
+    },
+
     "Pharmacy Item": {
         "before_insert": "taal_inventory.events.pharmacy_item.before_insert",
         "after_insert":  "taal_inventory.events.pharmacy_item.after_insert",
         # on_update is a list so sync_service_item_to_master always runs
         # AFTER the existing on_update → _sync_to_item_master call.
-        # For service items, sync_service_item_to_master then overrides
-        # is_stock_item=0, has_batch_no=0, item_group=Services, and sets
-        # the Item Price from service_selling_price. For all other items
-        # it is a silent no-op — existing FEFO logic is completely unchanged.
+        # Both entries return early when the save came from a stock rebuild
+        # (doc.flags.ignore_taal_item_sync), so refreshing stock never
+        # re-runs the Item Master / Item Price sync.
         "on_update": [
             "taal_inventory.events.pharmacy_item.on_update",
             "taal_inventory.events.pharmacy_item.sync_service_item_to_master",
         ],
-    },
-    "Purchase Invoice": {
-        "on_submit": "taal_inventory.events.purchase_invoice.on_submit",
-        "on_cancel": "taal_inventory.events.purchase_invoice.on_cancel",
-    },
-    "Pharmacy Stock Transfer": {
-        "on_submit": "taal_inventory.events.pharmacy_stock_transfer.on_submit",
-        "on_cancel": "taal_inventory.events.pharmacy_stock_transfer.on_cancel",
     },
 }

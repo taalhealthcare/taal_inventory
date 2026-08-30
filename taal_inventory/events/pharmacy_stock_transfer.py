@@ -13,16 +13,21 @@ BUSINESS LOGIC:
     destination company's NEW cost_price.
   - Destination warehouse is always the fixed "Finished Goods - <abbr>"
     warehouse for the receiving company.
-  - Full deduction_log integration, now including `company`:
+  - Full deduction_log integration, including `company`:
         Source company      -> event_type = "Transfer OUT", company=from_company
         Destination company -> event_type = "Transfer IN",  company=to_company
-  - Pharmacy Stock Transfer Item now also records from_selling_price
-    and from_mrp_price (live-fetched on the client side, written
-    again server-side on submit for data integrity).
 
   - Pharmacy Item stays a SINGLE global record per item_code.
-    Per-company stock breakdown lives in the `company_stock`
-    child table (see utils/company_stock.py).
+    Per-company stock breakdown lives in the `company_stock` child
+    table, rebuilt from source by utils/company_stock.rebuild_item_stock.
+
+STOCK REFRESH:
+  Batch mutations here use frappe.db.set_value / direct insert, so the
+  Pharmacy Batch hooks do not fire. Every affected Pharmacy Item is
+  therefore rebuilt explicitly once, after the item loop finishes.
+  No intermediate frappe.db.commit() calls — the whole submit is one
+  atomic transaction, and uncommitted writes are already visible to the
+  SQL reads inside rebuild_item_stock on the same connection.
 """
 
 import frappe
@@ -38,13 +43,14 @@ def on_submit(doc, method):
       2. Reduce source batch remaining_qty by transferred qty
       3. Mark source batch Exhausted if remaining_qty becomes 0
       4. Create a NEW Pharmacy Batch at to_company
-      5. Refresh company_stock child table rows on BOTH companies
-      6. Log "Transfer OUT" on source side, "Transfer IN" on destination
-         side — both with company recorded
-      7. Write new_batch + pricing reference fields back onto the row
+      5. Log "Transfer OUT" at source and "Transfer IN" at destination
+      6. Write new_batch + pricing reference fields back onto the row
+
+    After the loop: rebuild current_stock + company_stock for every
+    Pharmacy Item involved.
     """
     from taal_inventory.utils.stock_log import append_stock_log
-    from taal_inventory.utils.company_stock import recalculate_company_stock
+    from taal_inventory.utils.company_stock import rebuild_item_stock, get_company_stock
 
     if doc.from_company == doc.to_company:
         frappe.throw(
@@ -64,6 +70,7 @@ def on_submit(doc, method):
         )
 
     total_transferred = 0
+    affected_items    = set()
 
     for row in doc.items:
         # ── Step 1: Validate source batch ─────────────────────────────────────
@@ -82,7 +89,7 @@ def on_submit(doc, method):
                 f"can be transferred."
             )
 
-        available = flt(source_batch.remaining_qty)
+        available    = flt(source_batch.remaining_qty)
         transfer_qty = flt(row.qty)
 
         if transfer_qty <= 0:
@@ -96,7 +103,7 @@ def on_submit(doc, method):
 
         # ── Step 2 & 3: Reduce source batch, update status ────────────────────
         new_source_remaining = available - transfer_qty
-        new_source_status = "Exhausted" if new_source_remaining == 0 else "Active"
+        new_source_status    = "Exhausted" if new_source_remaining == 0 else "Active"
 
         frappe.db.set_value("Pharmacy Batch", source_batch.name, {
             "remaining_qty": new_source_remaining,
@@ -104,40 +111,40 @@ def on_submit(doc, method):
         })
 
         # ── Step 4: Create NEW Pharmacy Batch at destination company ──────────
-        transfer_price    = flt(row.transfer_price)
-        to_selling_price  = flt(row.to_selling_price)
-        to_mrp_price       = flt(row.to_mrp_price)
-        profit             = to_selling_price - transfer_price
+        transfer_price   = flt(row.transfer_price)
+        to_selling_price = flt(row.to_selling_price)
+        to_mrp_price     = flt(row.to_mrp_price)
+        profit           = to_selling_price - transfer_price
 
         new_batch = frappe.get_doc({
-            "doctype":               "Pharmacy Batch",
-            "item":                  source_batch.item,
-            "item_name":             source_batch.item_name,
-            "batch_id":              _generate_transfer_batch_id(source_batch.batch_id, doc.name),
-            "manufacturing_date":    source_batch.manufacturing_date,
-            "expiry_date":           source_batch.expiry_date,
-            "mrp_price":             to_mrp_price,
-            "selling_price":         to_selling_price,
-            "cost_price":            transfer_price,
-            "profit_per_uom":        profit,
-            "gst_pct":               source_batch.gst_pct,
-            "purchsase_tax_pct":     source_batch.purchsase_tax_pct,
-            "supplier_discount_pct": 0,
-            "hsn_sac_code":          source_batch.hsn_sac_code,
-            "manufacturer_name":     source_batch.manufacturer_name,
-            "supplier_name":         doc.from_company,
-            "supplier_invoice_no":   doc.name,
-            "qty_received":          transfer_qty,
-            "remaining_qty":         transfer_qty,
-            "warehouse":             destination_warehouse,
-            "company":               doc.to_company,
+            "doctype":                  "Pharmacy Batch",
+            "item":                     source_batch.item,
+            "item_name":                source_batch.item_name,
+            "batch_id":                 _generate_transfer_batch_id(
+                                            source_batch.batch_id, doc.name),
+            "manufacturing_date":       source_batch.manufacturing_date,
+            "expiry_date":              source_batch.expiry_date,
+            "mrp_price":                to_mrp_price,
+            "selling_price":            to_selling_price,
+            "cost_price":               transfer_price,
+            "profit_per_uom":           profit,
+            "gst_pct":                  source_batch.gst_pct,
+            "purchsase_tax_pct":        source_batch.purchsase_tax_pct,
+            "supplier_discount_pct":    0,
+            "hsn_sac_code":             source_batch.hsn_sac_code,
+            "manufacturer_name":        source_batch.manufacturer_name,
+            "supplier_name":            doc.from_company,
+            "supplier_invoice_no":      doc.name,
+            "qty_received":             transfer_qty,
+            "remaining_qty":            transfer_qty,
+            "warehouse":                destination_warehouse,
+            "company":                  doc.to_company,
             "transferred_from_company": doc.from_company,
-            "transfer_reference":   doc.name,
-            "status":                "Active",
-            "creation_date":         now_datetime()
+            "transfer_reference":       doc.name,
+            "status":                   "Active",
+            "creation_date":            now_datetime()
         })
         new_batch.insert(ignore_permissions=True)
-        frappe.db.commit()
 
         # Write batch references and pricing snapshot back onto the row
         frappe.db.set_value(
@@ -151,13 +158,14 @@ def on_submit(doc, method):
             }
         )
 
-        # ── Step 5: Refresh company_stock on BOTH companies ────────────────────
         pharmacy_item_name = source_batch.item
+        affected_items.add(pharmacy_item_name)
 
-        source_company_stock = recalculate_company_stock(pharmacy_item_name, doc.from_company)
-        dest_company_stock   = recalculate_company_stock(pharmacy_item_name, doc.to_company)
+        # Live per-company balances for the log lines
+        source_company_stock = get_company_stock(pharmacy_item_name, doc.from_company)
+        dest_company_stock   = get_company_stock(pharmacy_item_name, doc.to_company)
 
-        # ── Step 6: Log Transfer OUT at source ─────────────────────────────────
+        # ── Step 5: Log Transfer OUT at source ─────────────────────────────────
         append_stock_log(
             pharmacy_item_name=pharmacy_item_name,
             event_type="Transfer OUT",
@@ -175,7 +183,7 @@ def on_submit(doc, method):
                     f"(company stock at source after: {source_company_stock})"
         )
 
-        # ── Step 7: Log Transfer IN at destination ─────────────────────────────
+        # ── Step 6: Log Transfer IN at destination ─────────────────────────────
         append_stock_log(
             pharmacy_item_name=pharmacy_item_name,
             event_type="Transfer IN",
@@ -196,8 +204,12 @@ def on_submit(doc, method):
 
         total_transferred += transfer_qty
 
-    frappe.db.set_value("Pharmacy Stock Transfer", doc.name, "total_qty", total_transferred)
-    frappe.db.commit()
+    frappe.db.set_value("Pharmacy Stock Transfer", doc.name,
+                        "total_qty", total_transferred)
+
+    # ── Rebuild stock once per affected item ──────────────────────────────────
+    for pharmacy_item_name in affected_items:
+        rebuild_item_stock(pharmacy_item_name)
 
     frappe.msgprint(
         f"Stock Transfer submitted. {len(doc.items)} batch(es) transferred "
@@ -215,18 +227,20 @@ def on_cancel(doc, method):
       1. Restore remaining_qty on source batch
       2. Reactivate source batch if it was Exhausted
       3. Quarantine the NEW batch created at destination
-      4. Refresh company_stock on both companies
-      5. Log reversal entries on both sides, each with correct company
+      4. Log reversal entries on both sides, each with correct company
+      5. Rebuild stock for every affected Pharmacy Item
     """
     from taal_inventory.utils.stock_log import append_stock_log
-    from taal_inventory.utils.company_stock import recalculate_company_stock
+    from taal_inventory.utils.company_stock import rebuild_item_stock, get_company_stock
+
+    affected_items = set()
 
     for row in doc.items:
         if not row.new_batch:
             continue
 
         source_batch = frappe.get_doc("Pharmacy Batch", row.source_batch)
-        new_batch     = frappe.get_doc("Pharmacy Batch", row.new_batch)
+        new_batch    = frappe.get_doc("Pharmacy Batch", row.new_batch)
 
         transfer_qty = flt(row.qty)
 
@@ -239,15 +253,14 @@ def on_cancel(doc, method):
 
         # ── Step 3: Quarantine destination batch ───────────────────────────────
         frappe.db.set_value("Pharmacy Batch", new_batch.name, "status", "Quarantined")
-        frappe.db.commit()
 
-        # ── Step 4: Refresh company_stock on both sides ─────────────────────────
         pharmacy_item_name = source_batch.item
+        affected_items.add(pharmacy_item_name)
 
-        source_company_stock = recalculate_company_stock(pharmacy_item_name, doc.from_company)
-        dest_company_stock   = recalculate_company_stock(pharmacy_item_name, doc.to_company)
+        source_company_stock = get_company_stock(pharmacy_item_name, doc.from_company)
+        dest_company_stock   = get_company_stock(pharmacy_item_name, doc.to_company)
 
-        # ── Step 5: Log reversal at source (stock restored) ─────────────────────
+        # ── Step 4: Log reversal at source (stock restored) ────────────────────
         append_stock_log(
             pharmacy_item_name=pharmacy_item_name,
             event_type="Transfer IN",
@@ -281,7 +294,9 @@ def on_cancel(doc, method):
             remarks=f"Cancelled Transfer {doc.name} — batch quarantined at destination"
         )
 
-    frappe.db.commit()
+    # ── Step 5: Rebuild stock once per affected item ──────────────────────────
+    for pharmacy_item_name in affected_items:
+        rebuild_item_stock(pharmacy_item_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

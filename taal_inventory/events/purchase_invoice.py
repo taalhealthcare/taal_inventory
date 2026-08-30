@@ -29,8 +29,7 @@ TOPUP  : batch_id already exists for this item+company -> ADD the invoice qty
          (cost/selling/MRP/expiry) is NOT overwritten — the PI is expected to
          mirror the existing batch's pricing (client script auto-fetches it).
 
-The old "finance-only" and "duplicate blocked" scenarios are gone. Reusing a
-batch ID is now normal and always adds stock.
+Reusing a batch ID is normal and always adds stock.
 """
 
 import frappe
@@ -56,6 +55,35 @@ _INVENTORY_SWEEP_CONFIG = {
         "cost_center": "Main - NP",
     },
 }
+
+
+def _resolve_config(company, config, context=""):
+    """
+    Case-insensitive company config lookup.
+
+    A plain config[company] lookup is case-sensitive, so a Company record
+    named "TAALPLUS CHC Private Limited" would silently miss a key written
+    as "Taalplus CHC Private Limited" — no error, no GL entry, no trace.
+    This matches case-insensitively and LOGS a real miss instead.
+    """
+    if not company:
+        return None
+
+    if company in config:
+        return config[company]
+
+    key = company.strip().lower()
+    for k, v in config.items():
+        if k.strip().lower() == key:
+            return v
+
+    frappe.log_error(
+        f"No account configuration found for company '{company}'. "
+        f"Configured companies: {list(config.keys())}. "
+        f"Context: {context}",
+        "Company Config Missing"
+    )
+    return None
 
 
 # =============================================================================
@@ -92,7 +120,7 @@ def on_submit(doc, method):
 
 def on_cancel(doc, method):
     """
-    Purchase Invoice cancel. Reverses exactly what submit applied:
+    Reverses exactly what submit applied:
 
       - Batches CREATED by this PI (purchase_invoice == doc.name and
         qty_received > 0) -> quarantined, remaining stock reversed.
@@ -485,7 +513,8 @@ def _sweep_srbnb_to_inventory(doc):
 
     The PI name is stamped into cheque_no so on_cancel can reverse it.
     """
-    cfg = _INVENTORY_SWEEP_CONFIG.get(doc.company)
+    cfg = _resolve_config(doc.company, _INVENTORY_SWEEP_CONFIG,
+                          context=f"SRBNB sweep for Purchase Invoice {doc.name}")
     if not cfg:
         return
 
@@ -599,14 +628,14 @@ def _sync_item_price(item_code, selling_price, expiry_date):
             "Item Price Sync Error"
         )
 
+
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
 def get_pharmacy_items_for_purchase(doctype, txt, searchfield, start, page_len, filters):
     """
     Search filter for item_code field in Purchase Invoice Item.
-    Returns only Item Master records that have a matching
-    Pharmacy Item — active or inactive (both can receive new stock).
-    Searches by item_code, item_name, or pharmacy item_name.
+    Returns only Item Master records that have a matching Pharmacy Item —
+    active or inactive (both can receive new stock).
     """
     return frappe.db.sql("""
         SELECT
@@ -631,4 +660,4 @@ def get_pharmacy_items_for_purchase(doctype, txt, searchfield, start, page_len, 
         "txt":      "%" + (txt or "") + "%",
         "start":    start,
         "page_len": page_len
-    })        
+    })

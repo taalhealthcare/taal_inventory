@@ -5,21 +5,23 @@ Single source of truth for all stock movement logging.
 Every stock event (IN, OUT, Reversal, Transfer) writes one row to
 Pharmacy Item's deduction_log child table.
 
-UPDATED: Added `company` parameter — every deduction_log entry now
-records WHICH company the event happened in. Critical for multi-company
-operations (Point 3 — Inter-Company Transfer) where the same Pharmacy
-Item can have events happening across multiple companies, and audit
-trail must clearly show which company each event belongs to.
+`company` is recorded on every entry — critical for multi-company
+operations where the same Pharmacy Item has events across companies
+and the audit trail must show which company each event belongs to.
 
 CRITICAL PATTERN: Uses pi_doc.append() + pi_doc.save() — NOT frappe.db.insert().
 frappe.db.insert() bypasses naming series, idx assignment, and produces
 rows that never appear in the UI.
 
+The save() sets flags.ignore_taal_item_sync so it does NOT re-trigger the
+Item Master / Item Price sync. Without that flag, a five-line invoice
+consuming eight batches would fire eight full item syncs and eight toasts.
+
 Called by:
-  - events/sales_invoice.py        (Stock OUT, Reversal IN)
-  - events/stock_receipt.py        (Stock IN, Reversal OUT)
-  - events/purchase_invoice.py     (Stock IN, Reversal OUT)
-  - events/pharmacy_stock_transfer.py (Transfer OUT, Transfer IN)
+  - events/sales_invoice.py            (Stock OUT, Reversal IN)
+  - events/stock_receipt.py            (Stock IN, Reversal OUT)
+  - events/purchase_invoice.py         (Stock IN, Reversal OUT)
+  - events/pharmacy_stock_transfer.py  (Transfer OUT, Transfer IN)
 
 Event types (must match Deduction Log.event_type Select options):
   "Stock IN"      - stock added (SR submit, PI submit)
@@ -71,15 +73,13 @@ def append_stock_log(
     qty : float
         Quantity moved — always positive, event_type conveys direction
     balance_after : float
-        Stock balance AFTER this event (company-specific when relevant)
+        Stock balance AFTER this event, for THIS company
     cost_price, selling_price, mrp_price : float
         Pricing at time of event
     warehouse : str
         Warehouse involved
     company : str
-        Which company this event happened in — CRITICAL for multi-company
-        audit trail. Always pass this explicitly; do not leave blank
-        for any event going forward.
+        Which company this event happened in. Always pass explicitly.
     patient_name : str
         Patient / customer name (for SI events)
     deducted_by : str
@@ -108,6 +108,8 @@ def append_stock_log(
             "remarks":            remarks or "",
         })
 
+        # Logging stock must never re-run the Item Master / Item Price sync
+        pi_doc.flags.ignore_taal_item_sync = True
         pi_doc.save(ignore_permissions=True)
 
     except Exception as e:
