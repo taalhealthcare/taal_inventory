@@ -1,21 +1,16 @@
 // ================================================================
-//  Orders Dashboard  —  Online / Offline toggle + Period Labels
+//  Orders Dashboard  -  Online / Offline toggle + Period Labels
 //  App  : taal_inventory
 //  Page : woocommerce-dashboard
 //  URL  : /app/woocommerce-dashboard
 //
-//  v2 changes:
-//    - Defaults to Current Month on page load
-//    - Date range display bar beside toolbar buttons
-//    - _monthsAgo anchors to 1st of start month
-//    - Period bar shows correct note for Online vs Offline
-//    - Top customer tie-aware (handled in Python, displayed here)
-//
-//  v3 changes:
-//    - Custom From Date / To Date inputs beside the date bar
-//    - Preset clicks and Clear keep those inputs in sync
-//    - Doughnut canvases wrapped in fixed-size boxes so Chart.js
-//      stops resizing them over the legend
+//  v4 changes (aligned to the "Basic Report"):
+//    - Active statuses: Shipped, Processing, Processing LP,
+//      Delivered, Picked up (drafts included on the backend)
+//    - Pending now means "Pending Payment"
+//    - Online pipeline has 7 stages incl. Delivered
+//    - Status colours and badges cover every real status
+//    - Fulfilled rate = Shipped + Delivered + Picked up
 // ================================================================
 
 frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
@@ -130,8 +125,6 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
     );
     $dateBar.after($customRange);
 
-    // Keeps the two inputs showing whatever period is currently active,
-    // so switching from a preset back to custom starts from the right dates.
     window._woo_sync_range_inputs = function (fd, td) {
         $('#dw-from-date').val(fd || '');
         $('#dw-to-date').val(td || '');
@@ -193,7 +186,7 @@ frappe.pages["woocommerce-dashboard"].on_page_load = function (wrapper) {
             else if (preset.label === "Last 6 Months") { fd = _monthsAgo(today, 6);  td = today; }
 
             if (!fd || !td) {
-                frappe.msgprint("Could not compute date range — please try again.");
+                frappe.msgprint("Could not compute date range. Please try again.");
                 return;
             }
 
@@ -492,6 +485,31 @@ function _dash_styles() {
 // ================================================================
 var _INR = function (n) { return "₹ " + Math.round(n || 0).toLocaleString("en-IN"); };
 
+// One colour map for every real WooCommerce status (lowercase keys)
+var _WOO_COLORS = {
+    "shipped":           "#27ae60",
+    "delivered":         "#15803d",
+    "picked up":         "#0d9488",
+    "processing":        "#f39c12",
+    "processing lp":     "#fb923c",
+    "pending payment":   "#BA7517",
+    "pending":           "#BA7517",
+    "on hold":           "#888780",
+    "on-hold":           "#888780",
+    "cancelled":         "#e74c3c",
+    "failed":            "#b91c1c",
+    "trash":             "#57534e",
+    "refunded":          "#8e44ad",
+    "draft":             "#94a3b8",
+    "quote sent":        "#7c3aed",
+    "ready for pickup":  "#0ea5e9",
+    "partially shipped": "#06b6d4",
+    "not synced":        "#64748b"
+};
+function _woo_color(s) {
+    return _WOO_COLORS[(s || "").toLowerCase().trim()] || "#888780";
+}
+
 function _ptag(label) {
     if (!label || label === "All Time") return "";
     return '<span class="dw-period-tag">' + label + "</span>";
@@ -507,7 +525,7 @@ function _sechd(lbl, periodLabel) {
          + '</span><div class="dw-sl-line"></div></div>';
 }
 
-// Period bar — mode-aware right label
+// Period bar with mode-aware right label
 function _period_bar(periodLabel, fd, td, mode) {
     if (!periodLabel || periodLabel === "All Time") return "";
     var months = ["Jan","Feb","Mar","Apr","May","Jun",
@@ -520,8 +538,8 @@ function _period_bar(periodLabel, fd, td, mode) {
         rangeStr = fd === td ? fStr : fStr + " – " + tStr;
     }
     var modeNote = (mode === "offline")
-        ? "ERPNext native status · Offline orders"
-        : "Shipped + Processing only";
+        ? "ERPNext native status · drafts included"
+        : "Active orders only · drafts included";
     return '<div class="dw-period-bar">'
         + '<div>'
         + '<div class="dw-period-bar-lbl">📅 Active filter: ' + periodLabel + "</div>"
@@ -545,7 +563,7 @@ function _kpi(cls, lbl, vid, val, trendHtml, note, sub, fid, fc, fw) {
 
 function _trend_html(t, inv) {
     if (!t || t.dir === "flat" || t.pct === 0)
-        return '<div class="dw-ktr dw-t-fl">— stable</div>';
+        return '<div class="dw-ktr dw-t-fl">stable</div>';
     var up  = t.dir === "up";
     var arr = up ? "↑" : "↓";
     var cls = inv ? (up ? "dw-t-inv-up" : "dw-t-inv-dn") : (up ? "dw-t-up" : "dw-t-dn");
@@ -553,9 +571,16 @@ function _trend_html(t, inv) {
 }
 
 function _badge_online(s) {
-    var k = (s || "").toLowerCase();
-    var c = k === "shipped" ? "db-sh" : k === "processing" ? "db-pr" : k === "pending" ? "db-pe"
-          : k === "on-hold" ? "db-oh" : k === "refunded"   ? "db-rf" : "db-cn";
+    var k = (s || "").toLowerCase().trim();
+    var c = "db-oh";
+    if      (k === "shipped" || k === "partially shipped")                        c = "db-sh";
+    else if (k.indexOf("processing") === 0)                                       c = "db-pr";
+    else if (k.indexOf("pending") === 0)                                          c = "db-pe";
+    else if (k === "on hold" || k === "on-hold" || k === "draft"
+          || k === "quote sent")                                                  c = "db-oh";
+    else if (k === "refunded")                                                    c = "db-rf";
+    else if (k === "delivered" || k === "picked up" || k === "ready for pickup")  c = "db-cp";
+    else if (k === "cancelled" || k === "failed" || k === "trash")                c = "db-cn";
     return '<span class="dw-badge ' + c + '">' + (s || "—") + "</span>";
 }
 
@@ -667,8 +692,8 @@ function _dash_topbar(mode, kp, fd, td, periodLabel) {
     var isOnline = mode === "online";
     var chips = isOnline
         ? [["#EAF3DE","#27500A","#639922", _INR(kp.total_revenue||0)+" revenue"],
-           ["#E6F1FB","#0C447C","#378ADD", (kp.ship_proc_count||0)+" shipped/processing"],
-           ["#FAEEDA","#633806","#BA7517", (kp.pending||0)+" pending"]]
+           ["#E6F1FB","#0C447C","#378ADD", (kp.ship_proc_count||0)+" active orders"],
+           ["#FAEEDA","#633806","#BA7517", (kp.pending||0)+" pending payment"]]
         : [["#EAF3DE","#27500A","#639922", _INR(kp.total_revenue||0)+" revenue"],
            ["#FAEEDA","#633806","#BA7517", (kp.total_orders||0)+" orders"],
            ["#E6F1FB","#0C447C","#378ADD", (kp.pending||0)+" pending"]];
@@ -719,40 +744,40 @@ function _online_html(d, fd, td, periodLabel) {
     H += _dash_topbar("online", kp, fd, td, periodLabel);
     H += _period_bar(periodLabel, fd, td, "online");
 
-    H += '<div class="dw-notice dw-notice-b">All metrics: custom_offline__online = Online · '
-       + 'All sections: woocommerce_status IN (Shipped, Processing) · Pending: status = Pending only'
+    H += '<div class="dw-notice dw-notice-b">All metrics: Online · drafts included (docstatus 0 and 1) · WooCommerce server set · '
+       + 'Active = Shipped, Processing, Processing LP, Delivered, Picked up · Pending = Pending Payment'
        + (pl_active ? " · Period: <strong>" + periodLabel + "</strong>" : "")
        + "</div>";
 
-    // S1 — KPIs
-    H += _sechd("Section 1 — Revenue & order KPIs", periodLabel);
+    // S1: KPIs
+    H += _sechd("Section 1: Revenue & order KPIs", periodLabel);
     H += '<div class="dw-g3">';
 
     var revLabel = pl_active ? periodLabel + " revenue (Online)" : "Total revenue (Online)";
     H += _kpi("kg", revLabel, "dw-k1", _INR(kp.total_revenue||0),
         _trend_html(kp.month_rev_trend, false),
-        "Shipped + Processing only",
-        _pcs("Online · woocommerce_status IN (Shipped, Processing)", periodLabel),
+        "Active orders only",
+        _pcs("Online · item amounts · Shipped / Processing / Processing LP / Delivered / Picked up", periodLabel),
         "dw-kf1","#639922",100);
 
     var card2Label = pl_active ? periodLabel + " revenue" : "This month's revenue";
     H += _kpi("kb", card2Label, "dw-k2", _INR(kp.month_revenue||0),
         _trend_html(kp.month_rev_trend, false),
-        "Shipped + Processing only",
-        _pcs("Shipped or Processing · " + (pl_active ? periodLabel : "current month"), periodLabel),
+        "Active orders only",
+        _pcs("Active orders · " + (pl_active ? periodLabel : "current month"), periodLabel),
         "dw-kf2","#378ADD",
         kp.total_revenue>0?Math.round(kp.month_revenue/kp.total_revenue*100):0);
 
     H += _kpi("kt","Average order value","dw-k3",_INR(kp.avg_order_value||0),
         _trend_html({dir:"flat",pct:0},false),
-        "Shipped + Processing only",
-        _pcs("base_net_total ÷ Shipped+Processing order count", periodLabel),
+        "Active orders only",
+        _pcs("SUM(item amounts) ÷ active order count", periodLabel),
         "dw-kf3","#1D9E75",45);
 
     H += _kpi("ka","Pending delivery","dw-k4",String(kp.pending||0),
         _trend_html({dir:"flat",pct:0},true),
-        "woocommerce_status = Pending only",
-        _pcs("Online · woocommerce_status = Pending", periodLabel),
+        "woocommerce_status = Pending Payment",
+        _pcs("Online · Pending Payment", periodLabel),
         "dw-kf4","#BA7517",
         kp.total_orders>0?Math.round((kp.pending||0)/kp.total_orders*100):0);
 
@@ -760,10 +785,10 @@ function _online_html(d, fd, td, periodLabel) {
     H += _kpi("kp", todayLabel, "dw-k5",
         String(pl_active ? (kp.ship_proc_count||0) : (kp.today_orders||0)),
         _trend_html(pl_active?{dir:"flat",pct:0}:kp.today_trend, false),
-        pl_active ? "Shipped + Processing · " + periodLabel : "Online orders only",
+        pl_active ? "Active orders · " + periodLabel : "Active orders only",
         pl_active
-            ? "All Shipped+Processing orders in selected period"
-            : "transaction_date = " + frappe.datetime.get_today() + " · Online",
+            ? "All active orders in selected period"
+            : "transaction_date = " + frappe.datetime.get_today() + " · Online · Active",
         "dw-kf5","#7F77DD",2);
 
     H += _kpi("kc","Cancelled orders","dw-k6",String(kp.cancelled||0),
@@ -775,11 +800,10 @@ function _online_html(d, fd, td, periodLabel) {
 
     H += "</div>";
 
-    // S2 — Snapshot
-    H += _sechd("Section 2 — Snapshot summary", periodLabel);
+    // S2: Snapshot
+    H += _sechd("Section 2: Snapshot summary", periodLabel);
     H += '<div class="dw-g3">';
 
-    // Top customer — may contain multiple names if tied
     var tcSub = (sn.top_cust_cnt||0) + " orders · " + _INR(sn.top_cust_rev||0);
     if ((sn.top_customer||"").indexOf(" & ") !== -1) {
         tcSub = "Tied · " + tcSub;
@@ -795,28 +819,25 @@ function _online_html(d, fd, td, periodLabel) {
     H += '<div class="dw-stc"><div class="dw-stl">Fulfillment rates ' + _ptag(periodLabel) + "</div>"
        + '<div style="margin-bottom:10px">'
        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
-       + '<span style="font-size:10px;color:#64748b">Shipped only</span>'
+       + '<span style="font-size:10px;color:#64748b">Shipped + Delivered</span>'
        + '<span style="font-size:12px;font-weight:500;color:#085041">' + fs + "%</span></div>"
        + '<div class="dw-bar"><div class="dw-barf" style="background:#1D9E75" data-w="' + fs + '"></div></div></div>'
        + '<div>'
        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
-       + '<span style="font-size:10px;color:#64748b">Shipped + Processing</span>'
+       + '<span style="font-size:10px;color:#64748b">All active (+ Processing)</span>'
        + '<span style="font-size:12px;font-weight:500;color:#0C447C">' + fsp + "%</span></div>"
        + '<div class="dw-bar"><div class="dw-barf" style="background:#378ADD" data-w="' + fsp + '"></div></div></div>'
-       + ((fs===fsp&&fsp>0)?'<div style="font-size:9px;color:#94a3b8;margin-top:6px;font-style:italic">Equal — no Processing orders in this period</div>':"")
+       + ((fs===fsp&&fsp>0)?'<div style="font-size:9px;color:#94a3b8;margin-top:6px;font-style:italic">Equal: no Processing orders in this period</div>':"")
        + "</div>";
     H += "</div>";
 
-    // S3 — Doughnuts
-    H += _sechd("Section 3 — Status & payment distribution", periodLabel);
+    // S3: Doughnuts
+    H += _sechd("Section 3: Status & payment distribution", periodLabel);
     H += '<div class="dw-g2">';
     var ws=ch.woo_status||{},wsl=ws.labels||[],wsv=(ws.datasets&&ws.datasets[0]&&ws.datasets[0].values)||[];
-    var stC={"Shipped":"#27ae60","shipped":"#27ae60","Processing":"#f39c12","processing":"#f39c12",
-             "Pending":"#BA7517","pending":"#BA7517","Cancelled":"#e74c3c","cancelled":"#e74c3c",
-             "on-hold":"#888780","Refunded":"#8e44ad","refunded":"#8e44ad"};
-    var stLeg="";for(var i=0;i<wsl.length;i++){stLeg+='<div class="dw-leg-row"><span class="dw-leg-dot" style="background:'+(stC[wsl[i]]||"#888")+'"></span><span class="dw-leg-lbl">'+wsl[i]+'</span><span class="dw-leg-val">'+(wsv[i]||0)+'</span></div>';}
+    var stLeg="";for(var i=0;i<wsl.length;i++){stLeg+='<div class="dw-leg-row"><span class="dw-leg-dot" style="background:'+_woo_color(wsl[i])+'"></span><span class="dw-leg-lbl">'+wsl[i]+'</span><span class="dw-leg-val">'+(wsv[i]||0)+'</span></div>';}
     H += '<div class="dw-card"><div class="dw-ct">WooCommerce order status ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online orders · woocommerce_status", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online orders · all statuses · woocommerce_status", periodLabel) + "</div>"
        + '<div style="display:flex;gap:16px;align-items:center">'
        + '<div style="width:140px;height:140px;flex:0 0 140px;position:relative">'
        + '<canvas id="dw-ch1" role="img" aria-label="Status doughnut">Status</canvas></div>'
@@ -825,22 +846,22 @@ function _online_html(d, fd, td, periodLabel) {
     var pmC=["#378ADD","#7F77DD","#D85A30","#888780","#639922","#D4537E"];
     var pmLeg="";for(var j=0;j<pml.length;j++){pmLeg+='<div class="dw-leg-row"><span class="dw-leg-dot" style="background:'+pmC[j%pmC.length]+'"></span><span class="dw-leg-lbl">'+pml[j]+'</span><span class="dw-leg-val">'+(pmv[j]||0)+'</span></div>';}
     H += '<div class="dw-card"><div class="dw-ct">Payment method ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing · woocommerce_payment_method", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · woocommerce_payment_method", periodLabel) + "</div>"
        + '<div style="display:flex;gap:16px;align-items:center">'
        + '<div style="width:140px;height:140px;flex:0 0 140px;position:relative">'
        + '<canvas id="dw-ch2" role="img" aria-label="Payment doughnut">Payment</canvas></div>'
        + '<div style="flex:1;min-width:0">'+pmLeg+'</div></div></div>';
     H += "</div>";
 
-    // S4 — Order value + Top states
-    H += _sechd("Section 4 — Order value distribution & top states", periodLabel);
+    // S4: Order value + Top states
+    H += _sechd("Section 4: Order value distribution & top states", periodLabel);
     H += '<div class="dw-g2">';
     var ob=ch.order_buckets||{},obl=ob.labels||[],obv=(ob.datasets&&ob.datasets[0]&&ob.datasets[0].values)||[];
     var obMax=Math.max.apply(null,obv)||1;var obC=["#D4537E","#378ADD","#639922","#7F77DD","#D85A30"];
     var bktH="";for(var bi=0;bi<obl.length;bi++){var bp=Math.round((obv[bi]/obMax)*100);bktH+='<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="font-size:11px;color:#64748b">'+obl[bi]+'</span><span style="font-size:11px;font-weight:500;color:#111">'+(obv[bi]||0)+' orders</span></div><div style="height:8px;border-radius:4px;background:#e2e8f0"><div style="height:100%;border-radius:4px;background:'+obC[bi%obC.length]+';width:0;transition:width 1.1s ease" data-w="'+bp+'"></div></div></div>';}
     var mbIdx=obv.indexOf(Math.max.apply(null,obv));
     H += '<div class="dw-card"><div class="dw-ct">Order value distribution ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing · grand_total buckets", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · base_net_total buckets", periodLabel) + "</div>"
        + bktH
        + '<div style="margin-top:10px;padding-top:10px;border-top:0.5px solid #e2e8f0;display:flex;justify-content:space-between"><span style="font-size:10px;color:#94a3b8">Most orders in</span><span style="font-size:12px;font-weight:500;color:#639922">'+(obl[mbIdx]||"")+'</span></div></div>';
     var ts=ch.top_states||{},tsl=ts.labels||[],tsv=(ts.datasets&&ts.datasets[0]&&ts.datasets[0].values)||[];
@@ -848,64 +869,65 @@ function _online_html(d, fd, td, periodLabel) {
     var stateH="";for(var si=0;si<tsl.length;si++){var sp=Math.round((tsv[si]/tsMax)*100);stateH+='<div class="dw-hbar-row"><span class="dw-hbar-lbl">'+tsl[si]+'</span><div class="dw-hbar-track"><div class="dw-hbar-fill" style="background:'+tsC[si%tsC.length]+'" data-w="'+sp+'">'+(sp>25?'<span style="font-size:9px;font-weight:500;color:#fff">'+(tsv[si]||0)+'</span>':'')+'</div></div>'+(sp<=25?'<span class="dw-hbar-outer">'+(tsv[si]||0)+'</span>':'')+'</div>';}
     if(!stateH)stateH='<div class="dw-empty">No state data for this period</div>';
     H += '<div class="dw-card"><div class="dw-ct">Top states by order count ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing · shipping address", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · Address state", periodLabel) + "</div>"
        + stateH+'</div>';
     H += "</div>";
 
-    // S5 — Trends
-    H += _sechd("Section 5 — Revenue & order volume trends", periodLabel);
+    // S5: Trends
+    H += _sechd("Section 5: Revenue & order volume trends", periodLabel);
     H += '<div class="dw-g2">';
     H += '<div class="dw-card"><div class="dw-ct">Revenue trend ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing · grouped by period", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · item amounts by period", periodLabel) + "</div>"
        + '<div style="position:relative;height:200px"><canvas id="dw-ch3" role="img" aria-label="Revenue trend">Revenue</canvas></div></div>';
     H += '<div class="dw-card"><div class="dw-ct">Order volume ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing · grouped by period", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · grouped by period", periodLabel) + "</div>"
        + '<div style="position:relative;height:200px"><canvas id="dw-ch4" role="img" aria-label="Order volume">Orders</canvas></div></div>';
     H += "</div>";
 
-    // S6 — Top items + customers
-    H += _sechd("Section 6 — Top items & top customers", periodLabel);
+    // S6: Top items + customers
+    H += _sechd("Section 6: Top items & top customers", periodLabel);
     H += '<div class="dw-g2">';
     var items=t5.items||[],im=items.length>0?(items[0].rev||1):1;
     H += '<div class="dw-card"><div class="dw-ct">Top items by revenue ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · item amounts", periodLabel) + "</div>"
        + '<div style="display:flex;gap:8px;padding:5px 0;border-bottom:0.5px solid #e2e8f0;margin-bottom:2px"><div style="flex:1;min-width:32px"></div><span style="font-size:10px;font-weight:500;color:#94a3b8;flex:1;min-width:0">Item</span><span style="font-size:10px;font-weight:500;color:#94a3b8;min-width:22px;text-align:right">Qty</span><span style="font-size:10px;font-weight:500;color:#94a3b8;min-width:66px;text-align:right">Revenue</span></div>'
        + _ranked_rows(items, iColors, im) + "</div>";
     var custs=t5.customers||[],cm=custs.length>0?(custs[0].rev||1):1;
     H += '<div class="dw-card"><div class="dw-ct">Top customers by revenue ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders · item amounts", periodLabel) + "</div>"
        + '<div style="display:flex;gap:8px;padding:5px 0;border-bottom:0.5px solid #e2e8f0;margin-bottom:2px"><div style="flex:1;min-width:32px"></div><span style="font-size:10px;font-weight:500;color:#94a3b8;flex:1;min-width:0">Customer</span><span style="font-size:10px;font-weight:500;color:#94a3b8;min-width:22px;text-align:right">Ord</span><span style="font-size:10px;font-weight:500;color:#94a3b8;min-width:66px;text-align:right">Revenue</span></div>'
        + _ranked_rows(custs, cColors, cm) + "</div>";
     H += "</div>";
 
-    // S7 — Recent orders
-    H += _sechd("Section 7 — Recent orders", periodLabel);
+    // S7: Recent orders
+    H += _sechd("Section 7: Recent orders", periodLabel);
     H += '<div class="dw-card" style="margin-bottom:14px">'
        + '<div class="dw-ct">Recent orders ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Last 8 Online Sales Orders · newest first", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Last 8 Online Sales Orders · all statuses · newest first", periodLabel) + "</div>"
        + '<div class="dw-feed-hd"><span>Order ID</span><span>Customer</span><span>Date</span><span>Amount</span><span>Status</span></div>'
        + _feed_rows(feed, _badge_online, "#0C447C") + "</div>";
 
-    // S8 — Pipeline + customer stats
-    H += _sechd("Section 8 — Order pipeline & customer statistics", periodLabel);
+    // S8: Pipeline + customer stats
+    H += _sechd("Section 8: Order pipeline & customer statistics", periodLabel);
     H += '<div class="dw-g2">';
     H += '<div class="dw-card"><div class="dw-ct">WooCommerce order pipeline ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online orders · woocommerce_status stages", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · woocommerce_status stages · Cancelled includes Trash · Refunded includes Failed", periodLabel) + "</div>"
        + '<div class="dw-pipe">'
        + _pipe_stage("#FAEEDA","#633806","#854F0B","dw-pp1",pl.pending||0,"Pending") + _arrow(false)
        + _pipe_stage("#F1EFE8","#444441","#5F5E5A","dw-pp2",pl.on_hold||0,"On Hold") + _arrow(false)
        + _pipe_stage("#E6F1FB","#0C447C","#185FA5","dw-pp3",pl.processing||0,"Processing") + _arrow(false)
-       + _pipe_stage("#E1F5EE","#085041","#0F6E56","dw-pp4",pl.shipped||0,"Shipped") + _arrow(true)
-       + _pipe_stage("#EEEDFE","#3C3489","#534AB7","dw-pp5",pl.refunded||0,"Refunded") + _arrow(true)
-       + _pipe_stage("#FCEBEB","#791F1F","#A32D2D","dw-pp6",pl.cancelled||0,"Cancelled")
+       + _pipe_stage("#E1F5EE","#085041","#0F6E56","dw-pp4",pl.shipped||0,"Shipped") + _arrow(false)
+       + _pipe_stage("#EAF3DE","#27500A","#3B6D11","dw-pp5",pl.delivered||0,"Delivered") + _arrow(true)
+       + _pipe_stage("#EEEDFE","#3C3489","#534AB7","dw-pp6",pl.refunded||0,"Refunded") + _arrow(true)
+       + _pipe_stage("#FCEBEB","#791F1F","#A32D2D","dw-pp7",pl.cancelled||0,"Cancelled")
        + "</div>"
-       + _fbar_block("Fulfillment rate — Shipped ÷ Total" + (pl_active?" · "+periodLabel:""), pl.fulfil_shipped||0, "#1D9E75","dw-fb1",null)
-       + _fbar_block("Active fulfillment — Shipped + Processing ÷ Total" + (pl_active?" · "+periodLabel:""), pl.fulfil_ship_proc||0, "#378ADD","dw-fb2",
+       + _fbar_block("Fulfilled rate: Shipped + Delivered ÷ Total" + (pl_active?" · "+periodLabel:""), pl.fulfil_shipped||0, "#1D9E75","dw-fb1",null)
+       + _fbar_block("Active rate: Fulfilled + Processing ÷ Total" + (pl_active?" · "+periodLabel:""), pl.fulfil_ship_proc||0, "#378ADD","dw-fb2",
            (pl.fulfil_shipped===pl.fulfil_ship_proc&&pl.fulfil_shipped>0)
-               ? "Equal — no Processing orders in this period" : null)
+               ? "Equal: no Processing orders in this period" : null)
        + "</div>";
     H += '<div class="dw-card"><div class="dw-ct">Customer statistics ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Online · Shipped + Processing", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Online · Active orders", periodLabel) + "</div>"
        + _customer_stats_html(sn, "#0C447C", periodLabel) + "</div>";
     H += "</div>";
     H += "</div>";
@@ -930,10 +952,10 @@ function _offline_html(d, fd, td, periodLabel) {
 
     H += _dash_topbar("offline", kp, fd, td, periodLabel);
     H += _period_bar(periodLabel, fd, td, "offline");
-    H += '<div class="dw-notice dw-notice-g">All metrics: custom_offline__online = Offline · ERPNext native status · Tax from tabSales Taxes and Charges'
+    H += '<div class="dw-notice dw-notice-g">All metrics: Offline · drafts included (docstatus 0 and 1) · ERPNext native status · Tax from tabSales Taxes and Charges'
        + (pl_active ? " · Period: <strong>" + periodLabel + "</strong>" : "") + "</div>";
 
-    H += _sechd("Section 1 — Revenue & order KPIs", periodLabel);
+    H += _sechd("Section 1: Revenue & order KPIs", periodLabel);
     H += '<div class="dw-g3">';
     var revLbl2 = pl_active ? periodLabel + " revenue (Offline)" : "Total revenue (Offline)";
     H += _kpi("kg",revLbl2,"dw-k1",_INR(kp.total_revenue||0),_trend_html(kp.month_rev_trend,false),null,_pcs("SUM(base_net_total) · Offline Sales Orders",periodLabel),"dw-kf1","#639922",100);
@@ -946,10 +968,9 @@ function _offline_html(d, fd, td, periodLabel) {
     H += _kpi("kc","Cancelled orders","dw-k6",String(kp.cancelled||0),_trend_html({dir:"flat",pct:0},true),null,_pcs("status = Cancelled · Offline",periodLabel),"dw-kf6","#D85A30",kp.total_orders>0?Math.round((kp.cancelled||0)/kp.total_orders*100):0);
     H += "</div>";
 
-    H += _sechd("Section 2 — Snapshot summary", periodLabel);
+    H += _sechd("Section 2: Snapshot summary", periodLabel);
     H += '<div class="dw-g3">';
 
-    // Top customer — tie-aware
     var tcSub2 = (sn.top_cust_cnt||0) + " Offline orders · " + _INR(sn.top_cust_rev||0);
     if ((sn.top_customer||"").indexOf(" & ") !== -1) {
         tcSub2 = "Tied · " + tcSub2;
@@ -970,7 +991,7 @@ function _offline_html(d, fd, td, periodLabel) {
     H += '<div class="dw-stc"><div class="dw-stl">Tax collected ' + _ptag(periodLabel) + "</div>" + taxBody + "</div>";
     H += "</div>";
 
-    H += _sechd("Section 3 — Order status & tax breakdown", periodLabel);
+    H += _sechd("Section 3: Order status & tax breakdown", periodLabel);
     H += '<div class="dw-g2">';
     var st=ch.status||{},stl=st.labels||[],stv=(st.datasets&&st.datasets[0]&&st.datasets[0].values)||[];
     var offStC={"Completed":"#27ae60","To Deliver and Bill":"#f39c12","To Bill":"#2490ef","Cancelled":"#e74c3c","Draft":"#888780"};
@@ -1010,21 +1031,21 @@ function _offline_html(d, fd, td, periodLabel) {
        + '<span style="display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b"><span style="width:10px;height:10px;border-radius:2px;background:#7F77DD"></span>IGST</span>'
        + '<span style="display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b"><span style="width:10px;height:10px;border-radius:2px;background:#E24B4A"></span>TDS deducted</span></div>'
        + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px;padding-top:12px;border-top:0.5px solid #e2e8f0">'
-       + '<div style="text-align:center"><div style="font-size:12px;font-weight:500;color:#085041">'+_INR(totSg)+'</div><div style="font-size:9px;color:#94a3b8;margin-top:2px">Total SGST</div></div>'
+              + '<div style="text-align:center"><div style="font-size:12px;font-weight:500;color:#085041">'+_INR(totSg)+'</div><div style="font-size:9px;color:#94a3b8;margin-top:2px">Total SGST</div></div>'
        + '<div style="text-align:center"><div style="font-size:12px;font-weight:500;color:#0C447C">'+_INR(totCg)+'</div><div style="font-size:9px;color:#94a3b8;margin-top:2px">Total CGST</div></div>'
        + '<div style="text-align:center"><div style="font-size:12px;font-weight:500;color:#3C3489">'+_INR(totIg)+'</div><div style="font-size:9px;color:#94a3b8;margin-top:2px">Total IGST</div></div>'
        + '<div style="text-align:center"><div style="font-size:12px;font-weight:500;color:#791F1F">- '+_INR(totTds)+'</div><div style="font-size:9px;color:#94a3b8;margin-top:2px">Total TDS</div></div>'
        + "</div></div>";
     H += "</div>";
 
-    H += _sechd("Section 4 — Order value distribution & top items", periodLabel);
+    H += _sechd("Section 4: Order value distribution & top items", periodLabel);
     H += '<div class="dw-g2">';
     var ob2=ch.order_buckets||{},obl2=ob2.labels||[],obv2=(ob2.datasets&&ob2.datasets[0]&&ob2.datasets[0].values)||[];
     var obMax2=Math.max.apply(null,obv2)||1;var obC2=["#D4537E","#378ADD","#639922","#7F77DD","#D85A30"];
     var bktH2="";for(var bi2=0;bi2<obl2.length;bi2++){var bp2=Math.round((obv2[bi2]/obMax2)*100);bktH2+='<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="font-size:11px;color:#64748b">'+obl2[bi2]+'</span><span style="font-size:11px;font-weight:500;color:#111">'+(obv2[bi2]||0)+' orders</span></div><div style="height:8px;border-radius:4px;background:#e2e8f0"><div style="height:100%;border-radius:4px;background:'+obC2[bi2%obC2.length]+';width:0;transition:width 1.1s ease" data-w="'+bp2+'"></div></div></div>';}
     var mbIdx2=obv2.indexOf(Math.max.apply(null,obv2));
     H += '<div class="dw-card"><div class="dw-ct">Order value distribution ' + _ptag(periodLabel) + "</div>"
-       + '<div class="dw-cs">' + _pcs("Offline orders grouped by grand_total", periodLabel) + "</div>"
+       + '<div class="dw-cs">' + _pcs("Offline orders grouped by base_net_total", periodLabel) + "</div>"
        + bktH2+'<div style="margin-top:10px;padding-top:10px;border-top:0.5px solid #e2e8f0;display:flex;justify-content:space-between"><span style="font-size:10px;color:#94a3b8">Most orders in</span><span style="font-size:12px;font-weight:500;color:#639922">'+(obl2[mbIdx2]||"")+'</span></div></div>';
     var items2=t5.items||[],im2=items2.length>0?(items2[0].rev||1):1;
     H += '<div class="dw-card"><div class="dw-ct">Top items by revenue ' + _ptag(periodLabel) + "</div>"
@@ -1033,7 +1054,7 @@ function _offline_html(d, fd, td, periodLabel) {
        + _ranked_rows(items2, iColors, im2) + "</div>";
     H += "</div>";
 
-    H += _sechd("Section 5 — Revenue & order volume trends", periodLabel);
+    H += _sechd("Section 5: Revenue & order volume trends", periodLabel);
     H += '<div class="dw-g2">';
     H += '<div class="dw-card"><div class="dw-ct">Revenue trend ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Offline orders · grouped by period", periodLabel) + "</div>"
@@ -1043,20 +1064,20 @@ function _offline_html(d, fd, td, periodLabel) {
        + '<div style="position:relative;height:200px"><canvas id="dw-ch4" role="img" aria-label="Orders">Orders</canvas></div></div>';
     H += "</div>";
 
-    H += _sechd("Section 6 — Top customers", periodLabel);
+    H += _sechd("Section 6: Top customers", periodLabel);
     var custs2=t5.customers||[],cm2=custs2.length>0?(custs2[0].rev||1):1;
     H += '<div class="dw-card" style="margin-bottom:14px"><div class="dw-ct">Top customers by revenue ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Offline orders only · top 5", periodLabel) + "</div>"
        + '<div style="display:flex;gap:8px;padding:5px 0;border-bottom:0.5px solid #e2e8f0;margin-bottom:2px"><div style="flex:1;min-width:32px"></div><span style="font-size:10px;font-weight:500;color:#94a3b8;flex:1;min-width:0">Customer</span><span style="font-size:10px;font-weight:500;color:#94a3b8;min-width:22px;text-align:right">Ord</span><span style="font-size:10px;font-weight:500;color:#94a3b8;min-width:66px;text-align:right">Revenue</span></div>'
        + _ranked_rows(custs2, cColors, cm2) + "</div>";
 
-    H += _sechd("Section 7 — Recent orders", periodLabel);
+    H += _sechd("Section 7: Recent orders", periodLabel);
     H += '<div class="dw-card" style="margin-bottom:14px"><div class="dw-ct">Recent orders ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Last 8 Offline Sales Orders · newest first", periodLabel) + "</div>"
        + '<div class="dw-feed-hd"><span>Order ID</span><span>Customer</span><span>Date</span><span>Amount</span><span>Status</span></div>'
        + _feed_rows(feed, _badge_offline, "#27500A") + "</div>";
 
-    H += _sechd("Section 8 — Order pipeline & customer statistics", periodLabel);
+    H += _sechd("Section 8: Order pipeline & customer statistics", periodLabel);
     H += '<div class="dw-g2">';
     var cr=pl.completion_rate||0;
     H += '<div class="dw-card"><div class="dw-ct">Offline order pipeline ' + _ptag(periodLabel) + "</div>"
@@ -1068,7 +1089,7 @@ function _offline_html(d, fd, td, periodLabel) {
        + _pipe_stage("#EAF3DE","#27500A","#3B6D11","dw-pp4",pl.completed||0,"Completed") + _arrow(true)
        + _pipe_stage("#FCEBEB","#791F1F","#A32D2D","dw-pp5",pl.cancelled||0,"Cancelled")
        + "</div>"
-       + _fbar_block("Completion rate — Completed ÷ Total" + (pl_active?" · "+periodLabel:""), cr,"#639922","dw-fb1",null)
+       + _fbar_block("Completion rate: Completed ÷ Total" + (pl_active?" · "+periodLabel:""), cr,"#639922","dw-fb1",null)
        + "</div>";
     H += '<div class="dw-card"><div class="dw-ct">Customer statistics ' + _ptag(periodLabel) + "</div>"
        + '<div class="dw-cs">' + _pcs("Offline order behaviour", periodLabel) + "</div>"
@@ -1102,8 +1123,9 @@ function _dash_animate(d, mode) {
         cu("dw-pp2", pl.on_hold    || 0);
         cu("dw-pp3", pl.processing || 0);
         cu("dw-pp4", pl.shipped    || 0);
-        cu("dw-pp5", pl.refunded   || 0);
-        cu("dw-pp6", pl.cancelled  || 0);
+        cu("dw-pp5", pl.delivered  || 0);
+        cu("dw-pp6", pl.refunded   || 0);
+        cu("dw-pp7", pl.cancelled  || 0);
     } else {
         cu("dw-pp1", pl.draft           || 0);
         cu("dw-pp2", pl.to_deliver_bill || 0);
@@ -1148,12 +1170,8 @@ function _dash_charts(d, mode) {
 
     var c1 = document.getElementById("dw-ch1");
     if (c1) {
-        var stColors = mode === "online"
-            ? {"Shipped":"#27ae60","shipped":"#27ae60","Processing":"#f39c12","processing":"#f39c12",
-               "Pending":"#BA7517","pending":"#BA7517","Cancelled":"#e74c3c","cancelled":"#e74c3c",
-               "on-hold":"#888780","Refunded":"#8e44ad","refunded":"#8e44ad"}
-            : {"Completed":"#27ae60","To Deliver and Bill":"#f39c12","To Bill":"#2490ef",
-               "Cancelled":"#e74c3c","Draft":"#888780"};
+        var offStColors = {"Completed":"#27ae60","To Deliver and Bill":"#f39c12",
+                           "To Bill":"#2490ef","Cancelled":"#e74c3c","Draft":"#888780"};
         var stData = mode === "online" ? (ch.woo_status||{}) : (ch.status||{});
         var stL    = stData.labels || [];
         new Chart(c1, {
@@ -1162,7 +1180,9 @@ function _dash_charts(d, mode) {
                 labels:   stL,
                 datasets: [{
                     data:            (stData.datasets&&stData.datasets[0]&&stData.datasets[0].values)||[],
-                    backgroundColor: stL.map(function (s) { return stColors[s] || "#888780"; }),
+                    backgroundColor: stL.map(function (s) {
+                        return mode === "online" ? _woo_color(s) : (offStColors[s] || "#888780");
+                    }),
                     borderWidth: 3, borderColor: bdr, hoverOffset: 8
                 }]
             },

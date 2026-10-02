@@ -1,12 +1,25 @@
 import frappe
-from frappe.utils import today, add_days, get_first_day, get_last_day, nowdate
+from frappe.utils import today, add_days, get_first_day, get_last_day, getdate
+
+
+# ================================================================
+#  Orders Dashboard - backend (v4)
+#  Alignment rules (matched to the "Basic Report"):
+#    - docstatus IN (0,1)  -> drafts included, Online and Offline
+#    - Online also requires woocommerce_server to be set
+#    - Active statuses: shipped, processing, processing lp,
+#      delivered, picked up (case-insensitive)
+#    - Revenue = SUM(Sales Order Item.base_amount) of active orders
+#    - Pending = "Pending Payment"
+#    - from_date / to_date validated via getdate before SQL use
+# ================================================================
 
 
 @frappe.whitelist()
 def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None, period_label=None):
-    t   = today()
-    fd  = from_date or None
-    td  = to_date   or None
+    t  = today()
+    fd = _san_date(from_date)
+    td = _san_date(to_date)
 
     ms  = str(get_first_day(t))
     me  = str(get_last_day(t))
@@ -17,8 +30,8 @@ def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None, 
         return {
             "mode":         "offline",
             "period_label": period_label or "All Time",
-            "from_date":    from_date or "",
-            "to_date":      to_date   or "",
+            "from_date":    fd or "",
+            "to_date":      td or "",
             "kpis":     _offline_kpis(t, ms, me, lms, lme, fd, td),
             "snapshot": _offline_snapshot(ms, me, fd, td),
             "charts":   _offline_charts(t, ms, me, fd, td),
@@ -30,8 +43,8 @@ def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None, 
         return {
             "mode":         "online",
             "period_label": period_label or "All Time",
-            "from_date":    from_date or "",
-            "to_date":      to_date   or "",
+            "from_date":    fd or "",
+            "to_date":      td or "",
             "kpis":     _online_kpis(t, ms, me, lms, lme, fd, td),
             "snapshot": _online_snapshot(fd, td),
             "charts":   _online_charts(t, fd, td),
@@ -44,6 +57,14 @@ def get_woocommerce_dashboard_data(mode="online", from_date=None, to_date=None, 
 # ================================================================
 #  SHARED HELPERS
 # ================================================================
+
+def _san_date(val):
+    if not val:
+        return None
+    try:
+        return str(getdate(val))
+    except Exception:
+        return None
 
 def _q(sql, args=None):
     r = frappe.db.sql(sql, args or [], as_list=True)
@@ -70,21 +91,32 @@ def _mo_label(yr, mo):
     except Exception:
         return str(yr) + "-" + str(mo)
 
-def _date_clause(fd, td, alias="so"):
+def _date_clause(fd, td, alias=""):
+    # alias is "" or "so."
     if fd and td:
-        col = "{}.transaction_date".format(alias) if alias else "transaction_date"
-        return " AND {} BETWEEN '{}' AND '{}'".format(col, fd, td)
+        return " AND {}transaction_date BETWEEN '{}' AND '{}'".format(alias, fd, td)
     return ""
 
 
 # ================================================================
-#  ONLINE CONSTANTS
+#  CONDITION BUILDERS  (alias is "" or "so.")
 # ================================================================
-_ON    = "docstatus=1 AND custom_offline__online='Online'"
-_RSTAT = "woocommerce_status IN ('Shipped','Processing','shipped','processing')"
-_PEND  = "woocommerce_status IN ('Pending','pending')"
-_CANC  = "woocommerce_status IN ('Cancelled','cancelled')"
-_SHIP  = "woocommerce_status IN ('Shipped','shipped')"
+
+def _on(alias=""):
+    return ("{a}docstatus IN (0,1) AND {a}custom_offline__online='Online' "
+            "AND IFNULL({a}woocommerce_server,'') != ''").format(a=alias)
+
+def _off(alias=""):
+    return "{a}docstatus IN (0,1) AND {a}custom_offline__online='Offline'".format(a=alias)
+
+def _rstat(alias=""):
+    # Active statuses, matched to the Basic Report rule
+    return ("LOWER({a}woocommerce_status) IN "
+            "('shipped','processing','processing lp','delivered','picked up')").format(a=alias)
+
+def _wstat(alias, *vals):
+    quoted = ", ".join(["'" + v + "'" for v in vals])
+    return "LOWER({a}woocommerce_status) IN ({v})".format(a=alias, v=quoted)
 
 
 # ================================================================
@@ -92,18 +124,26 @@ _SHIP  = "woocommerce_status IN ('Shipped','shipped')"
 # ================================================================
 
 def _online_kpis(t, ms, me, lms, lme, fd, td):
-    date_c = _date_clause(fd, td, alias="")
+    dc    = _date_clause(fd, td, alias="")
+    dc_so = _date_clause(fd, td, alias="so.")
 
     def rev(extra=""):
-        w = "WHERE {} AND {}".format(_ON, _RSTAT)
-        if extra: w += " AND " + extra
-        if date_c: w += date_c
-        return _flt(_q("SELECT COALESCE(SUM(base_net_total),0) FROM `tabSales Order` " + w))
+        w = "WHERE {} AND {}".format(_on("so."), _rstat("so."))
+        if extra:
+            w += " AND " + extra
+        if dc_so:
+            w += dc_so
+        return _flt(_q(
+            "SELECT COALESCE(SUM(soi.base_amount),0) "
+            "FROM `tabSales Order Item` soi "
+            "JOIN `tabSales Order` so ON so.name = soi.parent " + w))
 
     def cnt(extra=""):
-        w = "WHERE " + _ON
-        if extra: w += " AND " + extra
-        if date_c: w += date_c
+        w = "WHERE " + _on("")
+        if extra:
+            w += " AND " + extra
+        if dc:
+            w += dc
         return _int(_q("SELECT COUNT(*) FROM `tabSales Order` " + w))
 
     if fd and td:
@@ -112,19 +152,20 @@ def _online_kpis(t, ms, me, lms, lme, fd, td):
         lmonth_rev = 0.0
     else:
         total_rev  = rev()
-        month_rev  = rev("transaction_date BETWEEN '{}' AND '{}'".format(ms, me))
-        lmonth_rev = rev("transaction_date BETWEEN '{}' AND '{}'".format(lms, lme))
+        month_rev  = rev("so.transaction_date BETWEEN '{}' AND '{}'".format(ms, me))
+        lmonth_rev = rev("so.transaction_date BETWEEN '{}' AND '{}'".format(lms, lme))
 
-    ty        = str(add_days(t, -1))
-    total_ord = cnt()
-    today_ord = cnt("{} AND transaction_date='{}'".format(_RSTAT, str(t)))
-    yest_ord  = cnt("{} AND transaction_date='{}'".format(_RSTAT, ty))
+    ty         = str(add_days(t, -1))
+    total_ord  = cnt()
+    active_cnt = cnt(_rstat(""))
+    today_ord  = cnt("{} AND transaction_date='{}'".format(_rstat(""), str(t)))
+    yest_ord   = cnt("{} AND transaction_date='{}'".format(_rstat(""), ty))
 
-    pending   = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _PEND, date_c)))
-    cancelled = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _CANC, date_c)))
-    shipped   = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _SHIP, date_c)))
-    ship_proc = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(_ON, _RSTAT, date_c)))
-    aov = round(total_rev / ship_proc, 2) if ship_proc else 0.0
+    pending   = cnt(_wstat("", "pending payment", "pending"))
+    cancelled = cnt(_wstat("", "cancelled"))
+    fulfilled = cnt(_wstat("", "shipped", "delivered", "picked up"))
+
+    aov = round(total_rev / active_cnt, 2) if active_cnt else 0.0
 
     return {
         "total_revenue":    total_rev,
@@ -132,33 +173,32 @@ def _online_kpis(t, ms, me, lms, lme, fd, td):
         "month_rev_trend":  _trend(month_rev, lmonth_rev),
         "avg_order_value":  aov,
         "total_orders":     total_ord,
-        "ship_proc_count":  ship_proc,
+        "ship_proc_count":  active_cnt,
         "today_orders":     today_ord,
         "today_trend":      _trend(today_ord, yest_ord),
         "pending":          pending,
         "cancelled":        cancelled,
-        "fulfil_shipped":   round(shipped   / total_ord * 100) if total_ord else 0,
-        "fulfil_ship_proc": round(ship_proc / total_ord * 100) if total_ord else 0,
+        "fulfil_shipped":   round(fulfilled  / total_ord * 100) if total_ord else 0,
+        "fulfil_ship_proc": round(active_cnt / total_ord * 100) if total_ord else 0,
     }
 
 
 # ================================================================
-#  ONLINE SNAPSHOT  —  tie-aware top customer
+#  ONLINE SNAPSHOT  (tie-aware top customer, item-based revenue)
 # ================================================================
 
 def _online_snapshot(fd, td):
-    date_c      = _date_clause(fd, td, alias="so")
-    date_c_bare = _date_clause(fd, td, alias="")
+    dc    = _date_clause(fd, td, alias="")
+    dc_so = _date_clause(fd, td, alias="so.")
 
-    # Fetch top 5 customers, then collect all tied at #1 revenue
     tc_all = frappe.db.sql("""
-        SELECT customer, COUNT(*) AS cnt, SUM(base_net_total) AS rev
-        FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {rstat} {date}
-          AND customer IS NOT NULL AND customer != ''
-        GROUP BY customer ORDER BY rev DESC LIMIT 5
-    """.format(rstat=_RSTAT, date=date_c_bare), as_dict=True)
+        SELECT so.customer, COUNT(DISTINCT so.name) AS cnt, SUM(soi.base_amount) AS rev
+        FROM `tabSales Order Item` soi
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {on} AND {rstat} {date}
+          AND so.customer IS NOT NULL AND so.customer != ''
+        GROUP BY so.customer ORDER BY rev DESC LIMIT 5
+    """.format(on=_on("so."), rstat=_rstat("so."), date=dc_so), as_dict=True)
 
     tc = []
     if tc_all:
@@ -169,49 +209,43 @@ def _online_snapshot(fd, td):
             else:
                 break
 
-    # Top item
     ti = frappe.db.sql("""
-        SELECT soi.item_name, SUM(soi.qty) AS qty, SUM(soi.amount) AS rev
+        SELECT soi.item_name, SUM(soi.qty) AS qty, SUM(soi.base_amount) AS rev
         FROM `tabSales Order Item` soi
-        JOIN `tabSales Order` so ON so.name=soi.parent
-        WHERE so.docstatus=1 AND so.custom_offline__online='Online'
-          AND so.{rstat} {date}
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {on} AND {rstat} {date}
           AND soi.item_name IS NOT NULL AND soi.item_name != ''
         GROUP BY soi.item_name ORDER BY rev DESC LIMIT 1
-    """.format(rstat=_RSTAT, date=date_c), as_dict=True)
+    """.format(on=_on("so."), rstat=_rstat("so."), date=dc_so), as_dict=True)
 
     unique = _int(_q("""
         SELECT COUNT(DISTINCT customer) FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {rstat} {date}
+        WHERE {on} AND {rstat} {date}
           AND customer IS NOT NULL AND customer != ''
-    """.format(rstat=_RSTAT, date=date_c_bare)))
+    """.format(on=_on(""), rstat=_rstat(""), date=dc)))
 
     repeat = _int(_q("""
         SELECT COUNT(*) FROM (
             SELECT customer FROM `tabSales Order`
-            WHERE docstatus=1 AND custom_offline__online='Online'
-              AND {rstat} {date}
+            WHERE {on} AND {rstat} {date}
               AND customer IS NOT NULL AND customer != ''
             GROUP BY customer HAVING COUNT(*) > 1
         ) t
-    """.format(rstat=_RSTAT, date=date_c_bare)))
+    """.format(on=_on(""), rstat=_rstat(""), date=dc)))
 
-    total = _int(_q("""
-        SELECT COUNT(*) FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {rstat} {date}
-    """.format(rstat=_RSTAT, date=date_c_bare)))
+    total = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(
+        _on(""), _rstat(""), dc)))
 
-    shipped   = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE docstatus=1 AND custom_offline__online='Online' AND {}{}".format(_SHIP, date_c_bare)))
-    ship_proc = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE docstatus=1 AND custom_offline__online='Online' AND {}{}".format(_RSTAT, date_c_bare)))
-    all_online= _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE docstatus=1 AND custom_offline__online='Online'{}".format(date_c_bare)))
+    fulfilled  = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(
+        _on(""), _wstat("", "shipped", "delivered", "picked up"), dc)))
+    active     = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {} AND {}{}".format(
+        _on(""), _rstat(""), dc)))
+    all_online = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {}{}".format(
+        _on(""), dc)))
 
-    # Build display strings — show all tied customers
     top_cust_display = " & ".join([r.customer for r in tc]) if tc else "—"
     top_cust_cnt     = _int(tc[0].cnt) if tc else 0
     top_cust_rev     = _flt(tc[0].rev) if tc else 0.0
-    # If multiple tied, show combined count
     if len(tc) > 1:
         top_cust_cnt = sum(_int(r.cnt) for r in tc)
 
@@ -226,8 +260,8 @@ def _online_snapshot(fd, td):
         "repeat_customers": repeat,
         "repeat_rate":      round(repeat / unique * 100) if unique else 0,
         "avg_per_customer": round(total / unique, 1) if unique else 0.0,
-        "fulfil_shipped":   round(shipped   / all_online * 100) if all_online else 0,
-        "fulfil_ship_proc": round(ship_proc / all_online * 100) if all_online else 0,
+        "fulfil_shipped":   round(fulfilled / all_online * 100) if all_online else 0,
+        "fulfil_ship_proc": round(active    / all_online * 100) if all_online else 0,
     }
 
 
@@ -236,25 +270,25 @@ def _online_snapshot(fd, td):
 # ================================================================
 
 def _online_charts(t, fd, td):
-    date_c      = _date_clause(fd, td, alias="")
-    date_c_so   = _date_clause(fd, td, alias="so")
+    dc    = _date_clause(fd, td, alias="")
+    dc_so = _date_clause(fd, td, alias="so.")
 
     ws = frappe.db.sql("""
         SELECT woocommerce_status, COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online' {}
+        WHERE {on} {date}
           AND woocommerce_status IS NOT NULL AND woocommerce_status != ''
         GROUP BY woocommerce_status ORDER BY cnt DESC
-    """.format(date_c), as_dict=True)
+    """.format(on=_on(""), date=dc), as_dict=True)
 
     pm = frappe.db.sql("""
         SELECT woocommerce_payment_method, COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {} {} AND woocommerce_payment_method IS NOT NULL
+        WHERE {on} AND {rstat} {date}
+          AND woocommerce_payment_method IS NOT NULL
           AND woocommerce_payment_method != ''
         GROUP BY woocommerce_payment_method ORDER BY cnt DESC LIMIT 6
-    """.format(_RSTAT, date_c), as_dict=True)
+    """.format(on=_on(""), rstat=_rstat(""), date=dc), as_dict=True)
 
     buckets = [
         ("Under ₹500",       0,    500),
@@ -267,42 +301,40 @@ def _online_charts(t, fd, td):
     for lbl, lo, hi in buckets:
         c = _int(_q("""
             SELECT COUNT(*) FROM `tabSales Order`
-            WHERE docstatus=1 AND custom_offline__online='Online'
-              AND {} AND base_net_total >= %s AND base_net_total < %s {}
-        """.format(_RSTAT, date_c), [lo, hi]))
+            WHERE {on} AND {rstat}
+              AND base_net_total >= %s AND base_net_total < %s {date}
+        """.format(on=_on(""), rstat=_rstat(""), date=dc), [lo, hi]))
         bkt_labels.append(lbl)
         bkt_values.append(c)
 
-    addr_rows = frappe.db.sql("""
-        SELECT shipping_address_name, COUNT(*) AS cnt
-        FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {} {} AND shipping_address_name IS NOT NULL
-          AND shipping_address_name != ''
-        GROUP BY shipping_address_name ORDER BY cnt DESC LIMIT 20
-    """.format(_RSTAT, date_c), as_dict=True)
-    state_map = {}
-    for r in addr_rows:
-        try:
-            st = frappe.db.get_value("Address", r.shipping_address_name, "state")
-            key = st if st else r.shipping_address_name
-        except Exception:
-            key = r.shipping_address_name
-        state_map[key] = state_map.get(key, 0) + _int(r.cnt)
-    sorted_states = sorted(state_map.items(), key=lambda x: x[1], reverse=True)[:8]
+    state_rows = frappe.db.sql("""
+        SELECT COALESCE(NULLIF(TRIM(addr.state), ''), 'Unknown') AS state,
+               COUNT(*) AS cnt
+        FROM `tabSales Order` so
+        LEFT JOIN `tabAddress` addr ON addr.name = so.shipping_address_name
+        WHERE {on} AND {rstat} {date}
+          AND IFNULL(so.shipping_address_name,'') != ''
+        GROUP BY state ORDER BY cnt DESC LIMIT 8
+    """.format(on=_on("so."), rstat=_rstat("so."), date=dc_so), as_dict=True)
 
-    _mo_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
+    if fd and td:
+        win_so = " AND so.transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
+        win    = " AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
+    else:
+        win_so = " AND so.transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t))
+        win    = " AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t))
+
     mr = frappe.db.sql("""
-        SELECT YEAR(transaction_date) AS yr,
-               MONTH(transaction_date) AS mo_num,
-               YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
-               COALESCE(SUM(base_net_total),0) AS rev
-        FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {} {}
-          AND transaction_date IS NOT NULL
+        SELECT YEAR(so.transaction_date) AS yr,
+               MONTH(so.transaction_date) AS mo_num,
+               YEAR(so.transaction_date)*100+MONTH(so.transaction_date) AS sk,
+               COALESCE(SUM(soi.base_amount),0) AS rev
+        FROM `tabSales Order Item` soi
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {on} AND {rstat} {win}
+          AND so.transaction_date IS NOT NULL
         GROUP BY yr, mo_num, sk ORDER BY sk
-    """.format(_RSTAT, _mo_date), as_dict=True)
+    """.format(on=_on("so."), rstat=_rstat("so."), win=win_so), as_dict=True)
 
     mo = frappe.db.sql("""
         SELECT YEAR(transaction_date) AS yr,
@@ -310,19 +342,18 @@ def _online_charts(t, fd, td):
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {} {}
+        WHERE {on} AND {rstat} {win}
           AND transaction_date IS NOT NULL
         GROUP BY yr, mo_num, sk ORDER BY sk
-    """.format(_RSTAT, _mo_date), as_dict=True)
+    """.format(on=_on(""), rstat=_rstat(""), win=win), as_dict=True)
 
     return {
-        "woo_status":    {"labels": [r.woocommerce_status for r in ws],           "datasets": [{"values": [_int(r.cnt) for r in ws]}]},
-        "payment":       {"labels": [r.woocommerce_payment_method for r in pm],   "datasets": [{"values": [_int(r.cnt) for r in pm]}]},
-        "order_buckets": {"labels": bkt_labels,                                   "datasets": [{"values": bkt_values}]},
-        "top_states":    {"labels": [s[0] for s in sorted_states],                "datasets": [{"values": [s[1] for s in sorted_states]}]},
-        "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mr],      "datasets": [{"values": [_flt(r.rev) for r in mr]}]},
-        "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo],      "datasets": [{"values": [_int(r.cnt) for r in mo]}]},
+        "woo_status":    {"labels": [r.woocommerce_status for r in ws],         "datasets": [{"values": [_int(r.cnt) for r in ws]}]},
+        "payment":       {"labels": [r.woocommerce_payment_method for r in pm], "datasets": [{"values": [_int(r.cnt) for r in pm]}]},
+        "order_buckets": {"labels": bkt_labels,                                 "datasets": [{"values": bkt_values}]},
+        "top_states":    {"labels": [r.state for r in state_rows],              "datasets": [{"values": [_int(r.cnt) for r in state_rows]}]},
+        "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mr],    "datasets": [{"values": [_flt(r.rev) for r in mr]}]},
+        "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo],    "datasets": [{"values": [_int(r.cnt) for r in mo]}]},
     }
 
 
@@ -331,27 +362,25 @@ def _online_charts(t, fd, td):
 # ================================================================
 
 def _online_top5(fd, td):
-    date_c    = _date_clause(fd, td, alias="so")
-    date_c_b  = _date_clause(fd, td, alias="")
+    dc_so = _date_clause(fd, td, alias="so.")
 
     items = frappe.db.sql("""
-        SELECT soi.item_name, SUM(soi.qty) AS tq, SUM(soi.amount) AS tr
+        SELECT soi.item_name, SUM(soi.qty) AS tq, SUM(soi.base_amount) AS tr
         FROM `tabSales Order Item` soi
-        JOIN `tabSales Order` so ON so.name=soi.parent
-        WHERE so.docstatus=1 AND so.custom_offline__online='Online'
-          AND so.{rstat} {date}
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {on} AND {rstat} {date}
           AND soi.item_name IS NOT NULL AND soi.item_name != ''
         GROUP BY soi.item_name ORDER BY tr DESC LIMIT 6
-    """.format(rstat=_RSTAT, date=date_c), as_dict=True)
+    """.format(on=_on("so."), rstat=_rstat("so."), date=dc_so), as_dict=True)
 
     custs = frappe.db.sql("""
-        SELECT customer, COUNT(*) AS oc, SUM(base_net_total) AS tr
-        FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online'
-          AND {rstat} {date}
-          AND customer IS NOT NULL AND customer != ''
-        GROUP BY customer ORDER BY tr DESC LIMIT 5
-    """.format(rstat=_RSTAT, date=date_c_b), as_dict=True)
+        SELECT so.customer, COUNT(DISTINCT so.name) AS oc, SUM(soi.base_amount) AS tr
+        FROM `tabSales Order Item` soi
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {on} AND {rstat} {date}
+          AND so.customer IS NOT NULL AND so.customer != ''
+        GROUP BY so.customer ORDER BY tr DESC LIMIT 5
+    """.format(on=_on("so."), rstat=_rstat("so."), date=dc_so), as_dict=True)
 
     im = _flt(items[0].tr) if items else 1
     cm = _flt(custs[0].tr) if custs else 1
@@ -362,13 +391,13 @@ def _online_top5(fd, td):
 
 
 def _online_recent(fd, td):
-    date_c = _date_clause(fd, td, alias="")
+    dc = _date_clause(fd, td, alias="")
     rows = frappe.db.sql("""
         SELECT name, customer, transaction_date, grand_total, woocommerce_status
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online' {}
+        WHERE {on} {date}
         ORDER BY creation DESC LIMIT 8
-    """.format(date_c), as_dict=True)
+    """.format(on=_on(""), date=dc), as_dict=True)
     return [{"name": r.name, "customer": r.customer or "—",
              "transaction_date": str(r.transaction_date or ""),
              "grand_total": _flt(r.grand_total),
@@ -376,48 +405,54 @@ def _online_recent(fd, td):
 
 
 def _online_pipeline(fd, td):
-    date_c = _date_clause(fd, td, alias="")
+    dc = _date_clause(fd, td, alias="")
     rows = frappe.db.sql("""
         SELECT woocommerce_status, COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Online' {}
+        WHERE {on} {date}
           AND woocommerce_status IS NOT NULL AND woocommerce_status != ''
         GROUP BY woocommerce_status
-    """.format(date_c), as_dict=True)
-    sm = {r.woocommerce_status: _int(r.cnt) for r in rows}
-    def p(*keys): return sum(sm.get(k, 0) for k in keys)
-    total     = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE docstatus=1 AND custom_offline__online='Online'{}".format(date_c)))
-    shipped   = p("Shipped","shipped")
-    proc      = p("Processing","processing")
+    """.format(on=_on(""), date=dc), as_dict=True)
+
+    sm = {}
+    for r in rows:
+        key = (r.woocommerce_status or "").strip().lower()
+        sm[key] = sm.get(key, 0) + _int(r.cnt)
+
+    total      = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {}{}".format(_on(""), dc)))
+    shipped    = sm.get("shipped", 0)
+    delivered  = sm.get("delivered", 0) + sm.get("picked up", 0)
+    processing = sm.get("processing", 0) + sm.get("processing lp", 0)
+    fulfilled  = shipped + delivered
+    active     = fulfilled + processing
+
     return {
-        "pending":          p("Pending","pending"),
-        "on_hold":          p("on-hold"),
-        "processing":       proc,
+        "pending":          sm.get("pending payment", 0) + sm.get("pending", 0),
+        "on_hold":          sm.get("on hold", 0) + sm.get("on-hold", 0),
+        "processing":       processing,
         "shipped":          shipped,
-        "refunded":         p("Refunded","refunded"),
-        "cancelled":        p("Cancelled","cancelled","failed"),
+        "delivered":        delivered,
+        "refunded":         sm.get("refunded", 0) + sm.get("failed", 0),
+        "cancelled":        sm.get("cancelled", 0) + sm.get("trash", 0),
         "total":            total,
-        "fulfil_shipped":   round(shipped          / total * 100) if total else 0,
-        "fulfil_ship_proc": round((shipped + proc) / total * 100) if total else 0,
+        "fulfil_shipped":   round(fulfilled / total * 100) if total else 0,
+        "fulfil_ship_proc": round(active    / total * 100) if total else 0,
     }
 
 
 # ================================================================
-#  OFFLINE FUNCTIONS
+#  OFFLINE FUNCTIONS  (drafts included: docstatus IN (0,1))
 # ================================================================
 
-_OFF = "docstatus=1 AND custom_offline__online='Offline'"
-
-
 def _offline_kpis(t, ms, me, lms, lme, fd, td):
-    date_c = _date_clause(fd, td, alias="")
+    dc = _date_clause(fd, td, alias="")
 
     def rev(extra=""):
-        w = "WHERE " + _OFF + (" AND " + extra if extra else "") + date_c
+        w = "WHERE " + _off("") + (" AND " + extra if extra else "") + dc
         return _flt(_q("SELECT COALESCE(SUM(base_net_total),0) FROM `tabSales Order` " + w))
 
     def cnt(extra=""):
-        w = "WHERE " + _OFF + (" AND " + extra if extra else "") + date_c
+        w = "WHERE " + _off("") + (" AND " + extra if extra else "") + dc
         return _int(_q("SELECT COUNT(*) FROM `tabSales Order` " + w))
 
     if fd and td:
@@ -430,8 +465,8 @@ def _offline_kpis(t, ms, me, lms, lme, fd, td):
         lmonth_rev = rev("transaction_date BETWEEN '{}' AND '{}'".format(lms, lme))
 
     total_ord = cnt()
-    today_ord = cnt("transaction_date='{}' AND {}".format(str(t), _RSTAT))
-    yest_ord  = cnt("transaction_date='{}' AND {}".format(str(add_days(t, -1)), _RSTAT))
+    today_ord = cnt("transaction_date='{}'".format(str(t)))
+    yest_ord  = cnt("transaction_date='{}'".format(str(add_days(t, -1))))
     pending   = cnt("status='To Deliver and Bill'")
     cancelled = cnt("status='Cancelled'")
     completed = cnt("status='Completed'")
@@ -452,19 +487,18 @@ def _offline_kpis(t, ms, me, lms, lme, fd, td):
 
 
 def _offline_snapshot(ms, me, fd, td):
-    date_c    = _date_clause(fd, td, alias="")
-    date_c_so = _date_clause(fd, td, alias="so")
+    dc     = _date_clause(fd, td, alias="")
+    dc_so  = _date_clause(fd, td, alias="so.")
     tax_ms = fd if fd else ms
     tax_me = td if td else me
 
-    # Fetch top 5 customers, then collect all tied at #1 revenue
     tc_all = frappe.db.sql("""
         SELECT customer, COUNT(*) AS cnt, SUM(base_net_total) AS rev
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {date}
           AND customer IS NOT NULL AND customer != ''
         GROUP BY customer ORDER BY rev DESC LIMIT 5
-    """.format(date_c), as_dict=True)
+    """.format(off=_off(""), date=dc), as_dict=True)
 
     tc = []
     if tc_all:
@@ -478,22 +512,22 @@ def _offline_snapshot(ms, me, fd, td):
     ti = frappe.db.sql("""
         SELECT soi.item_name, SUM(soi.qty) AS qty, SUM(soi.amount) AS rev
         FROM `tabSales Order Item` soi
-        JOIN `tabSales Order` so ON so.name=soi.parent
-        WHERE so.docstatus=1 AND so.custom_offline__online='Offline' {}
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {off} {date}
           AND soi.item_name IS NOT NULL AND soi.item_name != ''
         GROUP BY soi.item_name ORDER BY rev DESC LIMIT 1
-    """.format(date_c_so), as_dict=True)
+    """.format(off=_off("so."), date=dc_so), as_dict=True)
 
     tax_rows = frappe.db.sql("""
         SELECT stc.account_head, COALESCE(SUM(stc.tax_amount), 0) AS total
         FROM `tabSales Taxes and Charges` stc
         JOIN `tabSales Order` so ON so.name = stc.parent
-        WHERE so.docstatus=1 AND so.custom_offline__online='Offline'
+        WHERE {off}
           AND so.transaction_date BETWEEN %s AND %s
           AND stc.tax_amount IS NOT NULL
           AND stc.charge_type != 'Actual'
         GROUP BY stc.account_head ORDER BY total DESC
-    """, [tax_ms, tax_me], as_dict=True)
+    """.format(off=_off("so.")), [tax_ms, tax_me], as_dict=True)
 
     sgst = cgst = igst = tds = 0.0
     for r in tax_rows:
@@ -509,20 +543,19 @@ def _offline_snapshot(ms, me, fd, td):
 
     unique = _int(_q("""
         SELECT COUNT(DISTINCT customer) FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {date}
           AND customer IS NOT NULL AND customer != ''
-    """.format(date_c)))
+    """.format(off=_off(""), date=dc)))
     repeat = _int(_q("""
         SELECT COUNT(*) FROM (
             SELECT customer FROM `tabSales Order`
-            WHERE docstatus=1 AND custom_offline__online='Offline' {}
+            WHERE {off} {date}
               AND customer IS NOT NULL AND customer != ''
             GROUP BY customer HAVING COUNT(*) > 1
         ) t
-    """.format(date_c)))
-    total = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE docstatus=1 AND custom_offline__online='Offline'{}".format(date_c)))
+    """.format(off=_off(""), date=dc)))
+    total = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {}{}".format(_off(""), dc)))
 
-    # Build display strings — show all tied customers
     top_cust_display = " & ".join([r.customer for r in tc]) if tc else "—"
     top_cust_cnt     = sum(_int(r.cnt) for r in tc) if len(tc) > 1 else (_int(tc[0].cnt) if tc else 0)
     top_cust_rev     = _flt(tc[0].rev) if tc else 0.0
@@ -548,20 +581,23 @@ def _offline_snapshot(ms, me, fd, td):
 
 
 def _offline_charts(t, ms, me, fd, td):
-    date_c    = _date_clause(fd, td, alias="")
-    date_c_so = _date_clause(fd, td, alias="so")
-    tax_ms = fd if fd else ms
-    tax_me = td if td else me
+    dc = _date_clause(fd, td, alias="")
 
     st_rows = frappe.db.sql("""
         SELECT status, COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {date}
           AND status IS NOT NULL AND status != ''
         GROUP BY status ORDER BY cnt DESC
-    """.format(date_c), as_dict=True)
+    """.format(off=_off(""), date=dc), as_dict=True)
 
-    _mo_date = "AND so.transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND so.transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
+    if fd and td:
+        win_so = " AND so.transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
+        win    = " AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
+    else:
+        win_so = " AND so.transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t))
+        win    = " AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t))
+
     tax_monthly = frappe.db.sql("""
         SELECT YEAR(so.transaction_date) AS yr,
                MONTH(so.transaction_date) AS mo_num,
@@ -570,10 +606,10 @@ def _offline_charts(t, ms, me, fd, td):
                COALESCE(SUM(stc.tax_amount), 0) AS total
         FROM `tabSales Taxes and Charges` stc
         JOIN `tabSales Order` so ON so.name = stc.parent
-        WHERE so.docstatus=1 AND so.custom_offline__online='Offline'
-          {} AND stc.tax_amount IS NOT NULL
+        WHERE {off}
+          {win} AND stc.tax_amount IS NOT NULL
         GROUP BY yr, mo_num, sk, stc.account_head ORDER BY sk
-    """.format(_mo_date), as_dict=True)
+    """.format(off=_off("so."), win=win_so), as_dict=True)
 
     month_map = {}
     for r in tax_monthly:
@@ -587,15 +623,14 @@ def _offline_charts(t, ms, me, fd, td):
         elif "CGST" in ah:                    month_map[r.sk]["cgst"] += val
 
     if not month_map:
-        _ord_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
         ord_rows = frappe.db.sql("""
             SELECT YEAR(transaction_date) AS yr,
                    MONTH(transaction_date) AS mo_num,
                    YEAR(transaction_date)*100+MONTH(transaction_date) AS sk
             FROM `tabSales Order`
-            WHERE docstatus=1 AND custom_offline__online='Offline' {}
+            WHERE {off} {win}
             GROUP BY yr, mo_num, sk ORDER BY sk
-        """.format(_ord_date), as_dict=True)
+        """.format(off=_off(""), win=win), as_dict=True)
         for r in ord_rows:
             month_map[r.sk] = {"mo": _mo_label(r.sk // 100, r.sk % 100), "sk": r.sk, "sgst": 0.0, "cgst": 0.0, "igst": 0.0, "tds": 0.0}
 
@@ -608,22 +643,21 @@ def _offline_charts(t, ms, me, fd, td):
     for lbl, lo, hi in off_buckets:
         c = _int(_q("""
             SELECT COUNT(*) FROM `tabSales Order`
-            WHERE docstatus=1 AND custom_offline__online='Offline'
-              AND base_net_total >= %s AND base_net_total < %s {}
-        """.format(date_c), [lo, hi]))
+            WHERE {off}
+              AND base_net_total >= %s AND base_net_total < %s {date}
+        """.format(off=_off(""), date=dc), [lo, hi]))
         bkt_labels.append(lbl)
         bkt_values.append(c)
 
-    _rev_date = "AND transaction_date >= DATE_SUB('{}', INTERVAL 6 MONTH)".format(str(t)) if not (fd and td) else "AND transaction_date BETWEEN '{}' AND '{}'".format(fd, td)
     rev_rows = frappe.db.sql("""
         SELECT YEAR(transaction_date) AS yr,
                MONTH(transaction_date) AS mo_num,
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {win}
         GROUP BY yr, mo_num, sk ORDER BY sk
-    """.format(_rev_date), as_dict=True)
+    """.format(off=_off(""), win=win), as_dict=True)
 
     mo_rows = frappe.db.sql("""
         SELECT YEAR(transaction_date) AS yr,
@@ -631,9 +665,9 @@ def _offline_charts(t, ms, me, fd, td):
                YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
                COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {win}
         GROUP BY yr, mo_num, sk ORDER BY sk
-    """.format(_rev_date), as_dict=True)
+    """.format(off=_off(""), win=win), as_dict=True)
 
     return {
         "status":        {"labels": [r.status for r in st_rows], "datasets": [{"values": [_int(r.cnt) for r in st_rows]}]},
@@ -645,25 +679,25 @@ def _offline_charts(t, ms, me, fd, td):
 
 
 def _offline_top5(fd, td):
-    date_c    = _date_clause(fd, td, alias="so")
-    date_c_b  = _date_clause(fd, td, alias="")
+    dc    = _date_clause(fd, td, alias="")
+    dc_so = _date_clause(fd, td, alias="so.")
 
     items = frappe.db.sql("""
         SELECT soi.item_name, SUM(soi.qty) AS tq, SUM(soi.amount) AS tr
         FROM `tabSales Order Item` soi
-        JOIN `tabSales Order` so ON so.name=soi.parent
-        WHERE so.docstatus=1 AND so.custom_offline__online='Offline' {}
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {off} {date}
           AND soi.item_name IS NOT NULL AND soi.item_name != ''
         GROUP BY soi.item_name ORDER BY tr DESC LIMIT 6
-    """.format(date_c), as_dict=True)
+    """.format(off=_off("so."), date=dc_so), as_dict=True)
 
     custs = frappe.db.sql("""
         SELECT customer, COUNT(*) AS oc, SUM(base_net_total) AS tr
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {date}
           AND customer IS NOT NULL AND customer != ''
         GROUP BY customer ORDER BY tr DESC LIMIT 5
-    """.format(date_c_b), as_dict=True)
+    """.format(off=_off(""), date=dc), as_dict=True)
 
     im = _flt(items[0].tr) if items else 1
     cm = _flt(custs[0].tr) if custs else 1
@@ -674,13 +708,13 @@ def _offline_top5(fd, td):
 
 
 def _offline_recent(fd, td):
-    date_c = _date_clause(fd, td, alias="")
+    dc = _date_clause(fd, td, alias="")
     rows = frappe.db.sql("""
         SELECT name, customer, transaction_date, grand_total, status
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {date}
         ORDER BY creation DESC LIMIT 8
-    """.format(date_c), as_dict=True)
+    """.format(off=_off(""), date=dc), as_dict=True)
     return [{"name": r.name, "customer": r.customer or "—",
              "transaction_date": str(r.transaction_date or ""),
              "grand_total": _flt(r.grand_total),
@@ -688,16 +722,16 @@ def _offline_recent(fd, td):
 
 
 def _offline_pipeline(fd, td):
-    date_c = _date_clause(fd, td, alias="")
+    dc = _date_clause(fd, td, alias="")
     rows = frappe.db.sql("""
         SELECT status, COUNT(*) AS cnt
         FROM `tabSales Order`
-        WHERE docstatus=1 AND custom_offline__online='Offline' {}
+        WHERE {off} {date}
           AND status IS NOT NULL AND status != ''
         GROUP BY status
-    """.format(date_c), as_dict=True)
+    """.format(off=_off(""), date=dc), as_dict=True)
     sm    = {r.status: _int(r.cnt) for r in rows}
-    total = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE docstatus=1 AND custom_offline__online='Offline'{}".format(date_c)))
+    total = _int(_q("SELECT COUNT(*) FROM `tabSales Order` WHERE {}{}".format(_off(""), dc)))
     comp  = sm.get("Completed", 0)
     return {
         "draft":           sm.get("Draft", 0),
