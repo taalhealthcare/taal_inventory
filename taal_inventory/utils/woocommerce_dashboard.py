@@ -273,22 +273,30 @@ def _online_charts(t, fd, td):
     dc    = _date_clause(fd, td, alias="")
     dc_so = _date_clause(fd, td, alias="so.")
 
+    # Status donut: order count + item revenue per status (all statuses)
     ws = frappe.db.sql("""
-        SELECT woocommerce_status, COUNT(*) AS cnt
-        FROM `tabSales Order`
+        SELECT so.woocommerce_status AS st,
+               COUNT(DISTINCT so.name) AS cnt,
+               COALESCE(SUM(soi.base_amount),0) AS rev
+        FROM `tabSales Order` so
+        LEFT JOIN `tabSales Order Item` soi ON soi.parent = so.name
         WHERE {on} {date}
-          AND woocommerce_status IS NOT NULL AND woocommerce_status != ''
-        GROUP BY woocommerce_status ORDER BY cnt DESC
-    """.format(on=_on(""), date=dc), as_dict=True)
+          AND so.woocommerce_status IS NOT NULL AND so.woocommerce_status != ''
+        GROUP BY so.woocommerce_status ORDER BY cnt DESC
+    """.format(on=_on("so."), date=dc_so), as_dict=True)
 
+    # Payment donut: order count + item revenue per method (active only)
     pm = frappe.db.sql("""
-        SELECT woocommerce_payment_method, COUNT(*) AS cnt
-        FROM `tabSales Order`
+        SELECT so.woocommerce_payment_method AS pmname,
+               COUNT(DISTINCT so.name) AS cnt,
+               COALESCE(SUM(soi.base_amount),0) AS rev
+        FROM `tabSales Order` so
+        LEFT JOIN `tabSales Order Item` soi ON soi.parent = so.name
         WHERE {on} AND {rstat} {date}
-          AND woocommerce_payment_method IS NOT NULL
-          AND woocommerce_payment_method != ''
-        GROUP BY woocommerce_payment_method ORDER BY cnt DESC LIMIT 6
-    """.format(on=_on(""), rstat=_rstat(""), date=dc), as_dict=True)
+          AND so.woocommerce_payment_method IS NOT NULL
+          AND so.woocommerce_payment_method != ''
+        GROUP BY so.woocommerce_payment_method ORDER BY cnt DESC LIMIT 6
+    """.format(on=_on("so."), rstat=_rstat("so."), date=dc_so), as_dict=True)
 
     buckets = [
         ("Under ₹500",       0,    500),
@@ -297,19 +305,22 @@ def _online_charts(t, fd, td):
         ("₹2,000 – ₹5,000", 2000,  5000),
         ("Above ₹5,000",    5000, 999999999),
     ]
-    bkt_labels, bkt_values = [], []
+    bkt_labels, bkt_values, bkt_rev = [], [], []
     for lbl, lo, hi in buckets:
-        c = _int(_q("""
-            SELECT COUNT(*) FROM `tabSales Order`
+        row = frappe.db.sql("""
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(base_net_total),0) AS rev
+            FROM `tabSales Order`
             WHERE {on} AND {rstat}
               AND base_net_total >= %s AND base_net_total < %s {date}
-        """.format(on=_on(""), rstat=_rstat(""), date=dc), [lo, hi]))
+        """.format(on=_on(""), rstat=_rstat(""), date=dc), [lo, hi], as_dict=True)
         bkt_labels.append(lbl)
-        bkt_values.append(c)
+        bkt_values.append(_int(row[0].cnt) if row else 0)
+        bkt_rev.append(_flt(row[0].rev) if row else 0.0)
 
     state_rows = frappe.db.sql("""
         SELECT COALESCE(NULLIF(TRIM(addr.state), ''), 'Unknown') AS state,
-               COUNT(*) AS cnt
+               COUNT(*) AS cnt,
+               COALESCE(SUM(so.base_net_total),0) AS rev
         FROM `tabSales Order` so
         LEFT JOIN `tabAddress` addr ON addr.name = so.shipping_address_name
         WHERE {on} AND {rstat} {date}
@@ -347,13 +358,96 @@ def _online_charts(t, fd, td):
         GROUP BY yr, mo_num, sk ORDER BY sk
     """.format(on=_on(""), rstat=_rstat(""), win=win), as_dict=True)
 
+    # ── Per-month full detail for the chart tooltips ──────────
+    detail = {}
+
+    def _slot(sk):
+        if sk not in detail:
+            detail[sk] = {
+                "label": _mo_label(sk // 100, sk % 100),
+                "orders": 0, "qty": 0.0, "revenue": 0.0, "aov": 0.0,
+                "grand": 0.0, "rounded": 0.0, "courier": 0.0,
+                "all_orders": 0, "shipped": 0, "delivered": 0,
+                "processing": 0, "pending": 0, "on_hold": 0,
+                "cancelled": 0, "trash": 0, "failed_refunded": 0, "other": 0
+            }
+        return detail[sk]
+
+    # Header sums per month: active orders only
+    hdr = frappe.db.sql("""
+        SELECT YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
+               COUNT(*) AS cnt,
+               COALESCE(SUM(base_grand_total),0) AS grand,
+               COALESCE(SUM(CASE WHEN IFNULL(base_rounded_total,0) != 0
+                                 THEN base_rounded_total
+                                 ELSE base_grand_total END),0) AS rounded,
+               COALESCE(SUM(base_total_taxes_and_charges),0) AS courier
+        FROM `tabSales Order`
+        WHERE {on} AND {rstat} {win}
+          AND transaction_date IS NOT NULL
+        GROUP BY sk
+    """.format(on=_on(""), rstat=_rstat(""), win=win), as_dict=True)
+    for r in hdr:
+        s = _slot(r.sk)
+        s["orders"]  = _int(r.cnt)
+        s["grand"]   = _flt(r.grand)
+        s["rounded"] = _flt(r.rounded)
+        s["courier"] = _flt(r.courier)
+
+    # Item sums per month: revenue and qty, active orders only
+    itm = frappe.db.sql("""
+        SELECT YEAR(so.transaction_date)*100+MONTH(so.transaction_date) AS sk,
+               COALESCE(SUM(soi.base_amount),0) AS rev,
+               COALESCE(SUM(soi.qty),0) AS qty
+        FROM `tabSales Order Item` soi
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {on} AND {rstat} {win}
+          AND so.transaction_date IS NOT NULL
+        GROUP BY sk
+    """.format(on=_on("so."), rstat=_rstat("so."), win=win_so), as_dict=True)
+    for r in itm:
+        s = _slot(r.sk)
+        s["revenue"] = _flt(r.rev)
+        s["qty"]     = _flt(r.qty)
+
+    # Status counts per month: every Online order
+    stm = frappe.db.sql("""
+        SELECT YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
+               LOWER(IFNULL(woocommerce_status,'')) AS st,
+               COUNT(*) AS cnt
+        FROM `tabSales Order`
+        WHERE {on} {win}
+          AND transaction_date IS NOT NULL
+        GROUP BY sk, st
+    """.format(on=_on(""), win=win), as_dict=True)
+    for r in stm:
+        s  = _slot(r.sk)
+        st = (r.st or "").strip()
+        c  = _int(r.cnt)
+        s["all_orders"] += c
+        if st == "shipped":                           s["shipped"]         += c
+        elif st in ("delivered", "picked up"):        s["delivered"]       += c
+        elif st in ("processing", "processing lp"):   s["processing"]      += c
+        elif st in ("pending payment", "pending"):    s["pending"]         += c
+        elif st in ("on hold", "on-hold"):            s["on_hold"]         += c
+        elif st == "cancelled":                       s["cancelled"]       += c
+        elif st == "trash":                           s["trash"]           += c
+        elif st in ("failed", "refunded"):            s["failed_refunded"] += c
+        else:                                         s["other"]           += c
+
+    monthly_detail = {}
+    for s in detail.values():
+        s["aov"] = round(s["revenue"] / s["orders"], 2) if s["orders"] else 0.0
+        monthly_detail[s["label"]] = s
+
     return {
-        "woo_status":    {"labels": [r.woocommerce_status for r in ws],         "datasets": [{"values": [_int(r.cnt) for r in ws]}]},
-        "payment":       {"labels": [r.woocommerce_payment_method for r in pm], "datasets": [{"values": [_int(r.cnt) for r in pm]}]},
-        "order_buckets": {"labels": bkt_labels,                                 "datasets": [{"values": bkt_values}]},
-        "top_states":    {"labels": [r.state for r in state_rows],              "datasets": [{"values": [_int(r.cnt) for r in state_rows]}]},
-        "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mr],    "datasets": [{"values": [_flt(r.rev) for r in mr]}]},
-        "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo],    "datasets": [{"values": [_int(r.cnt) for r in mo]}]},
+        "woo_status":    {"labels": [r.st for r in ws],          "datasets": [{"values": [_int(r.cnt) for r in ws]}], "revenue": [_flt(r.rev) for r in ws]},
+        "payment":       {"labels": [r.pmname for r in pm],      "datasets": [{"values": [_int(r.cnt) for r in pm]}], "revenue": [_flt(r.rev) for r in pm]},
+        "order_buckets": {"labels": bkt_labels,                  "datasets": [{"values": bkt_values}],                "revenue": bkt_rev},
+        "top_states":    {"labels": [r.state for r in state_rows], "datasets": [{"values": [_int(r.cnt) for r in state_rows]}], "revenue": [_flt(r.rev) for r in state_rows]},
+        "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mr], "datasets": [{"values": [_flt(r.rev) for r in mr]}]},
+        "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo], "datasets": [{"values": [_int(r.cnt) for r in mo]}]},
+        "monthly_detail": monthly_detail,
     }
 
 
@@ -584,7 +678,7 @@ def _offline_charts(t, ms, me, fd, td):
     dc = _date_clause(fd, td, alias="")
 
     st_rows = frappe.db.sql("""
-        SELECT status, COUNT(*) AS cnt
+        SELECT status, COUNT(*) AS cnt, COALESCE(SUM(base_net_total),0) AS rev
         FROM `tabSales Order`
         WHERE {off} {date}
           AND status IS NOT NULL AND status != ''
@@ -639,15 +733,17 @@ def _offline_charts(t, ms, me, fd, td):
     off_buckets = [("Under ₹1,000",0,1000),("₹1,000 – ₹2,000",1000,2000),
                    ("₹2,000 – ₹5,000",2000,5000),("₹5,000 – ₹10,000",5000,10000),
                    ("Above ₹10,000",10000,999999999)]
-    bkt_labels, bkt_values = [], []
+    bkt_labels, bkt_values, bkt_rev = [], [], []
     for lbl, lo, hi in off_buckets:
-        c = _int(_q("""
-            SELECT COUNT(*) FROM `tabSales Order`
+        row = frappe.db.sql("""
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(base_net_total),0) AS rev
+            FROM `tabSales Order`
             WHERE {off}
               AND base_net_total >= %s AND base_net_total < %s {date}
-        """.format(off=_off(""), date=dc), [lo, hi]))
+        """.format(off=_off(""), date=dc), [lo, hi], as_dict=True)
         bkt_labels.append(lbl)
-        bkt_values.append(c)
+        bkt_values.append(_int(row[0].cnt) if row else 0)
+        bkt_rev.append(_flt(row[0].rev) if row else 0.0)
 
     rev_rows = frappe.db.sql("""
         SELECT YEAR(transaction_date) AS yr,
@@ -669,12 +765,88 @@ def _offline_charts(t, ms, me, fd, td):
         GROUP BY yr, mo_num, sk ORDER BY sk
     """.format(off=_off(""), win=win), as_dict=True)
 
+    # ── Per-month full detail for the chart tooltips ──────────
+    detail = {}
+
+    def _slot(sk):
+        if sk not in detail:
+            detail[sk] = {
+                "label": _mo_label(sk // 100, sk % 100),
+                "orders": 0, "qty": 0.0, "revenue": 0.0, "aov": 0.0,
+                "grand": 0.0, "rounded": 0.0, "tax": 0.0, "tds": 0.0,
+                "completed": 0, "to_deliver": 0, "to_bill": 0,
+                "cancelled": 0, "draft": 0, "other": 0
+            }
+        return detail[sk]
+
+    hdr = frappe.db.sql("""
+        SELECT YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
+               COUNT(*) AS cnt,
+               COALESCE(SUM(base_net_total),0) AS rev,
+               COALESCE(SUM(base_grand_total),0) AS grand,
+               COALESCE(SUM(CASE WHEN IFNULL(base_rounded_total,0) != 0
+                                 THEN base_rounded_total
+                                 ELSE base_grand_total END),0) AS rounded
+        FROM `tabSales Order`
+        WHERE {off} {win}
+          AND transaction_date IS NOT NULL
+        GROUP BY sk
+    """.format(off=_off(""), win=win), as_dict=True)
+    for r in hdr:
+        s = _slot(r.sk)
+        s["orders"]  = _int(r.cnt)
+        s["revenue"] = _flt(r.rev)
+        s["grand"]   = _flt(r.grand)
+        s["rounded"] = _flt(r.rounded)
+
+    itm = frappe.db.sql("""
+        SELECT YEAR(so.transaction_date)*100+MONTH(so.transaction_date) AS sk,
+               COALESCE(SUM(soi.qty),0) AS qty
+        FROM `tabSales Order Item` soi
+        JOIN `tabSales Order` so ON so.name = soi.parent
+        WHERE {off} {win}
+          AND so.transaction_date IS NOT NULL
+        GROUP BY sk
+    """.format(off=_off("so."), win=win_so), as_dict=True)
+    for r in itm:
+        _slot(r.sk)["qty"] = _flt(r.qty)
+
+    stm = frappe.db.sql("""
+        SELECT YEAR(transaction_date)*100+MONTH(transaction_date) AS sk,
+               status, COUNT(*) AS cnt
+        FROM `tabSales Order`
+        WHERE {off} {win}
+          AND transaction_date IS NOT NULL
+        GROUP BY sk, status
+    """.format(off=_off(""), win=win), as_dict=True)
+    for r in stm:
+        s  = _slot(r.sk)
+        st = (r.status or "").strip()
+        c  = _int(r.cnt)
+        if st == "Completed":                                  s["completed"]  += c
+        elif st in ("To Deliver and Bill", "To Deliver"):      s["to_deliver"] += c
+        elif st == "To Bill":                                  s["to_bill"]    += c
+        elif st == "Cancelled":                                s["cancelled"]  += c
+        elif st == "Draft":                                    s["draft"]      += c
+        else:                                                  s["other"]      += c
+
+    for sk, m in month_map.items():
+        s = _slot(sk)
+        s["tax"] = round(m["sgst"] + m["cgst"] + m["igst"], 2)
+        s["tds"] = round(m["tds"], 2)
+
+    monthly_detail = {}
+    for s in detail.values():
+        s["aov"] = round(s["revenue"] / s["orders"], 2) if s["orders"] else 0.0
+        monthly_detail[s["label"]] = s
+
     return {
-        "status":        {"labels": [r.status for r in st_rows], "datasets": [{"values": [_int(r.cnt) for r in st_rows]}]},
+        "status":        {"labels": [r.status for r in st_rows], "datasets": [{"values": [_int(r.cnt) for r in st_rows]}], "revenue": [_flt(r.rev) for r in st_rows]},
         "tax_monthly":   [{"mo": m["mo"],"sgst": round(m["sgst"],2),"cgst": round(m["cgst"],2),"igst": round(m["igst"],2),"tds": round(m["tds"],2)} for m in sorted_months],
-        "order_buckets": {"labels": bkt_labels, "datasets": [{"values": bkt_values}]},
+        "order_buckets": {"labels": bkt_labels, "datasets": [{"values": bkt_values}], "revenue": bkt_rev},
         "monthly_rev":   {"labels": [_mo_label(r.yr, r.mo_num) for r in rev_rows], "datasets": [{"values": [_flt(r.rev) for r in rev_rows]}]},
         "monthly_ord":   {"labels": [_mo_label(r.yr, r.mo_num) for r in mo_rows],  "datasets": [{"values": [_int(r.cnt) for r in mo_rows]}]},
+        "monthly_detail": monthly_detail,
     }
 
 

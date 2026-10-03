@@ -856,7 +856,7 @@ function _online_html(d, fd, td, periodLabel) {
     // S4: Order value + Top states
     H += _sechd("Section 4: Order value distribution & top states", periodLabel);
     H += '<div class="dw-g2">';
-    var ob=ch.order_buckets||{},obl=ob.labels||[],obv=(ob.datasets&&ob.datasets[0]&&ob.datasets[0].values)||[];
+    var ob=ch.order_buckets||{},obl=ob.labels||[],obv=(ob.datasets&&ob.datasets[0]&&ob.datasets[0].values)||[],obr=ob.revenue||[];
     var obMax=Math.max.apply(null,obv)||1;var obC=["#D4537E","#378ADD","#639922","#7F77DD","#D85A30"];
     var bktH="";for(var bi=0;bi<obl.length;bi++){var bp=Math.round((obv[bi]/obMax)*100);bktH+='<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="font-size:11px;color:#64748b">'+obl[bi]+'</span><span style="font-size:11px;font-weight:500;color:#111">'+(obv[bi]||0)+' orders</span></div><div style="height:8px;border-radius:4px;background:#e2e8f0"><div style="height:100%;border-radius:4px;background:'+obC[bi%obC.length]+';width:0;transition:width 1.1s ease" data-w="'+bp+'"></div></div></div>';}
     var mbIdx=obv.indexOf(Math.max.apply(null,obv));
@@ -864,7 +864,7 @@ function _online_html(d, fd, td, periodLabel) {
        + '<div class="dw-cs">' + _pcs("Online · Active orders · base_net_total buckets", periodLabel) + "</div>"
        + bktH
        + '<div style="margin-top:10px;padding-top:10px;border-top:0.5px solid #e2e8f0;display:flex;justify-content:space-between"><span style="font-size:10px;color:#94a3b8">Most orders in</span><span style="font-size:12px;font-weight:500;color:#639922">'+(obl[mbIdx]||"")+'</span></div></div>';
-    var ts=ch.top_states||{},tsl=ts.labels||[],tsv=(ts.datasets&&ts.datasets[0]&&ts.datasets[0].values)||[];
+    var ts=ch.top_states||{},tsl=ts.labels||[],tsv=(ts.datasets&&ts.datasets[0]&&ts.datasets[0].values)||[],tsr=ts.revenue||[];
     var tsMax=Math.max.apply(null,tsv)||1;var tsC=["#378ADD","#1D9E75","#7F77DD","#D85A30","#639922","#BA7517","#D4537E","#888780"];
     var stateH="";for(var si=0;si<tsl.length;si++){var sp=Math.round((tsv[si]/tsMax)*100);stateH+='<div class="dw-hbar-row"><span class="dw-hbar-lbl">'+tsl[si]+'</span><div class="dw-hbar-track"><div class="dw-hbar-fill" style="background:'+tsC[si%tsC.length]+'" data-w="'+sp+'">'+(sp>25?'<span style="font-size:9px;font-weight:500;color:#fff">'+(tsv[si]||0)+'</span>':'')+'</div></div>'+(sp<=25?'<span class="dw-hbar-outer">'+(tsv[si]||0)+'</span>':'')+'</div>';}
     if(!stateH)stateH='<div class="dw-empty">No state data for this period</div>';
@@ -1146,27 +1146,83 @@ function _fill_bars() {
 
 
 // ================================================================
-//  CHARTS
+//  CHARTS  (v5: rich month tooltips from charts.monthly_detail,
+//           revenue in doughnut tooltips, hover-anywhere columns)
 // ================================================================
 function _dash_charts(d, mode) {
     var ch   = d.charts || {};
+    var md   = ch.monthly_detail || {};
     var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     var gc   = dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.06)";
     var lc   = dark ? "#94a3b8" : "#888780";
     var bdr  = dark ? "#1a1a1a" : "#ffffff";
 
-    var dOpts = {
-        responsive: true, maintainAspectRatio: false, cutout: "65%",
-        animation: { animateRotate: true, duration: 800 },
-        plugins: {
-            legend: { display: false },
-            tooltip: { callbacks: { label: function (ctx) {
-                var tot = ctx.dataset.data.reduce(function (a, b) { return a + b; }, 0);
-                var pct = tot > 0 ? Math.round(ctx.parsed / tot * 100) : 0;
-                return " " + ctx.label + ": " + ctx.parsed + " (" + pct + "%)";
-            }}}
+    function qn(v){
+        var n = parseFloat(v) || 0;
+        return n % 1 === 0 ? n.toLocaleString("en-IN")
+                           : n.toLocaleString("en-IN", {maximumFractionDigits:1});
+    }
+
+    // Full month breakdown, shown under the main tooltip line
+    function monthLines(label){
+        var m = md[label];
+        if (!m) return [];
+        if (mode === "online") {
+            return [
+                "Active orders: " + qn(m.orders) + "  \u00B7  All statuses: " + qn(m.all_orders),
+                "Qty sold: " + qn(m.qty) + " units  \u00B7  Avg/Order: " + _INR(m.aov),
+                "Grand Total: " + _INR(m.grand),
+                "Rounded Total: " + _INR(m.rounded),
+                "Taxes / Courier: " + _INR(m.courier),
+                "",
+                "Shipped: " + qn(m.shipped) + "  \u00B7  Delivered / Picked up: " + qn(m.delivered),
+                "Processing: " + qn(m.processing) + "  \u00B7  Pending Payment: " + qn(m.pending),
+                "Cancelled: " + qn(m.cancelled) + "  \u00B7  Trash: " + qn(m.trash) + "  \u00B7  Failed/Refunded: " + qn(m.failed_refunded)
+            ];
         }
+        return [
+            "Orders: " + qn(m.orders),
+            "Qty sold: " + qn(m.qty) + " units  \u00B7  Avg/Order: " + _INR(m.aov),
+            "Grand Total: " + _INR(m.grand),
+            "Rounded Total: " + _INR(m.rounded),
+            "Total Tax (GST): " + _INR(m.tax) + "  \u00B7  TDS: " + _INR(m.tds),
+            "",
+            "Completed: " + qn(m.completed) + "  \u00B7  To Deliver: " + qn(m.to_deliver) + "  \u00B7  To Bill: " + qn(m.to_bill),
+            "Cancelled: " + qn(m.cancelled) + "  \u00B7  Draft: " + qn(m.draft)
+        ];
+    }
+
+    var ttStyle = {
+        displayColors: false,
+        padding: 12,
+        titleFont: { size: 12, weight: "700" },
+        bodyFont:  { size: 11 },
+        bodySpacing: 4
     };
+
+    function donutOpts(revArr){
+        return {
+            responsive: true, maintainAspectRatio: false, cutout: "65%",
+            animation: { animateRotate: true, duration: 800 },
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    padding: 10,
+                    callbacks: {
+                        label: function (ctx) {
+                            var tot = ctx.dataset.data.reduce(function (a, b) { return a + b; }, 0);
+                            var pct = tot > 0 ? Math.round(ctx.parsed / tot * 100) : 0;
+                            return " " + ctx.label + ": " + ctx.parsed + " orders (" + pct + "%)";
+                        },
+                        afterLabel: function (ctx) {
+                            if (!revArr || revArr[ctx.dataIndex] === undefined) return "";
+                            return " Revenue: " + _INR(revArr[ctx.dataIndex]);
+                        }
+                    }
+                }
+            }
+        };
+    }
 
     var c1 = document.getElementById("dw-ch1");
     if (c1) {
@@ -1183,10 +1239,11 @@ function _dash_charts(d, mode) {
                     backgroundColor: stL.map(function (s) {
                         return mode === "online" ? _woo_color(s) : (offStColors[s] || "#888780");
                     }),
-                    borderWidth: 3, borderColor: bdr, hoverOffset: 8
+                    borderWidth: 3, borderColor: bdr,
+                    hoverOffset: 10, hoverBorderWidth: 3
                 }]
             },
-            options: dOpts
+            options: donutOpts(stData.revenue || [])
         });
     }
 
@@ -1202,10 +1259,11 @@ function _dash_charts(d, mode) {
                 datasets: [{
                     data:            (pm.datasets&&pm.datasets[0]&&pm.datasets[0].values)||[],
                     backgroundColor: pml.map(function (_, i) { return pmC[i % pmC.length]; }),
-                    borderWidth: 3, borderColor: bdr, hoverOffset: 8
+                    borderWidth: 3, borderColor: bdr,
+                    hoverOffset: 10, hoverBorderWidth: 3
                 }]
             },
-            options: dOpts
+            options: donutOpts(pm.revenue || [])
         });
     }
 
@@ -1222,19 +1280,27 @@ function _dash_charts(d, mode) {
                     data:  (mr.datasets&&mr.datasets[0]&&mr.datasets[0].values)||[0],
                     borderColor: revColor,
                     backgroundColor: dark?"rgba(99,153,34,.12)":"rgba(99,153,34,.08)",
-                    borderWidth:2,pointBackgroundColor:revColor,pointBorderColor:bdr,
-                    pointBorderWidth:2,pointRadius:5,pointHoverRadius:7,tension:0.4,fill:true
+                    borderWidth:2, pointBackgroundColor:revColor, pointBorderColor:bdr,
+                    pointBorderWidth:2, pointRadius:5,
+                    pointHoverRadius:8, pointHoverBorderWidth:3,
+                    tension:0.4, fill:true
                 }]
             },
             options: {
-                responsive:true,maintainAspectRatio:false,animation:{duration:900},
-                plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){
-                    return " ₹ "+(ctx.parsed.y||0).toLocaleString("en-IN");
-                }}}},
+                responsive:true, maintainAspectRatio:false, animation:{duration:900},
+                interaction:{ mode:"index", intersect:false },
+                plugins:{
+                    legend:{display:false},
+                    tooltip: Object.assign({}, ttStyle, { callbacks:{
+                        title: function(items){ return items[0].label; },
+                        label: function(ctx){ return "Revenue: \u20B9 " + (ctx.parsed.y||0).toLocaleString("en-IN"); },
+                        afterBody: function(items){ return monthLines(items[0].label); }
+                    }})
+                },
                 scales:{
                     x:{ticks:{color:lc,font:{size:11},autoSkip:false,maxRotation:30},grid:{color:gc},border:{display:false}},
                     y:{beginAtZero:true,ticks:{color:lc,font:{size:10},callback:function(v){
-                        return v>=1000?"₹"+Math.round(v/1000)+"K":"₹"+v;
+                        return v>=1000?"\u20B9"+Math.round(v/1000)+"K":"\u20B9"+v;
                     }},grid:{color:gc},border:{display:false}}
                 }
             }
@@ -1245,6 +1311,7 @@ function _dash_charts(d, mode) {
     if (c4) {
         var mo       = ch.monthly_ord || {};
         var barColor = mode === "online" ? "#378ADD" : "#639922";
+        var hovColor = mode === "online" ? "#2563eb" : "#4d7c0f";
         new Chart(c4, {
             type: "bar",
             data: {
@@ -1252,14 +1319,23 @@ function _dash_charts(d, mode) {
                 datasets: [{
                     label:"Orders",
                     data:(mo.datasets&&mo.datasets[0]&&mo.datasets[0].values)||[0],
-                    backgroundColor:barColor,borderRadius:6,borderSkipped:false
+                    backgroundColor:barColor, hoverBackgroundColor:hovColor,
+                    borderRadius:6, borderSkipped:false
                 }]
             },
             options: {
-                responsive:true,maintainAspectRatio:false,animation:{duration:900},
-                plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){
-                    return " "+ctx.parsed.y+" orders";
-                }}}},
+                responsive:true, maintainAspectRatio:false, animation:{duration:900},
+                interaction:{ mode:"index", intersect:false },
+                plugins:{
+                    legend:{display:false},
+                    tooltip: Object.assign({}, ttStyle, { callbacks:{
+                        title: function(items){ return items[0].label; },
+                        label: function(ctx){
+                            return (mode === "online" ? "Active orders: " : "Orders: ") + ctx.parsed.y;
+                        },
+                        afterBody: function(items){ return monthLines(items[0].label); }
+                    }})
+                },
                 scales:{
                     x:{ticks:{color:lc,font:{size:11},autoSkip:false,maxRotation:30},grid:{color:gc},border:{display:false}},
                     y:{beginAtZero:true,ticks:{color:lc,font:{size:11},stepSize:1},grid:{color:gc},border:{display:false}}
