@@ -1144,12 +1144,104 @@ function _fill_bars() {
     });
 }
 
+// ================================================================
+//  CHARTS  (v6: floating HTML tooltips, never clipped)
+//
+//  Chart.js normally draws its tooltip inside the chart canvas.
+//  The doughnuts live in fixed 140 x 140 boxes, so wide tooltips
+//  were cut off. Tooltips now render as one floating HTML element
+//  on the page body: it follows the hover point, flips near the
+//  screen edges, and is never clipped by any card or canvas.
+// ================================================================
 
-// ================================================================
-//  CHARTS  (v5: rich month tooltips from charts.monthly_detail,
-//           revenue in doughnut tooltips, hover-anywhere columns)
-// ================================================================
+function _dw_esc(s) {
+    return String(s === undefined || s === null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function _dw_tooltip_el() {
+    var el = document.getElementById("dw-chart-tooltip");
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = "dw-chart-tooltip";
+    el.style.cssText =
+        "position:fixed;z-index:99999;pointer-events:none;opacity:0;" +
+        "background:rgba(15,23,42,.96);color:#e2e8f0;border-radius:10px;" +
+        "padding:11px 14px;max-width:340px;" +
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;" +
+        "font-size:11px;line-height:1.6;" +
+        "box-shadow:0 10px 28px rgba(0,0,0,.38);" +
+        "transition:opacity .12s ease;";
+    document.body.appendChild(el);
+    return el;
+}
+
+function _dw_hide_tooltip() {
+    var el = document.getElementById("dw-chart-tooltip");
+    if (el) el.style.opacity = 0;
+}
+
+function _dw_external_tooltip(context) {
+    var tt = context.tooltip;
+    var el = _dw_tooltip_el();
+
+    if (!tt || tt.opacity === 0 ||
+        ((tt.title || []).length === 0 && (tt.body || []).length === 0)) {
+        el.style.opacity = 0;
+        return;
+    }
+
+    var html = "";
+
+    (tt.title || []).forEach(function (t) {
+        html += '<div style="font-size:12px;font-weight:700;color:#fff;margin-bottom:6px;">'
+              + _dw_esc(t) + "</div>";
+    });
+
+    var colors = tt.labelColors || [];
+    (tt.body || []).forEach(function (b, i) {
+        var sw = "";
+        if (colors[i] && colors[i].backgroundColor) {
+            sw = '<span style="display:inline-block;width:9px;height:9px;border-radius:2px;'
+               + 'background:' + colors[i].backgroundColor + ';margin-right:7px;"></span>';
+        }
+        (b.lines || []).forEach(function (line, li) {
+            html += '<div style="font-weight:600;color:#f8fafc;">'
+                  + (li === 0 ? sw : "") + _dw_esc(String(line).trim()) + "</div>";
+        });
+        (b.after || []).forEach(function (line) {
+            html += '<div style="color:#cbd5e1;">' + _dw_esc(String(line).trim()) + "</div>";
+        });
+    });
+
+    (tt.afterBody || []).forEach(function (line) {
+        if (String(line).trim() === "") {
+            html += '<div style="height:1px;background:rgba(255,255,255,.16);margin:7px 0;"></div>';
+        } else {
+            html += '<div style="color:#cbd5e1;">' + _dw_esc(line) + "</div>";
+        }
+    });
+
+    el.innerHTML = html;
+
+    var rect = context.chart.canvas.getBoundingClientRect();
+    var w = el.offsetWidth, h = el.offsetHeight;
+    var x = rect.left + tt.caretX + 14;
+    var y = rect.top  + tt.caretY - (h / 2);
+
+    if (x + w > window.innerWidth - 8) x = rect.left + tt.caretX - w - 14;
+    if (x < 8) x = 8;
+    if (y < 8) y = 8;
+    if (y + h > window.innerHeight - 8) y = window.innerHeight - h - 8;
+
+    el.style.left = Math.round(x) + "px";
+    el.style.top  = Math.round(y) + "px";
+    el.style.opacity = 1;
+}
+
 function _dash_charts(d, mode) {
+    _dw_hide_tooltip();
+
     var ch   = d.charts || {};
     var md   = ch.monthly_detail || {};
     var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -1192,31 +1284,25 @@ function _dash_charts(d, mode) {
         ];
     }
 
-    var ttStyle = {
-        displayColors: false,
-        padding: 12,
-        titleFont: { size: 12, weight: "700" },
-        bodyFont:  { size: 11 },
-        bodySpacing: 4
-    };
-
     function donutOpts(revArr){
         return {
-            responsive: true, maintainAspectRatio: false, cutout: "65%",
+            responsive: true, maintainAspectRatio: false, cutout: "62%",
+            layout: { padding: 8 },
             animation: { animateRotate: true, duration: 800 },
             plugins: {
                 legend: { display: false },
                 tooltip: {
-                    padding: 10,
+                    enabled: false,
+                    external: _dw_external_tooltip,
                     callbacks: {
                         label: function (ctx) {
                             var tot = ctx.dataset.data.reduce(function (a, b) { return a + b; }, 0);
                             var pct = tot > 0 ? Math.round(ctx.parsed / tot * 100) : 0;
-                            return " " + ctx.label + ": " + ctx.parsed + " orders (" + pct + "%)";
+                            return ctx.label + ": " + ctx.parsed + " orders (" + pct + "%)";
                         },
                         afterLabel: function (ctx) {
                             if (!revArr || revArr[ctx.dataIndex] === undefined) return "";
-                            return " Revenue: " + _INR(revArr[ctx.dataIndex]);
+                            return "Revenue: " + _INR(revArr[ctx.dataIndex]);
                         }
                     }
                 }
@@ -1240,7 +1326,7 @@ function _dash_charts(d, mode) {
                         return mode === "online" ? _woo_color(s) : (offStColors[s] || "#888780");
                     }),
                     borderWidth: 3, borderColor: bdr,
-                    hoverOffset: 10, hoverBorderWidth: 3
+                    hoverOffset: 8, hoverBorderWidth: 3
                 }]
             },
             options: donutOpts(stData.revenue || [])
@@ -1260,7 +1346,7 @@ function _dash_charts(d, mode) {
                     data:            (pm.datasets&&pm.datasets[0]&&pm.datasets[0].values)||[],
                     backgroundColor: pml.map(function (_, i) { return pmC[i % pmC.length]; }),
                     borderWidth: 3, borderColor: bdr,
-                    hoverOffset: 10, hoverBorderWidth: 3
+                    hoverOffset: 8, hoverBorderWidth: 3
                 }]
             },
             options: donutOpts(pm.revenue || [])
@@ -1291,11 +1377,15 @@ function _dash_charts(d, mode) {
                 interaction:{ mode:"index", intersect:false },
                 plugins:{
                     legend:{display:false},
-                    tooltip: Object.assign({}, ttStyle, { callbacks:{
-                        title: function(items){ return items[0].label; },
-                        label: function(ctx){ return "Revenue: \u20B9 " + (ctx.parsed.y||0).toLocaleString("en-IN"); },
-                        afterBody: function(items){ return monthLines(items[0].label); }
-                    }})
+                    tooltip:{
+                        enabled: false,
+                        external: _dw_external_tooltip,
+                        callbacks:{
+                            title: function(items){ return items[0].label; },
+                            label: function(ctx){ return "Revenue: \u20B9 " + (ctx.parsed.y||0).toLocaleString("en-IN"); },
+                            afterBody: function(items){ return monthLines(items[0].label); }
+                        }
+                    }
                 },
                 scales:{
                     x:{ticks:{color:lc,font:{size:11},autoSkip:false,maxRotation:30},grid:{color:gc},border:{display:false}},
@@ -1328,13 +1418,17 @@ function _dash_charts(d, mode) {
                 interaction:{ mode:"index", intersect:false },
                 plugins:{
                     legend:{display:false},
-                    tooltip: Object.assign({}, ttStyle, { callbacks:{
-                        title: function(items){ return items[0].label; },
-                        label: function(ctx){
-                            return (mode === "online" ? "Active orders: " : "Orders: ") + ctx.parsed.y;
-                        },
-                        afterBody: function(items){ return monthLines(items[0].label); }
-                    }})
+                    tooltip:{
+                        enabled: false,
+                        external: _dw_external_tooltip,
+                        callbacks:{
+                            title: function(items){ return items[0].label; },
+                            label: function(ctx){
+                                return (mode === "online" ? "Active orders: " : "Orders: ") + ctx.parsed.y;
+                            },
+                            afterBody: function(items){ return monthLines(items[0].label); }
+                        }
+                    }
                 },
                 scales:{
                     x:{ticks:{color:lc,font:{size:11},autoSkip:false,maxRotation:30},grid:{color:gc},border:{display:false}},
