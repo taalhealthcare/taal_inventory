@@ -1,15 +1,20 @@
 """
 taal_inventory/api/purchase_excel_upload.py
 
-Purchase Excel Upload -> Draft Purchase Invoice
-===============================================
-Reads the Tally invoice Excel from NMP+Taal Pharmacy (same layout as
-Purchase_20.xlsx) and creates a DRAFT Purchase Invoice. It never submits.
-You review the draft, fill what is marked, and submit it yourself. Your
-events/purchase_invoice.py on_submit then creates or tops up the
-Pharmacy Batches as usual.
+Supplier Excel -> Draft Purchase Invoice (button on Purchase Invoice)
+=====================================================================
+No separate upload DocType. A button on the Purchase Invoice list (and
+optionally on the form) opens a dialog: pick supplier and taxes, attach
+the Tally invoice Excel from NMP+Taal Pharmacy (layout of
+Purchase_20.xlsx), press Create Draft.
 
-Built for the taal_inventory app:
+This method parses the file, validates every row, creates the Purchase
+Invoice as a DRAFT, and attaches the Excel to that invoice for audit.
+It never submits. You review the draft, fill what is marked, and submit
+yourself. Your events/purchase_invoice.py on_submit then creates or
+tops up the Pharmacy Batches as usual.
+
+Guarantees, unchanged from before:
 - Reuses _get_pharmacy_item and _find_batch from events/purchase_invoice.py,
   so CREATE vs TOPUP is decided here EXACTLY as on_submit will decide it
   later (Active/Exhausted only, company scoped, newest first).
@@ -34,7 +39,7 @@ from datetime import date, datetime
 import frappe
 import openpyxl
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import flt, getdate
 
 from taal_inventory.events.purchase_invoice import _find_batch, _get_pharmacy_item
 
@@ -297,10 +302,10 @@ def merge_duplicate_rows(items):
     return merged, errors
 
 
-def validate_parsed(upload, data):
+def validate_parsed(args, data):
     errors = []
 
-    supplier_name = frappe.db.get_value("Supplier", upload.supplier, "supplier_name") or upload.supplier
+    supplier_name = frappe.db.get_value("Supplier", args.supplier, "supplier_name") or args.supplier
     if data["supplier_name"] and squash(data["supplier_name"]) != squash(supplier_name):
         errors.append(_("The file is billed from {0}, but this upload is for supplier {1}.").format(
             frappe.bold(data["supplier_name"]), frappe.bold(supplier_name)))
@@ -310,7 +315,7 @@ def validate_parsed(upload, data):
 
     # Resolve every row to an Item and its Pharmacy Item first.
     for entry in data["items"]:
-        entry["item_code"] = resolve_item(entry["name"], upload.supplier)
+        entry["item_code"] = resolve_item(entry["name"], args.supplier)
         entry["pharmacy_item"] = _get_pharmacy_item(entry["item_code"]) if entry["item_code"] else None
 
     merged, merge_errors = merge_duplicate_rows(data["items"])
@@ -345,7 +350,7 @@ def validate_parsed(upload, data):
         entry["batch_expiry"] = None
         entry["batch_mfg"] = None
         if entry["pharmacy_item"] and entry["batch"]:
-            existing = _find_batch(entry["batch"], entry["pharmacy_item"], upload.company)
+            existing = _find_batch(entry["batch"], entry["pharmacy_item"], args.company)
             if existing:
                 entry["existing_batch"] = existing
                 extra = frappe.db.get_value(
@@ -359,18 +364,18 @@ def validate_parsed(upload, data):
             errors.append(prefix + " " + _("expiry date is missing or unreadable ({0}).").format(
                 entry["expiry_raw"] or _("blank")))
 
-    bill_no = clean(upload.get("bill_no")) or data["ref_no"] or data["invoice_no"]
-    bill_date = upload.get("bill_date") or data["ref_date"] or data["invoice_date"]
+    bill_no = clean(args.get("bill_no")) or data["ref_no"] or data["invoice_no"]
+    bill_date = args.get("bill_date") or data["ref_date"] or data["invoice_date"]
     if not bill_no:
-        errors.append(_("No bill number found in the file. Fill Bill No on this form and retry."))
+        errors.append(_("No bill number found in the file. Enter Bill No in the dialog and retry."))
     if not bill_date:
-        errors.append(_("No bill date found in the file. Fill Bill Date on this form and retry."))
+        errors.append(_("No bill date found in the file. Enter Bill Date in the dialog and retry."))
     data["bill_no"] = bill_no
     data["bill_date"] = bill_date
 
     if bill_no:
         existing = frappe.db.get_value("Purchase Invoice", {
-            "supplier": upload.supplier,
+            "supplier": args.supplier,
             "bill_no": bill_no,
             "docstatus": ("<", 2),
         })
@@ -383,7 +388,7 @@ def validate_parsed(upload, data):
 
 # ----------------------------------------------------------------- creation
 
-def build_invoice(upload, data):
+def build_invoice(args, data):
     item_meta = frappe.get_meta("Purchase Invoice Item")
 
     def set_field(row, field, value):
@@ -391,12 +396,12 @@ def build_invoice(upload, data):
             row.set(field, value)
 
     invoice = frappe.new_doc("Purchase Invoice")
-    invoice.company = upload.company
-    invoice.supplier = upload.supplier
+    invoice.company = args.company
+    invoice.supplier = args.supplier
     invoice.bill_no = data["bill_no"]
     invoice.bill_date = data["bill_date"]
     invoice.set_posting_time = 1
-    invoice.posting_date = upload.get("posting_date") or data["bill_date"]
+    invoice.posting_date = args.get("posting_date") or data["bill_date"]
     invoice.due_date = invoice.posting_date
     invoice.update_stock = 0
     invoice.ignore_pricing_rule = 1
@@ -407,8 +412,8 @@ def build_invoice(upload, data):
             "qty": entry["qty"],
             "rate": entry["rate"],
         })
-        if upload.get("set_warehouse"):
-            row.warehouse = upload.set_warehouse
+        if args.get("set_warehouse"):
+            row.warehouse = args.set_warehouse
 
         stock_uom = frappe.db.get_value("Item", entry["item_code"], "stock_uom")
         if entry["uom"] and entry["uom"] == stock_uom:
@@ -430,9 +435,9 @@ def build_invoice(upload, data):
             # _validate_pharmacy_row until they are filled.
             set_field(row, "custom_expiry_date", entry["expiry"])
 
-    if upload.get("taxes_and_charges"):
-        invoice.taxes_and_charges = upload.taxes_and_charges
-        template = frappe.get_doc("Purchase Taxes and Charges Template", upload.taxes_and_charges)
+    if args.get("taxes_and_charges"):
+        invoice.taxes_and_charges = args.taxes_and_charges
+        template = frappe.get_doc("Purchase Taxes and Charges Template", args.taxes_and_charges)
         for tax in template.taxes:
             invoice.append("taxes", {
                 "category": tax.category,
@@ -561,40 +566,57 @@ def verify_invoice(invoice, data):
     return summary
 
 
+def _attach_file_to_invoice(file_doc, invoice):
+    """Keep the source Excel on the invoice for audit. Never blocks creation."""
+    try:
+        if not file_doc.attached_to_name:
+            frappe.db.set_value("File", file_doc.name, {
+                "attached_to_doctype": "Purchase Invoice",
+                "attached_to_name": invoice.name,
+            }, update_modified=False)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Purchase Excel Upload attach")
+
+
 # -------------------------------------------------------------- entry point
 
 @frappe.whitelist()
-def create_purchase_invoice(upload_name):
+def create_purchase_invoice(excel_file=None, company=None, supplier=None,
+                            taxes_and_charges=None, set_warehouse=None,
+                            posting_date=None, bill_no=None, bill_date=None):
+    """Called by the Create from Supplier Excel dialog on Purchase Invoice."""
     if not frappe.has_permission("Purchase Invoice", "create"):
         frappe.throw(_("You do not have permission to create Purchase Invoices."),
                      frappe.PermissionError)
 
-    upload = frappe.get_doc("Purchase Excel Upload", upload_name)
-    upload.check_permission("write")
+    if not excel_file:
+        frappe.throw(_("No Excel file was attached."))
+    if not company or not supplier:
+        frappe.throw(_("Company and Supplier are required."))
 
-    if upload.get("purchase_invoice") and frappe.db.get_value(
-            "Purchase Invoice", upload.purchase_invoice, "docstatus") in (0, 1):
-        frappe.throw(_("{0} was already created from this upload. "
-                       "Make a new Purchase Excel Upload for a new file.").format(
-            frappe.bold(upload.purchase_invoice)))
+    args = frappe._dict(
+        company=company,
+        supplier=supplier,
+        taxes_and_charges=taxes_and_charges,
+        set_warehouse=set_warehouse,
+        posting_date=getdate(posting_date) if posting_date else None,
+        bill_no=clean(bill_no),
+        bill_date=getdate(bill_date) if bill_date else None,
+    )
 
-    if not upload.get("excel_file"):
-        frappe.throw(_("Attach the Excel file first, then try again."))
-
-    file_doc = frappe.get_doc("File", {"file_url": upload.excel_file})
+    file_doc = frappe.get_doc("File", {"file_url": excel_file})
     content = file_doc.get_content()
 
     try:
         data = parse_workbook(content)
-        errors = validate_parsed(upload, data)
+        errors = validate_parsed(args, data)
         if errors:
             frappe.throw("<br>".join(errors), title=_("Cannot create Purchase Invoice"))
 
-        invoice = build_invoice(upload, data)
+        invoice = build_invoice(args, data)
         summary = verify_invoice(invoice, data)
+        _attach_file_to_invoice(file_doc, invoice)
 
-        upload.db_set("status", "Created")
-        upload.db_set("purchase_invoice", invoice.name)
         return {"purchase_invoice": invoice.name, "summary": summary}
 
     except frappe.ValidationError:
