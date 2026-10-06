@@ -4,9 +4,12 @@ taal_inventory/api/purchase_excel_upload.py
 Supplier Excel -> Draft Purchase Invoice (button on Purchase Invoice)
 =====================================================================
 No separate upload DocType. A button on the Purchase Invoice list (and
-optionally on the form) opens a dialog: pick supplier and taxes, attach
-the Tally invoice Excel from NMP+Taal Pharmacy (layout of
-Purchase_20.xlsx), press Create Draft.
+optionally on the form) opens a dialog: attach the Tally invoice Excel
+(layout of Purchase_20.xlsx / Purchase_19.xlsx), press Create Draft.
+Works for ANY supplier: the Supplier is matched from the file by GSTIN,
+then by name, and the GST template (In-state / Out-state) is picked from
+the two GSTIN state codes on the file. Both can be overridden in the
+dialog, and the result table shows what was used.
 
 This method parses the file, validates every row, creates the Purchase
 Invoice as a DRAFT, and attaches the Excel to that invoice for audit.
@@ -127,14 +130,27 @@ def find_item_columns(grid):
     return None, None
 
 
+GSTIN_RE = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b")
+
+
 def read_header_block(grid, header_index, data):
-    """Invoice no, dates and supplier name from the rows above the item table."""
+    """
+    Invoice no, dates, supplier name and both GSTINs from the rows above the
+    item table. The buyer (your company) block comes first, then the
+    "Supplier (Bill from)" block. So the first GSTIN after that label is the
+    supplier's, and the first GSTIN before it is the buyer's.
+    """
+    supplier_row = None
+    gstins = []  # (row_index, gstin) in order of appearance
+
     for index in range(header_index):
         row = grid[index]
         next_row = grid[index + 1] if index + 1 < len(grid) else []
         for col, cell in enumerate(row):
             text = clean(cell)
             low = text.lower()
+            for found in GSTIN_RE.findall(text.upper()):
+                gstins.append((index, found))
             if low.startswith("invoice no") and col < len(next_row):
                 data["invoice_no"] = clean(next_row[col])
             elif low == "dated" and col < len(next_row):
@@ -149,6 +165,13 @@ def read_header_block(grid, header_index, data):
                     data["ref_no"] = raw
             elif low.startswith("supplier (bill from)") and next_row:
                 data["supplier_name"] = clean(next_row[0])
+                supplier_row = index
+
+    if supplier_row is not None:
+        after = [g for r, g in gstins if r > supplier_row]
+        before = [g for r, g in gstins if r < supplier_row]
+        data["supplier_gstin"] = after[0] if after else ""
+        data["buyer_gstin"] = before[0] if before else ""
 
 
 def read_item_block(grid, header_index, columns, data):
@@ -187,6 +210,8 @@ def read_item_block(grid, header_index, columns, data):
             data["cgst"] = flt(amount)
         elif "sgst" in text:
             data["sgst"] = flt(amount)
+        elif "igst" in text:
+            data["igst"] = flt(amount)
         elif "round" in text:
             data["round_off"] = flt(amount)
         elif current and label_value(row, "batch") is not None:
@@ -211,6 +236,8 @@ def parse_workbook(content):
 
     data = {
         "supplier_name": "",
+        "supplier_gstin": "",
+        "buyer_gstin": "",
         "invoice_no": "",
         "invoice_date": None,
         "ref_no": "",
@@ -219,6 +246,7 @@ def parse_workbook(content):
         "taxable_total": None,
         "cgst": None,
         "sgst": None,
+        "igst": None,
         "round_off": None,
         "grand_total": None,
         "total_qty": None,
@@ -320,13 +348,87 @@ def merge_duplicate_rows(items):
     return merged, errors
 
 
+def find_supplier(data):
+    """
+    Resolve the ERPNext Supplier from the file.
+      1. GSTIN on the Supplier record (India Compliance field)
+      2. GSTIN on an Address linked to exactly one Supplier
+      3. Supplier ID or Supplier Name equal to the "Supplier (Bill from)" text
+    Returns the Supplier name, or None when nothing matches.
+    """
+    gstin = data.get("supplier_gstin") or ""
+
+    if gstin:
+        if frappe.get_meta("Supplier").has_field("gstin"):
+            found = frappe.db.get_value("Supplier", {"gstin": gstin, "disabled": 0})
+            if found:
+                return found
+        if frappe.get_meta("Address").has_field("gstin"):
+            addresses = frappe.get_all("Address", filters={"gstin": gstin}, pluck="name")
+            if addresses:
+                linked = frappe.get_all(
+                    "Dynamic Link",
+                    filters={"parenttype": "Address", "parent": ["in", addresses],
+                             "link_doctype": "Supplier"},
+                    pluck="link_name")
+                linked = [s for s in dict.fromkeys(linked)
+                          if not frappe.db.get_value("Supplier", s, "disabled")]
+                if len(linked) == 1:
+                    return linked[0]
+
+    wanted = squash(data.get("supplier_name"))
+    if wanted:
+        for row in frappe.get_all("Supplier", filters={"disabled": 0},
+                                  fields=["name", "supplier_name"]):
+            if squash(row.name) == wanted or squash(row.supplier_name) == wanted:
+                return row.name
+    return None
+
+
+def pick_tax_template(company, data):
+    """
+    In-state when the supplier GSTIN state code equals the buyer GSTIN state
+    code on the file, out-state otherwise. Without both GSTINs, an IGST line
+    on the file means out-state. Returns the template name, or None if that
+    template does not exist for the company.
+    """
+    supplier_state = (data.get("supplier_gstin") or "")[:2]
+    buyer_state = (data.get("buyer_gstin") or "")[:2]
+    if supplier_state and buyer_state:
+        in_state = supplier_state == buyer_state
+    elif data.get("igst"):
+        in_state = False
+    else:
+        in_state = True
+
+    abbr = frappe.db.get_value("Company", company, "abbr")
+    template = "Input GST {0} - {1}".format("In-state" if in_state else "Out-state", abbr)
+    if frappe.db.exists("Purchase Taxes and Charges Template", template):
+        return template
+    return None
+
+
 def validate_parsed(args, data):
     errors = []
 
-    supplier_name = frappe.db.get_value("Supplier", args.supplier, "supplier_name") or args.supplier
-    if data["supplier_name"] and squash(data["supplier_name"]) != squash(supplier_name):
-        errors.append(_("The file is billed from {0}, but this upload is for supplier {1}.").format(
-            frappe.bold(data["supplier_name"]), frappe.bold(supplier_name)))
+    # Supplier: the dialog choice wins. Blank means take it from the file.
+    args.supplier_chosen = bool(args.supplier)
+    if not args.supplier:
+        args.supplier = find_supplier(data) or ""
+        if not args.supplier:
+            errors.append(_(
+                "Supplier {0} (GSTIN {1}) was not found in the Supplier master. "
+                "Create it with this GSTIN, or pick the supplier in the dialog.").format(
+                frappe.bold(data["supplier_name"] or _("unknown")),
+                data["supplier_gstin"] or _("not on file")))
+
+    # Tax template: the dialog choice wins. Blank means pick by GSTIN state.
+    if not args.taxes_and_charges:
+        args.taxes_and_charges = pick_tax_template(args.company, data) or ""
+        if not args.taxes_and_charges:
+            errors.append(_(
+                "Could not pick a GST template automatically (In-state / Out-state "
+                "template not found for this company). Choose one in the dialog."))
 
     if not data["items"]:
         errors.append(_("No item rows were found in the file."))
@@ -393,7 +495,7 @@ def validate_parsed(args, data):
     data["bill_no"] = bill_no
     data["bill_date"] = bill_date
 
-    if bill_no:
+    if bill_no and args.supplier:
         existing = frappe.db.get_value("Purchase Invoice", {
             "supplier": args.supplier,
             "bill_no": bill_no,
@@ -513,23 +615,52 @@ def verify_invoice(invoice, data):
         "erp": "{0} / {1}".format(invoice.bill_no, invoice.bill_date),
         "ok": True,
     })
+    file_supplier = data.get("supplier_name") or ""
+    file_gstin = data.get("supplier_gstin") or ""
+    invoice_supplier = frappe.db.get_value("Supplier", invoice.supplier, "supplier_name") or invoice.supplier
+    invoice_gstin = invoice.get("supplier_gstin") or ""
+    supplier_ok = bool(
+        (file_gstin and file_gstin == invoice_gstin)
+        or squash(file_supplier) == squash(invoice_supplier)
+    )
+    summary.append({
+        "label": _("Supplier (file / invoice)"),
+        "excel": "{0} {1}".format(file_supplier, file_gstin).strip(),
+        "erp": "{0} {1}".format(invoice_supplier, invoice_gstin).strip(),
+        "ok": supplier_ok,
+    })
     add(_("Item lines"), len(data["items"]), len(invoice.items), 0)
     if data["total_qty"]:
         add(_("Total quantity"), data["total_qty"], invoice.total_qty, 0)
     if data["taxable_total"]:
         add(_("Net total (before GST)"), data["taxable_total"], invoice.net_total, 0.01)
 
-    cgst = sgst = 0
+    cgst = sgst = igst = 0
     for tax in invoice.taxes:
         text = (tax.description or "").lower()
         if "cgst" in text:
             cgst = tax.tax_amount
         elif "sgst" in text:
             sgst = tax.tax_amount
+        elif "igst" in text:
+            igst = tax.tax_amount
     if data["cgst"] is not None:
         add(_("CGST"), data["cgst"], cgst, 0.05)
     if data["sgst"] is not None:
         add(_("SGST"), data["sgst"], sgst, 0.05)
+    if data["igst"] is not None:
+        add(_("IGST"), data["igst"], igst, 0.05)
+
+    file_uses_igst = bool(data.get("igst"))
+    invoice_uses_igst = any("igst" in (t.description or "").lower() for t in invoice.taxes)
+    if file_uses_igst != invoice_uses_igst:
+        summary.append({
+            "label": _("GST type on file vs template {0}").format(
+                invoice.taxes_and_charges or _("(none)")),
+            "excel": "IGST" if file_uses_igst else "CGST + SGST",
+            "erp": "IGST" if invoice_uses_igst else "CGST + SGST",
+            "ok": False,
+        })
     if data["grand_total"]:
         add(_("Grand total (rounded)"), data["grand_total"],
             invoice.rounded_total or invoice.grand_total, 1.0)
@@ -611,12 +742,12 @@ def create_purchase_invoice(excel_file=None, company=None, supplier=None,
 
     if not excel_file:
         frappe.throw(_("No Excel file was attached."))
-    if not company or not supplier:
-        frappe.throw(_("Company and Supplier are required."))
+    if not company:
+        frappe.throw(_("Company is required."))
 
     args = frappe._dict(
         company=company,
-        supplier=supplier,
+        supplier=supplier or "",
         taxes_and_charges=taxes_and_charges,
         set_warehouse=set_warehouse,
         posting_date=getdate(posting_date) if posting_date else None,
