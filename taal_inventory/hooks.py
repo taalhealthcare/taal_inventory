@@ -46,6 +46,9 @@ doc_events = {
         "on_cancel": "taal_inventory.events.sales_invoice.on_cancel",
     },
     "Purchase Invoice": {
+        # Pharmacy-only guard: blocks any item that has no Pharmacy Item
+        # record. Runs on every save, draft included.
+        "validate":  "taal_inventory.events.purchase_invoice.validate",
         "on_submit": "taal_inventory.events.purchase_invoice.on_submit",
         "on_cancel": "taal_inventory.events.purchase_invoice.on_cancel",
     },

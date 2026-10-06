@@ -1,7 +1,7 @@
 """
 taal_inventory/events/purchase_invoice.py
 
-Handles Purchase Invoice submit and cancel for pharmacy stock.
+Handles Purchase Invoice validate, submit and cancel for pharmacy stock.
 
 =============================================================================
 TWO-PASS ARCHITECTURE (critical — do not collapse back into one loop)
@@ -89,6 +89,44 @@ def _resolve_config(company, config, context=""):
 # =============================================================================
 # ENTRY POINTS
 # =============================================================================
+
+def validate(doc, method):
+    """
+    Pharmacy-only guard. Runs on EVERY save, draft and submit.
+
+    Blocks any Purchase Invoice row whose item_code has no Pharmacy Item
+    record. This closes every path: manual entry, copy-paste, Data Import,
+    API inserts, and the Purchase Excel Upload tool. The item_code dropdown
+    filter (get_pharmacy_items_for_purchase) is convenience; this function
+    is the enforcement.
+
+    All offending rows are collected and shown together, same two-pass
+    spirit as the rest of this file: read everything, then act.
+
+    NOTE: this also blocks non-pharmacy purchases (services, expenses,
+    assets) on every Purchase Invoice. _build_plan used to skip such lines
+    silently. If you ever need them again, relax this to skip rows where
+    frappe.db.get_value("Item", row.item_code, "is_stock_item") == 0.
+    """
+    if doc.is_return:
+        return
+
+    missing = []
+    for row in doc.items:
+        if not _get_pharmacy_item(row.item_code):
+            missing.append(
+                f"Row #{row.idx}: {row.item_name or row.item_code or '(no item)'}"
+            )
+
+    if missing:
+        frappe.throw(
+            "These items have no Pharmacy Item record, so they cannot be "
+            "used on a Purchase Invoice:<br>"
+            + "<br>".join(missing)
+            + "<br><br>Create the Pharmacy Item first (with the correct "
+            "Item Code), then try again."
+        )
+
 
 def on_submit(doc, method):
     """Purchase Invoice submit. Two-pass: validate everything, then write."""
@@ -230,6 +268,8 @@ def _build_plan(doc):
         pharmacy_item_name = _get_pharmacy_item(row.item_code)
 
         # Non-pharmacy line (e.g. a service item) — skip silently.
+        # (validate() above now blocks these from being saved at all,
+        #  so this skip only matters for documents saved before it.)
         if not pharmacy_item_name:
             continue
 
