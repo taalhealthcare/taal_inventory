@@ -240,26 +240,44 @@ def parse_workbook(content):
 
 def resolve_item(name, supplier):
     """
-    Match order:
-      1. Item Code
-      2. Item Name
-      3. Pharmacy Item Product Name -> its Item Code
+    Collect EVERY Item the file name could mean, in this order:
+      1. Item Code equals the name
+      2. Item Name equals the name
+      3. Pharmacy Item Product Name equals the name -> its Item Code
       4. Item Supplier -> Supplier Part Number
+    Then return the FIRST candidate that has a Pharmacy Item record.
+
+    Why: two Items can share a name. Example: an Item whose Item Code is
+    literally "Spegra" next to TPIC 67 whose Item Name is "Spegra". Only
+    TPIC 67 is a pharmacy item, so TPIC 67 must win regardless of order.
+    If no candidate has a Pharmacy Item, the first one is returned so the
+    error message can name it.
     """
-    item = frappe.db.get_value("Item", {"name": name, "disabled": 0})
-    if not item:
-        item = frappe.db.get_value("Item", {"item_name": name, "disabled": 0})
-    if not item:
-        code = frappe.db.get_value("Pharmacy Item", {"item_name": name}, "item_code")
+    candidates = []
+
+    def add(code):
+        if code and code not in candidates:
+            candidates.append(code)
+
+    add(frappe.db.get_value("Item", {"name": name, "disabled": 0}))
+
+    for code in frappe.get_all("Item", filters={"item_name": name, "disabled": 0}, pluck="name"):
+        add(code)
+
+    for code in frappe.get_all("Pharmacy Item", filters={"item_name": name}, pluck="item_code"):
         if code and frappe.db.exists("Item", {"name": code, "disabled": 0}):
-            item = code
-    if not item:
-        item = frappe.db.get_value(
-            "Item Supplier",
-            {"supplier": supplier, "supplier_part_no": name},
-            "parent",
-        )
-    return item
+            add(code)
+
+    add(frappe.db.get_value(
+        "Item Supplier",
+        {"supplier": supplier, "supplier_part_no": name},
+        "parent",
+    ))
+
+    for code in candidates:
+        if _get_pharmacy_item(code):
+            return code
+    return candidates[0] if candidates else None
 
 
 def merge_duplicate_rows(items):
@@ -332,8 +350,10 @@ def validate_parsed(args, data):
                 "Supplier Part Number in the Item's Supplier Items table."))
         elif not entry["pharmacy_item"]:
             errors.append(prefix + " " + _(
-                "Item {0} has no Pharmacy Item record. Purchases are "
-                "pharmacy items only, create the Pharmacy Item first.").format(
+                "matched Item {0}, which has no Pharmacy Item record. "
+                "Purchases are pharmacy items only. Either link this Item "
+                "to a Pharmacy Item, or if it is a duplicate of another "
+                "Item with the same name, disable it.").format(
                 frappe.bold(entry["item_code"])))
 
         if entry["qty"] <= 0:
