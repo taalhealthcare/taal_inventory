@@ -42,7 +42,7 @@ from datetime import date, datetime
 import frappe
 import openpyxl
 from frappe import _
-from frappe.utils import flt, getdate
+from frappe.utils import cint, flt, getdate
 
 from taal_inventory.events.purchase_invoice import _find_batch, _get_pharmacy_item
 
@@ -385,6 +385,74 @@ def find_supplier(data):
     return None
 
 
+STATE_BY_CODE = {
+    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh",
+    "05": "Uttarakhand", "06": "Haryana", "07": "Delhi", "08": "Rajasthan", "09": "Uttar Pradesh",
+    "10": "Bihar", "11": "Sikkim", "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+    "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam", "19": "West Bengal",
+    "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh", "24": "Gujarat",
+    "26": "Dadra and Nagar Haveli and Daman and Diu", "27": "Maharashtra", "29": "Karnataka",
+    "30": "Goa", "31": "Lakshadweep Islands", "32": "Kerala", "33": "Tamil Nadu", "34": "Puducherry",
+    "35": "Andaman and Nicobar Islands", "36": "Telangana", "37": "Andhra Pradesh", "38": "Ladakh",
+}
+
+
+def create_supplier_from_file(data):
+    """
+    Creates a Supplier from the "Supplier (Bill from)" block, plus a billing
+    Address when a GSTIN is on the file. Only called when the dialog checkbox
+    "Create supplier if not found" was ticked. Runs inside the same
+    transaction as the invoice, so if anything later fails nothing stays.
+    The result table flags the new supplier for review before submit.
+    """
+    name = clean(data.get("supplier_name"))
+    gstin = data.get("supplier_gstin") or ""
+    if not name:
+        frappe.throw(_("The file has no supplier name, so the supplier cannot be created."))
+
+    supplier_meta = frappe.get_meta("Supplier")
+    supplier = frappe.new_doc("Supplier")
+    supplier.supplier_name = name
+    supplier.supplier_group = "All Supplier Groups"
+    supplier.supplier_type = "Company"
+    if supplier_meta.has_field("country"):
+        supplier.country = "India"
+    if supplier_meta.has_field("gst_category"):
+        supplier.gst_category = "Registered Regular" if gstin else "Unregistered"
+    if gstin and supplier_meta.has_field("gstin"):
+        supplier.gstin = gstin
+    supplier.insert()
+
+    data["supplier_created"] = supplier.name
+    data["address_created"] = ""
+
+    if gstin:
+        state = STATE_BY_CODE.get(gstin[:2], "")
+        try:
+            address_meta = frappe.get_meta("Address")
+            address = frappe.new_doc("Address")
+            address.address_title = name
+            address.address_type = "Billing"
+            address.address_line1 = _("Address to be updated (auto-created from supplier Excel)")
+            address.city = state or _("Unknown")
+            address.state = state
+            address.country = "India"
+            address.is_primary_address = 1
+            if address_meta.has_field("gstin"):
+                address.gstin = gstin
+            if address_meta.has_field("gst_category"):
+                address.gst_category = "Registered Regular"
+            if address_meta.has_field("gst_state") and state:
+                address.gst_state = state
+            address.append("links", {"link_doctype": "Supplier", "link_name": supplier.name})
+            address.insert()
+            data["address_created"] = address.name
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Purchase Excel Upload supplier address")
+
+    return supplier.name
+
+
 def pick_tax_template(company, data):
     """
     In-state when the supplier GSTIN state code equals the buyer GSTIN state
@@ -415,10 +483,13 @@ def validate_parsed(args, data):
     args.supplier_chosen = bool(args.supplier)
     if not args.supplier:
         args.supplier = find_supplier(data) or ""
+        if not args.supplier and cint(args.get("create_supplier")):
+            args.supplier = create_supplier_from_file(data)
         if not args.supplier:
             errors.append(_(
                 "Supplier {0} (GSTIN {1}) was not found in the Supplier master. "
-                "Create it with this GSTIN, or pick the supplier in the dialog.").format(
+                "Tick 'Create supplier if not found' in the dialog, create it "
+                "yourself with this GSTIN, or pick an existing supplier.").format(
                 frappe.bold(data["supplier_name"] or _("unknown")),
                 data["supplier_gstin"] or _("not on file")))
 
@@ -527,6 +598,8 @@ def build_invoice(args, data):
     invoice.due_date = invoice.posting_date
     invoice.update_stock = 0
     invoice.ignore_pricing_rule = 1
+    if args.get("excel_file") and frappe.get_meta("Purchase Invoice").has_field("custom_supplier_excel"):
+        invoice.custom_supplier_excel = args.excel_file  # drives the View Supplier Excel button
 
     for entry in data["items"]:
         row = invoice.append("items", {
@@ -629,6 +702,14 @@ def verify_invoice(invoice, data):
         "erp": "{0} {1}".format(invoice_supplier, invoice_gstin).strip(),
         "ok": supplier_ok,
     })
+    if data.get("supplier_created"):
+        summary.append({
+            "label": _("NEW supplier created from the file. Open it, complete the "
+                       "address and GST details, then come back and submit"),
+            "excel": data.get("supplier_created"),
+            "erp": data.get("address_created") or _("no address (GSTIN missing or address failed)"),
+            "ok": False,
+        })
     add(_("Item lines"), len(data["items"]), len(invoice.items), 0)
     if data["total_qty"]:
         add(_("Total quantity"), data["total_qty"], invoice.total_qty, 0)
@@ -729,12 +810,82 @@ def _attach_file_to_invoice(file_doc, invoice):
         frappe.log_error(frappe.get_traceback(), "Purchase Excel Upload attach")
 
 
+# ------------------------------------------------------- one-time backfill
+
+def backfill_supplier_excel_links():
+    """
+    Fills the Supplier Excel field on invoices created before the field
+    existed, from the xlsx already attached to each invoice. Run once:
+
+      bench --site <site> execute \
+        taal_inventory.api.purchase_excel_upload.backfill_supplier_excel_links
+
+    Safe to re-run. Skips invoices that already have the field filled.
+    Works on submitted invoices too (direct db write, no re-validation).
+    """
+    if not frappe.get_meta("Purchase Invoice").has_field("custom_supplier_excel"):
+        print("Add the 'Supplier Excel' field (custom_supplier_excel) to Purchase Invoice first.")
+        return
+
+    files = frappe.get_all(
+        "File",
+        filters={"attached_to_doctype": "Purchase Invoice", "file_url": ["like", "%.xlsx"]},
+        fields=["attached_to_name", "file_url"],
+        order_by="creation asc",
+    )
+    linked = 0
+    for row in files:
+        if not row.attached_to_name:
+            continue
+        if frappe.db.get_value("Purchase Invoice", row.attached_to_name, "custom_supplier_excel"):
+            continue
+        frappe.db.set_value("Purchase Invoice", row.attached_to_name,
+                            "custom_supplier_excel", row.file_url, update_modified=False)
+        linked += 1
+    frappe.db.commit()
+    print(f"Linked {linked} invoice(s) to their supplier Excel.")
+
+
 # -------------------------------------------------------------- entry point
+
+@frappe.whitelist()
+def preview_supplier_excel(excel_file=None, company=None):
+    """
+    Called the moment the Excel is attached in the dialog. READ-ONLY: parses
+    the file and returns what the dialog should pre-fill. Writes nothing.
+    """
+    if not frappe.has_permission("Purchase Invoice", "create"):
+        frappe.throw(_("You do not have permission to create Purchase Invoices."),
+                     frappe.PermissionError)
+    if not excel_file:
+        frappe.throw(_("No Excel file was attached."))
+
+    file_doc = frappe.get_doc("File", {"file_url": excel_file})
+    data = parse_workbook(file_doc.get_content())
+
+    supplier = find_supplier(data)
+    template = pick_tax_template(company, data) if company else None
+    bill_no = data["ref_no"] or data["invoice_no"]
+    bill_date = data["ref_date"] or data["invoice_date"]
+
+    return {
+        "supplier": supplier,
+        "supplier_name_on_file": data["supplier_name"],
+        "supplier_gstin": data["supplier_gstin"],
+        "taxes_and_charges": template,
+        "bill_no": bill_no,
+        "bill_date": str(bill_date) if bill_date else None,
+        "posting_date": str(bill_date) if bill_date else None,
+        "item_count": len(data["items"]),
+        "grand_total": data["grand_total"],
+    }
+
 
 @frappe.whitelist()
 def create_purchase_invoice(excel_file=None, company=None, supplier=None,
                             taxes_and_charges=None, set_warehouse=None,
-                            posting_date=None, bill_no=None, bill_date=None):
+                            posting_date=None, bill_no=None, bill_date=None,
+                            create_supplier=0):
     """Called by the Create from Supplier Excel dialog on Purchase Invoice."""
     if not frappe.has_permission("Purchase Invoice", "create"):
         frappe.throw(_("You do not have permission to create Purchase Invoices."),
@@ -746,6 +897,7 @@ def create_purchase_invoice(excel_file=None, company=None, supplier=None,
         frappe.throw(_("Company is required."))
 
     args = frappe._dict(
+        excel_file=excel_file,
         company=company,
         supplier=supplier or "",
         taxes_and_charges=taxes_and_charges,
@@ -753,6 +905,7 @@ def create_purchase_invoice(excel_file=None, company=None, supplier=None,
         posting_date=getdate(posting_date) if posting_date else None,
         bill_no=clean(bill_no),
         bill_date=getdate(bill_date) if bill_date else None,
+        create_supplier=cint(create_supplier),
     )
 
     file_doc = frappe.get_doc("File", {"file_url": excel_file})
