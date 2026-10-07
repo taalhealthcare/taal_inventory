@@ -141,6 +141,8 @@ def on_submit(doc, method):
 
     _sweep_srbnb_to_inventory(doc)   # GL: SRBNB -> Stock In Hand (Inventory)
 
+    _notify_shared_batches(doc)      # visibility only: same batch id on several items
+
     created = len([p for p in plan if p["action"] == _ACTION_CREATE])
     topped  = len([p for p in plan if p["action"] == _ACTION_TOPUP])
 
@@ -273,8 +275,12 @@ def _build_plan(doc):
         if not pharmacy_item_name:
             continue
 
-        _validate_pharmacy_row(row, doc, seen_batch_ids)
-        seen_batch_ids.add(row.custom_batch_id)
+        # Duplicate check is per ITEM + batch. The same batch id on two
+        # different items is valid: Pharmacy Batches are keyed by
+        # batch + item + company, so each item gets its own batch record.
+        batch_key = (pharmacy_item_name, row.custom_batch_id)
+        _validate_pharmacy_row(row, doc, seen_batch_ids, batch_key)
+        seen_batch_ids.add(batch_key)
 
         existing = _find_batch(row.custom_batch_id, pharmacy_item_name, doc.company)
 
@@ -296,8 +302,12 @@ def _build_plan(doc):
     return plan
 
 
-def _validate_pharmacy_row(row, doc, seen_batch_ids):
-    """Validates one pharmacy row. Throws on first failure. No writes."""
+def _validate_pharmacy_row(row, doc, seen_batch_ids, batch_key=None):
+    """
+    Validates one pharmacy row. Throws on first failure. No writes.
+    batch_key is (pharmacy_item_name, batch_id); the duplicate check is
+    scoped to that pair, so one batch id may appear under different items.
+    """
     idx  = row.idx
     name = row.item_name or row.item_code
 
@@ -330,11 +340,12 @@ def _validate_pharmacy_row(row, doc, seen_batch_ids):
                 f"before Expiry ({expiry})."
             )
 
-    if row.custom_batch_id in seen_batch_ids:
+    key = batch_key or row.custom_batch_id
+    if key in seen_batch_ids:
         frappe.throw(
             f"Row #{idx} ({name}): Batch ID '{row.custom_batch_id}' "
-            f"appears more than once in this invoice. Combine the rows "
-            f"into a single line with the total quantity."
+            f"appears more than once for this item in this invoice. "
+            f"Combine those rows into a single line with the total quantity."
         )
 
 
@@ -458,6 +469,52 @@ def _execute_plan(doc, plan):
             company=doc.company,
             remarks=f"Batch {row.custom_batch_id} created via PI {doc.name}"
         )
+
+
+# =============================================================================
+# SHARED BATCH VISIBILITY (read-only, never blocks)
+# =============================================================================
+
+def _shared_batch_groups(doc):
+    """
+    Returns {batch_id: [rows]} for every batch id that appears under more
+    than one item on this invoice. Allowed by design (Pharmacy Batches are
+    keyed by batch + item + company); this only makes it visible.
+    """
+    groups = {}
+    for row in doc.items:
+        if row.custom_batch_id:
+            groups.setdefault(row.custom_batch_id, []).append(row)
+    return {
+        batch_id: rows for batch_id, rows in groups.items()
+        if len({r.item_code for r in rows}) > 1
+    }
+
+
+def _notify_shared_batches(doc):
+    """One dialog listing each shared batch with its items. Informational."""
+    shared = _shared_batch_groups(doc)
+    if not shared:
+        return
+
+    blocks = []
+    for batch_id, rows in shared.items():
+        lines = "".join(
+            f"<li>Row #{r.idx}: <b>{r.item_name or r.item_code}</b> ({r.item_code}), "
+            f"qty {flt(r.qty):g}</li>"
+            for r in rows
+        )
+        blocks.append(
+            f"<b>Batch {batch_id}</b> is on {len(rows)} items:<ul>{lines}</ul>"
+        )
+
+    frappe.msgprint(
+        msg="".join(blocks)
+            + "<p>This is allowed. Each item gets its own Pharmacy Batch. "
+              "Shown here so you can confirm the batch id is correct on every item.</p>",
+        title="Same Batch ID on more than one item",
+        indicator="orange",
+    )
 
 
 # =============================================================================

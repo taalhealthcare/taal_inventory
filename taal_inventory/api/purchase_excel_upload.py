@@ -311,9 +311,10 @@ def resolve_item(name, supplier):
 def merge_duplicate_rows(items):
     """
     Same item + same batch + same rate on several lines -> one line
-    (your _validate_pharmacy_row requires one line per batch at submit).
-    Same batch with different rates, or the same batch under two different
-    items, is an error.
+    (submit requires one line per batch per item).
+    Same item + same batch with different rates is an error.
+    The same batch under two DIFFERENT items is allowed: Pharmacy Batches
+    are keyed by batch + item + company, so each item gets its own batch.
     """
     errors = []
     merged = []
@@ -333,17 +334,6 @@ def merge_duplicate_rows(items):
                 first["row"], entry["row"], entry["name"], entry["batch"]))
         index[key] = entry
         merged.append(entry)
-
-    batch_owners = {}
-    for entry in merged:
-        if entry.get("batch") and entry.get("item_code"):
-            batch_owners.setdefault(entry["batch"], set()).add(entry["item_code"])
-    for batch_id, owners in batch_owners.items():
-        if len(owners) > 1:
-            errors.append(_(
-                "Batch {0} appears under more than one item ({1}). "
-                "Submit would block this, fix the file.").format(
-                batch_id, ", ".join(sorted(owners))))
 
     return merged, errors
 
@@ -783,6 +773,23 @@ def verify_invoice(invoice, data):
                            "file rate kept").format(entry["name"]),
                 "excel": fmt(entry["rate"]),
                 "erp": fmt(batch_cost),
+                "ok": False,
+            })
+
+    # Same batch id under more than one item: allowed, listed for visibility.
+    by_batch = {}
+    for row in invoice.items:
+        if row.get("custom_batch_id"):
+            by_batch.setdefault(row.custom_batch_id, []).append(row)
+    for batch_id, rows in by_batch.items():
+        if len({r.item_code for r in rows}) > 1:
+            summary.append({
+                "label": _("Same batch {0} on {1} items (allowed, confirm it is correct)").format(
+                    batch_id, len(rows)),
+                "excel": "; ".join(
+                    "{0} ({1}) qty {2:g}".format(r.item_name or r.item_code, r.item_code, flt(r.qty))
+                    for r in rows),
+                "erp": _("one Pharmacy Batch per item at submit"),
                 "ok": False,
             })
 
