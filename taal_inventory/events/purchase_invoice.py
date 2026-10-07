@@ -127,6 +127,11 @@ def validate(doc, method):
             "Item Code), then try again."
         )
 
+    # Visibility only: same batch id on several items. Shown on every
+    # DRAFT save (docstatus 0), not at submit. Never blocks.
+    if doc.docstatus == 0:
+        _notify_shared_batches(doc)
+
 
 def on_submit(doc, method):
     """Purchase Invoice submit. Two-pass: validate everything, then write."""
@@ -140,8 +145,6 @@ def on_submit(doc, method):
     _execute_plan(doc, plan)         # PASS 2 — writes, does not throw
 
     _sweep_srbnb_to_inventory(doc)   # GL: SRBNB -> Stock In Hand (Inventory)
-
-    _notify_shared_batches(doc)      # visibility only: same batch id on several items
 
     created = len([p for p in plan if p["action"] == _ACTION_CREATE])
     topped  = len([p for p in plan if p["action"] == _ACTION_TOPUP])
