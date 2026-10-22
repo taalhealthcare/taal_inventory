@@ -5,6 +5,21 @@ app_description = "Pharmacy Inventory Management for TAAL+ Healthcare"
 app_version     = "1.0.0"
 app_license     = "MIT"
 
+# Custom fields owned by this app. Installed/updated by `bench migrate`
+# (or `bench --site <site> import-fixtures`). Currently:
+#   Sales Invoice Item: custom_pharmacy_batch, custom_batch_expiry,
+#                       custom_batch_available
+fixtures = [
+    {
+        "dt": "Custom Field",
+        "filters": [["name", "in", [
+            "Sales Invoice Item-custom_pharmacy_batch",
+            "Sales Invoice Item-custom_batch_expiry",
+            "Sales Invoice Item-custom_batch_available",
+        ]]],
+    },
+]
+
 before_request = [
     "taal_inventory.utils.wc_status_patch.apply",
     "taal_inventory.utils.erpnext_patches.apply",
@@ -42,6 +57,12 @@ doc_events = {
     # Each of these already calls recalculate_company_stock() internally,
     # which now routes through the full rebuild in utils/company_stock.py.
     "Sales Invoice": {
+        # Batch is chosen by the user per row (custom_pharmacy_batch).
+        # validate: fills nearest-expiry batch into any empty row, then
+        # checks every batch belongs to the row's item + doc.company, is
+        # Active and unexpired, and that total qty per batch across rows
+        # fits its remaining_qty. Runs on save and again on submit.
+        "validate":  "taal_inventory.events.sales_invoice.validate",
         "on_submit": "taal_inventory.events.sales_invoice.on_submit",
         "on_cancel": "taal_inventory.events.sales_invoice.on_cancel",
     },
